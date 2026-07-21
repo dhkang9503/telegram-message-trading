@@ -1,0 +1,16 @@
+[project]
+name = "telegram-message-trading"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "PyYAML==6.0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,0 +1,134 @@
+name: Deploy parser model
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Modal training run ID
+        required: true
+      force_ineligible:
+        description: Allow deployment when the release gate failed
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-parser-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT || 'main' }}
+      ARTIFACT_VOLUME: telegram-parser-artifacts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Modal
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "modal>=1.2.3,<2"
+
+      - name: Download manifest
+        run: |
+          mkdir -p deploy
+          modal volume get \
+            "${ARTIFACT_VOLUME}" \
+            "runs/${{ inputs.run_id }}/manifest.json" \
+            deploy/manifest.json
+
+      - name: Enforce release gate
+        env:
+          FORCE_INELIGIBLE: ${{ inputs.force_ineligible }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path("deploy/manifest.json").read_text())
+          eligible = bool(manifest.get("deploy_eligible"))
+          forced = os.environ["FORCE_INELIGIBLE"].lower() == "true"
+          if not eligible and not forced:
+              raise SystemExit(
+                  "Release gate failed. Re-run with force_ineligible only after manual review."
+              )
+          artifact = manifest.get("artifacts", {}).get("Q8_0")
+          if not artifact:
+              raise SystemExit("The run does not contain a Q8_0 artifact.")
+          Path("deploy/model-meta.env").write_text(
+              "\n".join(
+                  [
+                      f"MODEL_REMOTE_PATH={artifact['path']}",
+                      f"MODEL_SHA256={artifact['sha256']}",
+                  ]
+              )
+              + "\n"
+          )
+          PY
+
+      - name: Download Q8 model
+        shell: bash
+        run: |
+          source deploy/model-meta.env
+          modal volume get \
+            "${ARTIFACT_VOLUME}" \
+            "${MODEL_REMOTE_PATH}" \
+            deploy/model-Q8_0.gguf
+          echo "${MODEL_SHA256}  deploy/model-Q8_0.gguf" | sha256sum --check -
+
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${EC2_SSH_KEY}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${EC2_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Upload model and deploy script
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          scp -i ~/.ssh/deploy_key \
+            deploy/model-Q8_0.gguf \
+            scripts/deploy_ec2.sh \
+            "${EC2_USER}@${EC2_HOST}:/tmp/"
+
+      - name: Activate release
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_MODEL_ROOT: ${{ vars.EC2_MODEL_ROOT }}
+          EC2_CURRENT_MODEL_LINK: ${{ vars.EC2_CURRENT_MODEL_LINK }}
+          EC2_LLAMA_SERVICE: ${{ vars.EC2_LLAMA_SERVICE }}
+          EC2_LLAMA_HEALTH_URL: ${{ vars.EC2_LLAMA_HEALTH_URL }}
+        shell: bash
+        run: |
+          source deploy/model-meta.env
+          ssh -i ~/.ssh/deploy_key "${EC2_USER}@${EC2_HOST}" \
+            "bash /tmp/deploy_ec2.sh \
+              /tmp/model-Q8_0.gguf \
+              '${{ inputs.run_id }}' \
+              '${MODEL_SHA256}' \
+              '${EC2_MODEL_ROOT}' \
+              '${EC2_CURRENT_MODEL_LINK}' \
+              '${EC2_LLAMA_SERVICE}' \
+              '${EC2_LLAMA_HEALTH_URL}'"

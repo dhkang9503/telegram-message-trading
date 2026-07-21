@@ -1,0 +1,17 @@
+{
+  "train": {
+    "path": "data/base/train.jsonl",
+    "rows": 1604,
+    "sha256": "22c1aefb95ce6b4104d29a2dbe15ba19e0479f20ab8aab2cfbdb34e895c3c2cf"
+  },
+  "validation": {
+    "path": "data/base/validation.jsonl",
+    "rows": 324,
+    "sha256": "e475e51e01d17698196cbc2f43a7fe2fe7b15014b2532870b14af8e7bca5940d"
+  },
+  "test": {
+    "path": "data/base/test.jsonl",
+    "rows": 325,
+    "sha256": "a3b7e51789e51c551f38db2e7a82f20a7967bb81b5629bc026a42fdc6a38b69a"
+  }
+}

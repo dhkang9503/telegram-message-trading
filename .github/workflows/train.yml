@@ -1,0 +1,124 @@
+name: Train parser model
+
+on:
+  workflow_dispatch:
+    inputs:
+      quant_types:
+        description: Comma-separated GGUF quantizations
+        required: true
+        default: Q8_0
+      run_id:
+        description: Optional run ID; blank uses Actions run number and commit
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-parser-training
+  cancel-in-progress: false
+
+jobs:
+  validate-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate datasets
+        run: |
+          python scripts/validate_dataset.py \
+            --root . \
+            --write-report workflow-output/dataset-validation.json
+
+      - name: Upload validation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-validation-${{ github.run_id }}
+          path: workflow-output/dataset-validation.json
+          retention-days: 30
+
+  train:
+    needs: validate-data
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT || 'main' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Modal
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "modal>=1.2.3,<2"
+
+      - name: Resolve run ID
+        id: run
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.run_id }}" ]]; then
+            RUN_ID="${{ inputs.run_id }}"
+          else
+            RUN_ID="gh-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::8}"
+          fi
+          echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
+          echo "RUN_ID=${RUN_ID}" >> "${GITHUB_ENV}"
+
+      - name: Train, export and evaluate on Modal A100
+        run: |
+          mkdir -p workflow-output
+          modal run \
+            --write-result workflow-output/manifest.json \
+            modal/train_app.py \
+            --run-id "${RUN_ID}" \
+            --git-sha "${GITHUB_SHA}" \
+            --quant-types "${{ inputs.quant_types }}"
+
+      - name: Render summary
+        env:
+          MANIFEST_PATH: workflow-output/manifest.json
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(Path(os.environ["MANIFEST_PATH"]).read_text())
+          q8 = manifest.get("evaluation", {}).get("original_test", {}).get("Q8_0", {})
+          errors = q8.get("errors", {})
+          lines = [
+              f"# Model run `{manifest['run_id']}`",
+              "",
+              f"- Deploy eligible: **{manifest['deploy_eligible']}**",
+              f"- Train rows: {manifest['dataset']['combined_rows']}",
+              f"- Feedback rows appended: {manifest['dataset']['feedback_rows_appended']}",
+              f"- Q8 exact match: {q8.get('exact_match_rate', 'not built')}",
+              f"- Q8 JSON valid: {q8.get('json_valid_rate', 'not built')}",
+              f"- OPEN_TO_CLOSE: {errors.get('OPEN_TO_CLOSE', 0)}",
+              f"- Modal volume path: `runs/{manifest['run_id']}`",
+          ]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as file:
+              file.write("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload run manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-run-${{ steps.run.outputs.run_id }}
+          path: workflow-output/manifest.json
+          retention-days: 90
