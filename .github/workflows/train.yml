@@ -67,6 +67,8 @@ jobs:
           fi
           echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
           echo "RUN_ID=${RUN_ID}" >> "${GITHUB_ENV}"
+      - name: Prepare Modal source
+        run: python scripts/prepare_modal_source.py
       - name: Train and run Transformers validation/test on Modal A100
         run: |
           mkdir -p workflow-output
