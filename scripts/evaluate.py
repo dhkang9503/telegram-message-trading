@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import re
 import subprocess
 import time
@@ -23,25 +22,22 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def build_prompt(system_prompt: str, message: str) -> str:
     return (
-        "<|im_start|>system\n"
-        f"{system_prompt}"
-        "<|im_end|>\n"
-        "<|im_start|>user\n"
-        f"{message}"
-        "<|im_end|>\n"
-        "<|im_start|>assistant\n"
-        "<think>\n\n</think>\n\n"
+        "<|im_start|>system\n" + system_prompt + "<|im_end|>\n"
+        "<|im_start|>user\n" + message + "<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
 
 
 def normalize_result(obj: Any) -> dict[str, Any]:
     if not isinstance(obj, dict) or not isinstance(obj.get("actions"), list):
         return {"actions": []}
-    actions = []
-    for action in obj["actions"]:
-        if isinstance(action, dict):
-            actions.append({"type": action.get("type"), "price": action.get("price")})
-    return {"actions": actions}
+    return {
+        "actions": [
+            {"type": action.get("type"), "price": action.get("price")}
+            for action in obj["actions"]
+            if isinstance(action, dict)
+        ]
+    }
 
 
 def extract_json(raw_text: str) -> dict[str, Any]:
@@ -55,8 +51,7 @@ def extract_json(raw_text: str) -> dict[str, Any]:
 def _percentile(sorted_values: list[float], value: float) -> float | None:
     if not sorted_values:
         return None
-    index = int((len(sorted_values) - 1) * value)
-    return sorted_values[index]
+    return sorted_values[int((len(sorted_values) - 1) * value)]
 
 
 @contextlib.contextmanager
@@ -67,35 +62,23 @@ def llama_server(
     n_ctx: int,
     start_timeout_seconds: float,
     log_path: Path,
+    gpu_layers: int = 0,
 ) -> Iterator[str]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("w", encoding="utf-8")
     command = [
-        str(server_bin),
-        "-m", str(model_path),
-        "--host", "127.0.0.1",
-        "--port", str(port),
-        "-c", str(n_ctx),
-        "-ngl", "99",
+        str(server_bin), "-m", str(model_path), "--host", "127.0.0.1",
+        "--port", str(port), "-c", str(n_ctx), "-ngl", str(gpu_layers),
     ]
-    process = subprocess.Popen(
-        command,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},
-    )
+    process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, text=True)
     base_url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + start_timeout_seconds
     try:
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise RuntimeError(
-                    f"llama-server exited with {process.returncode}; see {log_path}"
-                )
+                raise RuntimeError(f"llama-server exited with {process.returncode}; see {log_path}")
             try:
-                response = httpx.get(f"{base_url}/health", timeout=2.0)
-                if response.status_code == 200:
+                if httpx.get(f"{base_url}/health", timeout=2.0).status_code == 200:
                     break
             except httpx.HTTPError:
                 pass
@@ -114,21 +97,11 @@ def llama_server(
 
 
 def evaluate_gguf(
-    *,
-    quant_name: str,
-    model_path: Path,
-    rows: list[dict[str, Any]],
-    output_dir: Path,
-    system_prompt: str,
-    server_bin: Path,
-    port: int = 18080,
-    n_ctx: int = 512,
-    n_predict: int = 48,
-    temperature: float = 0.0,
-    top_k: int = 1,
-    top_p: float = 1.0,
-    repeat_penalty: float = 1.0,
-    server_start_timeout_seconds: float = 120.0,
+    *, quant_name: str, model_path: Path, rows: list[dict[str, Any]],
+    output_dir: Path, system_prompt: str, server_bin: Path, port: int = 18080,
+    n_ctx: int = 512, n_predict: int = 48, temperature: float = 0.0,
+    top_k: int = 1, top_p: float = 1.0, repeat_penalty: float = 1.0,
+    server_start_timeout_seconds: float = 120.0, gpu_layers: int = 0,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     load_started = time.perf_counter()
@@ -138,12 +111,8 @@ def evaluate_gguf(
     error_counts: Counter[str] = Counter()
 
     with llama_server(
-        server_bin=server_bin,
-        model_path=model_path,
-        port=port,
-        n_ctx=n_ctx,
-        start_timeout_seconds=server_start_timeout_seconds,
-        log_path=output_dir / "llama-server.log",
+        server_bin, model_path, port, n_ctx, start_timeout_seconds=server_start_timeout_seconds,
+        log_path=output_dir / "llama-server.log", gpu_layers=gpu_layers,
     ) as base_url:
         model_load_seconds = time.perf_counter() - load_started
         with httpx.Client(timeout=120.0) as client:
@@ -151,14 +120,10 @@ def evaluate_gguf(
                 message = row["messages"][1]["content"]
                 expected = normalize_result(json.loads(row["messages"][2]["content"]))
                 payload = {
-                    "prompt": build_prompt(system_prompt, message),
-                    "n_predict": n_predict,
-                    "temperature": temperature,
-                    "top_k": top_k,
-                    "top_p": top_p,
+                    "prompt": build_prompt(system_prompt, message), "n_predict": n_predict,
+                    "temperature": temperature, "top_k": top_k, "top_p": top_p,
                     "repeat_penalty": repeat_penalty,
-                    "stop": ["<|im_end|>", "<|endoftext|>"],
-                    "stream": False,
+                    "stop": ["<|im_end|>", "<|endoftext|>"], "stream": False,
                 }
                 started = time.perf_counter()
                 response = client.post(f"{base_url}/completion", json=payload)
@@ -167,25 +132,17 @@ def evaluate_gguf(
                 latencies.append(latency)
                 raw_output = str(response.json().get("content", "")).strip()
                 result: dict[str, Any] = {
-                    "message": message,
-                    "expected": expected,
-                    "raw_output": raw_output,
-                    "latency_seconds": latency,
-                    "json_valid": False,
-                    "exact_match": False,
+                    "message": message, "expected": expected, "raw_output": raw_output,
+                    "latency_seconds": latency, "json_valid": False, "exact_match": False,
                 }
-
                 try:
                     predicted = normalize_result(extract_json(raw_output))
-                    result["json_valid"] = True
-                    result["predicted"] = predicted
+                    result.update({"json_valid": True, "predicted": predicted})
                     json_valid_count += 1
-
                     expected_types = [a["type"] for a in expected["actions"]]
                     predicted_types = [a["type"] for a in predicted["actions"]]
                     expected_prices = [a["price"] for a in expected["actions"]]
                     predicted_prices = [a["price"] for a in predicted["actions"]]
-
                     if predicted == expected:
                         exact_count += 1
                         result["exact_match"] = True
@@ -193,9 +150,7 @@ def evaluate_gguf(
                         type_count += 1
                     if predicted_prices == expected_prices:
                         price_count += 1
-
-                    expected_set = set(expected_types)
-                    predicted_set = set(predicted_types)
+                    expected_set, predicted_set = set(expected_types), set(predicted_types)
                     if "OPEN_LONG" in expected_set and "OPEN_SHORT" in predicted_set:
                         error_counts["LONG_TO_SHORT"] += 1
                     if "OPEN_SHORT" in expected_set and "OPEN_LONG" in predicted_set:
@@ -211,16 +166,13 @@ def evaluate_gguf(
                 except Exception as exc:
                     result["parse_error"] = f"{type(exc).__name__}: {exc}"
                     error_counts["INVALID_JSON"] += 1
-
                 results.append(result)
 
     total = len(results)
     sorted_latencies = sorted(latencies)
     metrics = {
-        "quantization": quant_name,
-        "model_path": str(model_path),
-        "model_size_mb": model_path.stat().st_size / 1024 / 1024,
-        "test_rows": total,
+        "quantization": quant_name, "model_path": str(model_path),
+        "model_size_mb": model_path.stat().st_size / 1024 / 1024, "test_rows": total,
         "model_load_seconds": model_load_seconds,
         "json_valid_rate": json_valid_count / total if total else 0.0,
         "exact_match_rate": exact_count / total if total else 0.0,
@@ -229,15 +181,11 @@ def evaluate_gguf(
         "latency_seconds": {
             "mean": sum(latencies) / len(latencies) if latencies else None,
             "p50": _percentile(sorted_latencies, 0.50),
-            "p95": _percentile(sorted_latencies, 0.95),
-            "max": max(latencies) if latencies else None,
+            "p95": _percentile(sorted_latencies, 0.95), "max": max(latencies) if latencies else None,
         },
         "errors": dict(error_counts),
     }
-
-    (output_dir / "metrics.json").write_text(
-        json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as file:
         for result in results:
             file.write(json.dumps(result, ensure_ascii=False) + "\n")
