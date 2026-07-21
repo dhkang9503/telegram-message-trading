@@ -67,18 +67,51 @@ jobs:
           fi
           echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
           echo "RUN_ID=${RUN_ID}" >> "${GITHUB_ENV}"
-      - name: Prepare Modal source
-        run: python scripts/prepare_modal_source.py
-      - name: Train and run Transformers validation/test on Modal A100
+      - name: Check for completed Modal training stage
+        id: cached_training
+        shell: bash
         run: |
           mkdir -p workflow-output
+          if modal volume get --force "${ARTIFACT_VOLUME}" \
+            "runs/${RUN_ID}/training_manifest.json" \
+            workflow-output/training-manifest.json; then
+            echo "found=true" >> "${GITHUB_OUTPUT}"
+            echo "Reusing completed Modal training stage for ${RUN_ID}."
+          else
+            rm -f workflow-output/training-manifest.json
+            echo "found=false" >> "${GITHUB_OUTPUT}"
+            echo "No completed training stage found for ${RUN_ID}; starting Modal training."
+          fi
+      - name: Prepare Modal source
+        if: steps.cached_training.outputs.found != 'true'
+        run: python scripts/prepare_modal_source.py
+      - name: Train and run Transformers validation/test on Modal A100
+        if: steps.cached_training.outputs.found != 'true'
+        run: |
           modal run --write-result workflow-output/training-manifest.json modal/train_app.py \
             --run-id "${RUN_ID}" --git-sha "${GITHUB_SHA}"
-      - name: Download merged model from Modal Volume
+      - name: Download and locate merged model from Modal Volume
+        shell: bash
         run: |
-          mkdir -p build/merged_model
+          rm -rf build/merged-model-download
+          mkdir -p build/merged-model-download
           modal volume get --force "${ARTIFACT_VOLUME}" \
-            "runs/${RUN_ID}/merged_model" build/merged_model
+            "runs/${RUN_ID}/merged_model" build/merged-model-download
+
+          CONFIG_PATH="$(find build/merged-model-download -type f -name config.json -print -quit)"
+          if [[ -z "${CONFIG_PATH}" ]]; then
+            echo "config.json was not found in the downloaded merged model."
+            echo "Downloaded files:"
+            find build/merged-model-download -maxdepth 4 -type f -print | sort
+            echo "Remote volume entries:"
+            modal volume ls "${ARTIFACT_VOLUME}" "runs/${RUN_ID}/merged_model" || true
+            exit 1
+          fi
+
+          MERGED_MODEL_DIR="$(dirname "${CONFIG_PATH}")"
+          echo "MERGED_MODEL_DIR=${MERGED_MODEL_DIR}" >> "${GITHUB_ENV}"
+          echo "Using merged model directory: ${MERGED_MODEL_DIR}"
+          test -s "${MERGED_MODEL_DIR}/config.json"
       - name: Build llama.cpp on GitHub runner CPU
         run: |
           git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git build/llama.cpp
@@ -93,7 +126,7 @@ jobs:
       - name: Convert and quantize on GitHub runner CPU
         run: |
           mkdir -p build/gguf workflow-output/q8-evaluation
-          python build/llama.cpp/convert_hf_to_gguf.py build/merged_model \
+          python build/llama.cpp/convert_hf_to_gguf.py "${MERGED_MODEL_DIR}" \
             --outfile build/gguf/model-F16.gguf --outtype f16
           build/llama.cpp/build/bin/llama-quantize \
             build/gguf/model-F16.gguf build/gguf/model-Q8_0.gguf Q8_0
