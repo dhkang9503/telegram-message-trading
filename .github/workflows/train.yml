@@ -3,10 +3,6 @@ name: Train parser model
 on:
   workflow_dispatch:
     inputs:
-      quant_types:
-        description: Comma-separated GGUF quantizations
-        required: true
-        default: Q8_0
       run_id:
         description: Optional run ID; blank uses Actions run number and commit
         required: false
@@ -25,18 +21,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Validate datasets
         run: |
-          python scripts/validate_dataset.py \
-            --root . \
-            --write-report workflow-output/dataset-validation.json
-
+          python scripts/validate_dataset.py --root . --write-report workflow-output/dataset-validation.json
       - name: Upload validation report
         uses: actions/upload-artifact@v4
         with:
@@ -47,26 +38,24 @@ jobs:
   train:
     needs: validate-data
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT || 'main' }}
-
+      ARTIFACT_VOLUME: telegram-parser-artifacts
+      LLAMA_CPP_COMMIT: 91d2fc387529940230555abd297a8b5e99737d3f
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install Modal
+      - name: Install workflow dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "modal>=1.2.3,<2"
-
+          python -m pip install "modal>=1.2.3,<2" PyYAML==6.0.2 httpx==0.28.1
       - name: Resolve run ID
         id: run
         shell: bash
@@ -78,47 +67,89 @@ jobs:
           fi
           echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
           echo "RUN_ID=${RUN_ID}" >> "${GITHUB_ENV}"
-
-      - name: Train, export and evaluate on Modal A100
+      - name: Train and run Transformers validation/test on Modal A100
         run: |
           mkdir -p workflow-output
-          modal run \
-            --write-result workflow-output/manifest.json \
-            modal/train_app.py \
-            --run-id "${RUN_ID}" \
-            --git-sha "${GITHUB_SHA}" \
-            --quant-types "${{ inputs.quant_types }}"
-
+          modal run --write-result workflow-output/training-manifest.json modal/train_app.py \
+            --run-id "${RUN_ID}" --git-sha "${GITHUB_SHA}"
+      - name: Download merged model from Modal Volume
+        run: |
+          mkdir -p build/merged_model
+          modal volume get --force "${ARTIFACT_VOLUME}" \
+            "runs/${RUN_ID}/merged_model" build/merged_model
+      - name: Build llama.cpp on GitHub runner CPU
+        run: |
+          git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git build/llama.cpp
+          git -C build/llama.cpp checkout "${LLAMA_CPP_COMMIT}"
+          cmake -S build/llama.cpp -B build/llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_SERVER=ON
+          cmake --build build/llama.cpp/build --target llama-quantize llama-server --parallel 2
+      - name: Install GGUF converter dependencies
+        run: |
+          python -m pip install -r build/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+      - name: Convert and quantize on GitHub runner CPU
+        run: |
+          mkdir -p build/gguf workflow-output/q8-evaluation
+          python build/llama.cpp/convert_hf_to_gguf.py build/merged_model \
+            --outfile build/gguf/model-F16.gguf --outtype f16
+          build/llama.cpp/build/bin/llama-quantize \
+            build/gguf/model-F16.gguf build/gguf/model-Q8_0.gguf Q8_0
+          rm -f build/gguf/model-F16.gguf
+      - name: Evaluate Q8 on GitHub runner CPU
+        run: |
+          python scripts/evaluate_cli.py \
+            --model build/gguf/model-Q8_0.gguf \
+            --server-bin build/llama.cpp/build/bin/llama-server \
+            --data data/base/test.jsonl \
+            --config configs/train.yaml \
+            --output-dir workflow-output/q8-evaluation \
+            --quant-name Q8_0 --gpu-layers 0
+      - name: Finalize manifest and release gate
+        run: |
+          REMOTE_MODEL_PATH="runs/${RUN_ID}/gguf/${RUN_ID}-Q8_0.gguf"
+          python scripts/finalize_manifest.py \
+            --training-manifest workflow-output/training-manifest.json \
+            --metrics workflow-output/q8-evaluation/metrics.json \
+            --model build/gguf/model-Q8_0.gguf \
+            --config configs/train.yaml \
+            --remote-model-path "${REMOTE_MODEL_PATH}" \
+            --output workflow-output/manifest.json
+      - name: Upload final artifacts to Modal Volume
+        run: |
+          modal volume put --force "${ARTIFACT_VOLUME}" build/gguf/model-Q8_0.gguf \
+            "runs/${RUN_ID}/gguf/${RUN_ID}-Q8_0.gguf"
+          modal volume put --force "${ARTIFACT_VOLUME}" workflow-output/manifest.json \
+            "runs/${RUN_ID}/manifest.json"
+          modal volume put --force "${ARTIFACT_VOLUME}" workflow-output/q8-evaluation \
+            "runs/${RUN_ID}/evaluation/original_test/Q8_0/"
       - name: Render summary
-        env:
-          MANIFEST_PATH: workflow-output/manifest.json
         run: |
           python - <<'PY'
-          import json
-          import os
+          import json, os
           from pathlib import Path
-
-          manifest = json.loads(Path(os.environ["MANIFEST_PATH"]).read_text())
-          q8 = manifest.get("evaluation", {}).get("original_test", {}).get("Q8_0", {})
-          errors = q8.get("errors", {})
+          m = json.loads(Path('workflow-output/manifest.json').read_text())
+          q8 = m['evaluation']['original_test']['Q8_0']
+          errors = q8.get('errors', {})
           lines = [
-              f"# Model run `{manifest['run_id']}`",
-              "",
-              f"- Deploy eligible: **{manifest['deploy_eligible']}**",
-              f"- Train rows: {manifest['dataset']['combined_rows']}",
-              f"- Feedback rows appended: {manifest['dataset']['feedback_rows_appended']}",
-              f"- Q8 exact match: {q8.get('exact_match_rate', 'not built')}",
-              f"- Q8 JSON valid: {q8.get('json_valid_rate', 'not built')}",
+              f"# Model run `{m['run_id']}`", "",
+              f"- Deploy eligible: **{m['deploy_eligible']}**",
+              f"- Train rows: {m['dataset']['combined_rows']}",
+              f"- Feedback rows: {m['dataset']['feedback_rows_appended']}",
+              f"- Transformers test exact: {m['evaluation']['transformers_test']['exact_match_rate']}",
+              f"- Q8 exact match: {q8['exact_match_rate']}",
+              f"- Q8 JSON valid: {q8['json_valid_rate']}",
               f"- OPEN_TO_CLOSE: {errors.get('OPEN_TO_CLOSE', 0)}",
-              f"- Modal volume path: `runs/{manifest['run_id']}`",
           ]
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as file:
-              file.write("\n".join(lines) + "\n")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('\n'.join(lines) + '\n')
           PY
-
-      - name: Upload run manifest
+      - name: Upload run manifest and evaluation
         uses: actions/upload-artifact@v4
         with:
           name: model-run-${{ steps.run.outputs.run_id }}
-          path: workflow-output/manifest.json
+          path: |
+            workflow-output/manifest.json
+            workflow-output/q8-evaluation/metrics.json
+            workflow-output/q8-evaluation/wrong_predictions.jsonl
           retention-days: 90

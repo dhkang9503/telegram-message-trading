@@ -3,11 +3,10 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
-import os
 import random
 import shutil
-import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,22 +18,13 @@ CONFIG_LOCAL = REPO_ROOT / "configs"
 DATA_LOCAL = REPO_ROOT / "data"
 SCRIPTS_LOCAL = REPO_ROOT / "scripts"
 
-LLAMA_CPP_COMMIT = "91d2fc387529940230555abd297a8b5e99737d3f"
 ARTIFACT_VOLUME_NAME = "telegram-parser-artifacts"
 HF_CACHE_VOLUME_NAME = "telegram-parser-hf-cache"
 
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+        "nvidia/cuda:12.8.1-runtime-ubuntu22.04",
         add_python="3.12",
-    )
-    .apt_install(
-        "build-essential",
-        "cmake",
-        "curl",
-        "git",
-        "libcurl4-openssl-dev",
-        "pkg-config",
     )
     .pip_install(
         "torch==2.11.0",
@@ -52,20 +42,6 @@ image = (
         "protobuf",
         "psutil",
         "pyyaml",
-        "httpx",
-    )
-    .run_commands(
-        "git clone https://github.com/ggml-org/llama.cpp.git /opt/llama.cpp",
-        f"git -C /opt/llama.cpp checkout {LLAMA_CPP_COMMIT}",
-        "cmake -S /opt/llama.cpp -B /opt/llama.cpp/build "
-        "-DCMAKE_BUILD_TYPE=Release "
-        "-DGGML_CUDA=ON "
-        "-DLLAMA_BUILD_TESTS=OFF "
-        "-DLLAMA_BUILD_EXAMPLES=ON "
-        "-DLLAMA_BUILD_SERVER=ON",
-        "cmake --build /opt/llama.cpp/build "
-        "--target llama-quantize llama-server "
-        "--parallel 8",
     )
     .env(
         {
@@ -87,6 +63,9 @@ app = modal.App("telegram-parser-training", image=image)
 artifact_volume = modal.Volume.from_name(ARTIFACT_VOLUME_NAME, create_if_missing=True)
 hf_cache_volume = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
 
+OPEN_TYPES = {"OPEN_LONG", "OPEN_SHORT"}
+CLOSE_TYPES = {"CLOSE_HALF", "CLOSE_ADDS", "CLOSE_ALL"}
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -100,24 +79,55 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as file:
+        return [json.loads(line) for line in file if line.strip()]
+
+
+def normalize_result(obj: Any) -> dict[str, Any]:
+    if not isinstance(obj, dict) or not isinstance(obj.get("actions"), list):
+        return {"actions": []}
+    actions = []
+    for action in obj["actions"]:
+        if isinstance(action, dict):
+            actions.append({"type": action.get("type"), "price": action.get("price")})
+    return {"actions": actions}
+
+
+def classify_errors(expected: dict[str, Any], predicted: dict[str, Any], counts: Counter[str]) -> None:
+    expected_types = [item["type"] for item in expected["actions"]]
+    predicted_types = [item["type"] for item in predicted["actions"]]
+    expected_set = set(expected_types)
+    predicted_set = set(predicted_types)
+    if "OPEN_LONG" in expected_set and "OPEN_SHORT" in predicted_set:
+        counts["LONG_TO_SHORT"] += 1
+    if "OPEN_SHORT" in expected_set and "OPEN_LONG" in predicted_set:
+        counts["SHORT_TO_LONG"] += 1
+    if expected_set & OPEN_TYPES and predicted_set & CLOSE_TYPES:
+        counts["OPEN_TO_CLOSE"] += 1
+    if expected_set & CLOSE_TYPES and predicted_set & OPEN_TYPES:
+        counts["CLOSE_TO_OPEN"] += 1
+    if not expected_types and predicted_types:
+        counts["FALSE_ACTION"] += 1
+    if expected_types and not predicted_types:
+        counts["MISSED_ACTION"] += 1
+
+
 @app.function(
     gpu="A100-40GB",
     cpu=8.0,
     memory=32768,
-    ephemeral_disk=40960,
+    ephemeral_disk=20480,
     timeout=4 * 60 * 60,
-    volumes={
-        "/artifacts": artifact_volume,
-        "/cache": hf_cache_volume,
-    },
+    volumes={"/artifacts": artifact_volume, "/cache": hf_cache_volume},
 )
-def train_and_evaluate(run_id: str, git_sha: str, quant_types_csv: str) -> str:
+def train_and_evaluate(run_id: str, git_sha: str) -> str:
     import numpy as np
     import torch
     import yaml
     from datasets import Dataset, DatasetDict
     from huggingface_hub import snapshot_download
-    from peft import LoraConfig, PeftModel, get_peft_model
+    from peft import LoraConfig, get_peft_model
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
@@ -129,40 +139,25 @@ def train_and_evaluate(run_id: str, git_sha: str, quant_types_csv: str) -> str:
 
     sys.path.insert(0, "/repo")
     from scripts.build_train_dataset import build_training_rows, write_jsonl
-    from scripts.compare_baseline import compare_metrics
-    from scripts.evaluate import evaluate_gguf, read_jsonl
     from scripts.validate_dataset import validate_repository_data
 
     config_path = Path("/repo/configs/train.yaml")
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     system_prompt = config["model"]["system_prompt"]
-    quant_types = [
-        item.strip().upper()
-        for item in quant_types_csv.split(",")
-        if item.strip()
-    ]
-    allowed_quants = {"Q4_K_M", "Q5_K_M", "Q8_0"}
-    if not quant_types or not set(quant_types) <= allowed_quants:
-        raise ValueError(f"quant_types must be a subset of {sorted(allowed_quants)}")
 
     run_root = Path("/artifacts/runs") / run_id
-    manifest_path = run_root / "manifest.json"
-    if manifest_path.exists():
+    training_manifest_path = run_root / "training_manifest.json"
+    if training_manifest_path.exists():
         artifact_volume.reload()
-        if manifest_path.exists():
-            return manifest_path.read_text(encoding="utf-8")
+        if training_manifest_path.exists():
+            return training_manifest_path.read_text(encoding="utf-8")
 
-    run_root.mkdir(parents=True, exist_ok=True)
     checkpoints_dir = run_root / "checkpoints"
     adapter_dir = run_root / "lora_adapter"
     merged_dir = run_root / "merged_model"
-    evaluation_dir = run_root / "evaluation"
-    gguf_dir = run_root / "gguf"
+    evaluation_dir = run_root / "evaluation" / "transformers"
     dataset_dir = run_root / "dataset"
-    for path in [
-        checkpoints_dir, adapter_dir, merged_dir,
-        evaluation_dir, gguf_dir, dataset_dir,
-    ]:
+    for path in (checkpoints_dir, adapter_dir, merged_dir, evaluation_dir, dataset_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     seed = int(config["reproducibility"]["seed"])
@@ -184,24 +179,15 @@ def train_and_evaluate(run_id: str, git_sha: str, quant_types_csv: str) -> str:
     )
     combined_train_path = dataset_dir / "train.combined.jsonl"
     write_jsonl(combined_train_path, combined_rows)
-    (dataset_dir / "build_report.json").write_text(
-        json.dumps(build_report, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
     shutil.copy2("/repo/data/base/validation.jsonl", dataset_dir / "validation.jsonl")
     shutil.copy2("/repo/data/base/test.jsonl", dataset_dir / "test.jsonl")
-    shutil.copy2("/repo/data/regression/live_failures.jsonl", dataset_dir / "live_failures.jsonl")
     shutil.copy2(config_path, run_root / "train.yaml")
 
     model_id = config["model"]["base_model_id"]
     base_model_dir = Path("/cache/models") / model_id.replace("/", "--")
     if not (base_model_dir / "model.safetensors").exists():
         base_model_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_download(
-            repo_id=model_id,
-            local_dir=str(base_model_dir),
-            max_workers=8,
-        )
+        snapshot_download(repo_id=model_id, local_dir=str(base_model_dir), max_workers=8)
         hf_cache_volume.commit()
 
     tokenizer = AutoTokenizer.from_pretrained(str(base_model_dir), use_fast=True)
@@ -213,31 +199,25 @@ def train_and_evaluate(run_id: str, git_sha: str, quant_types_csv: str) -> str:
     raw_rows = {
         "train": combined_rows,
         "validation": read_jsonl(Path("/repo/data/base/validation.jsonl")),
-        "test": read_jsonl(Path("/repo/data/base/test.jsonl")),
     }
 
     def tokenize_row(example: dict[str, Any]) -> dict[str, Any]:
         messages = example["messages"]
         prompt_ids = tokenizer.apply_chat_template(
-            messages[:2],
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=False,
+            messages[:2], tokenize=True, add_generation_prompt=True, enable_thinking=False
         )
         completion_ids = tokenizer(
-            messages[2]["content"] + tokenizer.eos_token,
-            add_special_tokens=False,
+            messages[2]["content"] + tokenizer.eos_token, add_special_tokens=False
         )["input_ids"]
         input_ids = prompt_ids + completion_ids
         labels = [-100] * len(prompt_ids) + completion_ids.copy()
         attention_mask = [1] * len(input_ids)
-
         if len(input_ids) > max_length:
             overflow = len(input_ids) - max_length
-            prompt_cut = min(overflow, len(prompt_ids))
-            input_ids = input_ids[prompt_cut:]
-            labels = labels[prompt_cut:]
-            attention_mask = attention_mask[prompt_cut:]
+            cut = min(overflow, len(prompt_ids))
+            input_ids = input_ids[cut:]
+            labels = labels[cut:]
+            attention_mask = attention_mask[cut:]
         if len(input_ids) > max_length:
             input_ids = input_ids[-max_length:]
             labels = labels[-max_length:]
@@ -251,227 +231,162 @@ def train_and_evaluate(run_id: str, git_sha: str, quant_types_csv: str) -> str:
             "length": len(input_ids),
         }
 
-    dataset = DatasetDict(
-        {split: Dataset.from_list(rows) for split, rows in raw_rows.items()}
-    )
+    dataset = DatasetDict({name: Dataset.from_list(rows) for name, rows in raw_rows.items()})
     tokenized = dataset.map(
-        tokenize_row,
-        remove_columns=["messages"],
-        num_proc=1,
-        desc="tokenize",
+        tokenize_row, remove_columns=["messages"], num_proc=1, desc="tokenize"
     )
 
     use_bf16 = torch.cuda.is_bf16_supported()
     model_dtype = torch.bfloat16 if use_bf16 else torch.float16
     base_model = AutoModelForCausalLM.from_pretrained(
-        str(base_model_dir),
-        torch_dtype=model_dtype,
-        device_map={"": 0},
+        str(base_model_dir), torch_dtype=model_dtype, device_map={"": 0}
     )
     base_model.config.use_cache = False
 
     lora = config["training"]["lora"]
-    lora_config = LoraConfig(
-        r=int(lora["r"]),
-        lora_alpha=int(lora["alpha"]),
-        lora_dropout=float(lora["dropout"]),
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=list(lora["target_modules"]),
+    model = get_peft_model(
+        base_model,
+        LoraConfig(
+            r=int(lora["r"]),
+            lora_alpha=int(lora["alpha"]),
+            lora_dropout=float(lora["dropout"]),
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=list(lora["target_modules"]),
+        ),
     )
-    model = get_peft_model(base_model, lora_config)
     model.enable_input_require_grads()
 
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        padding=True,
-        label_pad_token_id=-100,
-        return_tensors="pt",
-    )
     training = config["training"]
-    training_args = TrainingArguments(
-        output_dir=str(checkpoints_dir),
-        overwrite_output_dir=False,
-        num_train_epochs=float(training["num_epochs"]),
-        learning_rate=float(training["learning_rate"]),
-        weight_decay=float(training["weight_decay"]),
-        warmup_ratio=float(training["warmup_ratio"]),
-        lr_scheduler_type=str(training["lr_scheduler_type"]),
-        max_grad_norm=float(training["max_grad_norm"]),
-        per_device_train_batch_size=int(training["train_batch_size"]),
-        per_device_eval_batch_size=int(training["eval_batch_size"]),
-        gradient_accumulation_steps=int(training["gradient_accumulation_steps"]),
-        fp16=not use_bf16,
-        bf16=use_bf16,
-        gradient_checkpointing=True,
-        eval_strategy="epoch",
-        save_strategy="steps",
-        save_steps=int(training["save_steps"]),
-        save_total_limit=int(training["save_total_limit"]),
-        logging_strategy="steps",
-        logging_steps=int(training["logging_steps"]),
-        report_to="none",
-        seed=seed,
-        data_seed=int(config["reproducibility"]["data_seed"]),
-        group_by_length=True,
-        length_column_name="length",
-        dataloader_num_workers=0,
-        remove_unused_columns=True,
-    )
     trainer = Trainer(
         model=model,
-        args=training_args,
+        args=TrainingArguments(
+            output_dir=str(checkpoints_dir),
+            overwrite_output_dir=False,
+            num_train_epochs=float(training["num_epochs"]),
+            learning_rate=float(training["learning_rate"]),
+            weight_decay=float(training["weight_decay"]),
+            warmup_ratio=float(training["warmup_ratio"]),
+            lr_scheduler_type=str(training["lr_scheduler_type"]),
+            max_grad_norm=float(training["max_grad_norm"]),
+            per_device_train_batch_size=int(training["train_batch_size"]),
+            per_device_eval_batch_size=int(training["eval_batch_size"]),
+            gradient_accumulation_steps=int(training["gradient_accumulation_steps"]),
+            fp16=not use_bf16,
+            bf16=use_bf16,
+            gradient_checkpointing=True,
+            eval_strategy="epoch",
+            save_strategy="steps",
+            save_steps=int(training["save_steps"]),
+            save_total_limit=int(training["save_total_limit"]),
+            logging_strategy="steps",
+            logging_steps=int(training["logging_steps"]),
+            report_to="none",
+            seed=seed,
+            data_seed=int(config["reproducibility"]["data_seed"]),
+            group_by_length=True,
+            length_column_name="length",
+            dataloader_num_workers=0,
+            remove_unused_columns=True,
+        ),
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["validation"],
-        data_collator=data_collator,
+        data_collator=DataCollatorForSeq2Seq(
+            tokenizer=tokenizer,
+            padding=True,
+            label_pad_token_id=-100,
+            return_tensors="pt",
+        ),
     )
+
     last_checkpoint = get_last_checkpoint(str(checkpoints_dir))
     train_result = trainer.train(resume_from_checkpoint=last_checkpoint)
     trainer.save_model(str(adapter_dir))
     tokenizer.save_pretrained(str(adapter_dir))
-    trainer.save_metrics("train", train_result.metrics)
-    trainer.save_state()
-
     validation_metrics = trainer.evaluate(tokenized["validation"])
-    (evaluation_dir / "validation_metrics.json").write_text(
-        json.dumps(validation_metrics, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
 
     model.config.use_cache = True
     merged_model = model.merge_and_unload()
     merged_model.save_pretrained(str(merged_dir), safe_serialization=True)
     tokenizer.save_pretrained(str(merged_dir))
-    try:
-        merged_model.generation_config.save_pretrained(str(merged_dir))
-    except Exception:
-        pass
 
-    tokenizer_config_path = merged_dir / "tokenizer_config.json"
-    tokenizer_config = json.loads(tokenizer_config_path.read_text(encoding="utf-8"))
-    if isinstance(tokenizer_config.get("extra_special_tokens"), list):
-        tokenizer_config.pop("extra_special_tokens")
-        tokenizer_config_path.write_text(
-            json.dumps(tokenizer_config, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    AutoTokenizer.from_pretrained(str(merged_dir), use_fast=True)
-
-    del merged_model, model, base_model, trainer
+    del model, base_model, trainer
     gc.collect()
     torch.cuda.empty_cache()
 
-    llama_root = Path("/opt/llama.cpp")
-    converter = llama_root / "convert_hf_to_gguf.py"
-    quantize_bin = llama_root / "build/bin/llama-quantize"
-    server_bin = llama_root / "build/bin/llama-server"
-    f16_path = gguf_dir / f"{run_id}-F16.gguf"
-    subprocess.run(
-        [
-            sys.executable, str(converter), str(merged_dir),
-            "--outfile", str(f16_path), "--outtype", "f16",
-        ],
-        cwd=str(llama_root),
-        check=True,
-    )
-
-    quant_paths: dict[str, Path] = {}
-    for quant_type in quant_types:
-        output_path = gguf_dir / f"{run_id}-{quant_type}.gguf"
-        subprocess.run(
-            [str(quantize_bin), str(f16_path), str(output_path), quant_type],
-            check=True,
-        )
-        quant_paths[quant_type] = output_path
-
-    if not bool(config["export"]["keep_f16_gguf"]):
-        f16_path.unlink(missing_ok=True)
-
-    eval_config = config["evaluation"]
+    merged_model.eval()
     test_rows = read_jsonl(Path("/repo/data/base/test.jsonl"))
-    regression_rows = read_jsonl(Path("/repo/data/regression/live_failures.jsonl"))
-    quant_metrics: dict[str, Any] = {}
-    regression_metrics: dict[str, Any] = {}
+    exact = json_valid = type_exact = price_exact = 0
+    error_counts: Counter[str] = Counter()
+    predictions: list[dict[str, Any]] = []
+    generation = config["evaluation"]
 
-    for index, (quant_type, model_path) in enumerate(quant_paths.items()):
-        quant_metrics[quant_type] = evaluate_gguf(
-            quant_name=quant_type,
-            model_path=model_path,
-            rows=test_rows,
-            output_dir=evaluation_dir / "original_test" / quant_type,
-            system_prompt=system_prompt,
-            server_bin=server_bin,
-            port=int(eval_config["server_port"]) + index,
-            n_ctx=int(eval_config["n_ctx"]),
-            n_predict=int(eval_config["n_predict"]),
-            temperature=float(eval_config["temperature"]),
-            top_k=int(eval_config["top_k"]),
-            top_p=float(eval_config["top_p"]),
-            repeat_penalty=float(eval_config["repeat_penalty"]),
-            server_start_timeout_seconds=float(
-                eval_config["server_start_timeout_seconds"]
-            ),
+    for row in test_rows:
+        messages = row["messages"]
+        prompt = tokenizer.apply_chat_template(
+            messages[:2], tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
-        if regression_rows:
-            regression_metrics[quant_type] = evaluate_gguf(
-                quant_name=f"{quant_type}_LIVE_REGRESSION",
-                model_path=model_path,
-                rows=regression_rows,
-                output_dir=evaluation_dir / "live_regression" / quant_type,
-                system_prompt=system_prompt,
-                server_bin=server_bin,
-                port=int(eval_config["server_port"]) + 100 + index,
-                n_ctx=int(eval_config["n_ctx"]),
-                n_predict=int(eval_config["n_predict"]),
-                temperature=float(eval_config["temperature"]),
-                top_k=int(eval_config["top_k"]),
-                top_p=float(eval_config["top_p"]),
-                repeat_penalty=float(eval_config["repeat_penalty"]),
-                server_start_timeout_seconds=float(
-                    eval_config["server_start_timeout_seconds"]
-                ),
+        inputs = tokenizer(prompt, return_tensors="pt").to(merged_model.device)
+        with torch.inference_mode():
+            output = merged_model.generate(
+                **inputs,
+                max_new_tokens=int(generation["n_predict"]),
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
             )
-
-    (evaluation_dir / "benchmark_summary.json").write_text(
-        json.dumps(quant_metrics, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    if regression_metrics:
-        (evaluation_dir / "live_regression_summary.json").write_text(
-            json.dumps(regression_metrics, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-    q8_metrics = quant_metrics.get("Q8_0")
-    gate_report = (
-        compare_metrics(q8_metrics, config)
-        if q8_metrics is not None
-        else {
-            "deploy_eligible": False,
-            "checks": {},
-            "reason": "Q8_0 was not built",
+        raw = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        expected = normalize_result(json.loads(messages[2]["content"]))
+        result: dict[str, Any] = {
+            "message": messages[1]["content"],
+            "expected": expected,
+            "raw_output": raw,
+            "json_valid": False,
+            "exact_match": False,
         }
-    )
-    (evaluation_dir / "release_gate.json").write_text(
-        json.dumps(gate_report, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+        try:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            predicted = normalize_result(json.loads(raw[start:end + 1]))
+            result["predicted"] = predicted
+            result["json_valid"] = True
+            json_valid += 1
+            if predicted == expected:
+                exact += 1
+                result["exact_match"] = True
+            if [a["type"] for a in predicted["actions"]] == [a["type"] for a in expected["actions"]]:
+                type_exact += 1
+            if [a["price"] for a in predicted["actions"]] == [a["price"] for a in expected["actions"]]:
+                price_exact += 1
+            classify_errors(expected, predicted, error_counts)
+        except Exception as exc:
+            result["parse_error"] = f"{type(exc).__name__}: {exc}"
+            error_counts["INVALID_JSON"] += 1
+        predictions.append(result)
 
-    artifacts = {}
-    for quant_type, path in quant_paths.items():
-        artifacts[quant_type] = {
-            "path": str(path.relative_to(Path("/artifacts"))),
-            "size_bytes": path.stat().st_size,
-            "sha256": sha256_file(path),
-        }
+    total = len(test_rows)
+    transformers_test = {
+        "backend": "transformers-merged-fp16",
+        "test_rows": total,
+        "json_valid_rate": json_valid / total if total else 0.0,
+        "exact_match_rate": exact / total if total else 0.0,
+        "action_type_exact_rate": type_exact / total if total else 0.0,
+        "price_exact_rate": price_exact / total if total else 0.0,
+        "errors": dict(error_counts),
+    }
+    (evaluation_dir / "test_metrics.json").write_text(
+        json.dumps(transformers_test, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    with (evaluation_dir / "test_predictions.jsonl").open("w", encoding="utf-8") as file:
+        for item in predictions:
+            file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "stage": "trained",
         "run_id": run_id,
         "created_at": now_iso(),
         "git_sha": git_sha,
         "base_model_id": model_id,
-        "llama_cpp_commit": config["reproducibility"]["llama_cpp_commit"],
         "dataset": {
             **build_report,
             "combined_train_sha256": sha256_file(combined_train_path),
@@ -483,25 +398,19 @@ def train_and_evaluate(run_id: str, git_sha: str, quant_types_csv: str) -> str:
             "train_metrics": train_result.metrics,
             "validation_metrics": validation_metrics,
         },
-        "evaluation": {
-            "original_test": quant_metrics,
-            "live_regression": regression_metrics,
-            "release_gate": gate_report,
+        "evaluation": {"transformers_test": transformers_test},
+        "artifacts": {
+            "merged_model_path": str(merged_dir.relative_to(Path("/artifacts"))),
+            "adapter_path": str(adapter_dir.relative_to(Path("/artifacts"))),
         },
-        "artifacts": artifacts,
-        "deploy_eligible": bool(gate_report["deploy_eligible"]),
     }
-    manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
-    manifest_path.write_text(manifest_text, encoding="utf-8")
+    text = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+    training_manifest_path.write_text(text, encoding="utf-8")
     artifact_volume.commit()
     hf_cache_volume.commit()
-    return manifest_text
+    return text
 
 
 @app.local_entrypoint()
-def main(
-    run_id: str,
-    git_sha: str,
-    quant_types: str = "Q8_0",
-) -> str:
-    return train_and_evaluate.remote(run_id, git_sha, quant_types)
+def main(run_id: str, git_sha: str) -> str:
+    return train_and_evaluate.remote(run_id, git_sha)
