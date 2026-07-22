@@ -5,7 +5,7 @@ from scripts.validate_dataset import validate_repository_data
 
 
 ROOT = Path(__file__).resolve().parents[1]
-# Operational training uses every available real channel row from train, validation, and test.
+# Operational training intentionally includes every real row from all three stored splits.
 EXPECTED_TRAIN_ROWS = 2164
 
 
