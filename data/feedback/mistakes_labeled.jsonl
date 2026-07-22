@@ -1,36 +1,17 @@
-{"source":{"message":"아주 조금만 더 매수할게요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
-{"source":{"message":"지금 물 한 번 더 탑니다"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
-{"source":{"message":"평단 312까지 맞춰주세요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
-{"source":{"message":"평단 안 좋은 분들은 소량 더 담으세요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
-{"source":{"message":"한 번 더 타고 갈게요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
-{"source":{"message":"지금 추가로 조금 더 들어갑니다"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
-{"source":{"message":"조금 더 내려오면 그때 물 타주세요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"반등 확인되면 추가로 살게요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"상황 보고 한 번 더 탈지 결정할게요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"물 한 번 타고 손절 볼 생각이에요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"평단은 조금 더 내려오면 맞추겠습니다"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"추가매수 신호는 나중에 드릴게요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"슬슬 포지션 전부 정리해주세요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"시간 늦었으니 여기서 다 털고 나오겠습니다"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"이 정도면 모두 정리하시죠"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"지금 전량 익절하고 나올게요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"여기서 포지션 마감하세요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"지금 다 정리하시면 됩니다"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"다음 반등이 나오면 전부 정리하는 쪽으로 볼게요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"조금 더 오르면 정리할지 판단하겠습니다"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"정리 신호는 곧 드릴 테니 대기해주세요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"저는 아까 포지션 전부 정리했어요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"정리할 생각은 있는데 조금 더 볼게요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"수익권 오면 정리하는 방향으로 보겠습니다"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"추가로 탄 물량만 지금 줄이세요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ADDS","price":null}]}}
-{"source":{"message":"물탄 비중만 먼저 덜어내세요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ADDS","price":null}]}}
-{"source":{"message":"대응 어려운 분들은 추가분 비중 줄이세요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ADDS","price":null}]}}
-{"source":{"message":"본 비중은 두고 추가 진입분만 정리하세요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ADDS","price":null}]}}
-{"source":{"message":"비중 줄일지는 조금 더 보고 결정할게요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"숏 소액으로 지금 진입합니다. 안 내려가면 그때 정리할게요"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_SHORT","price":null}]}}
-{"source":{"message":"더 오르면 숏 잡을게요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"약손절은 생각만 하고 일단 그대로 둘게요"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"59에 손절 걸어두세요"},"label":{"status":"labeled","correct_actions":[{"type":"SET_STOP","price":59}]}}
-{"source":{"message":"손절가는 나중에 정하겠습니다"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"추가 주문 취소해주세요"},"label":{"status":"labeled","correct_actions":[{"type":"CANCEL_ADD","price":null}]}}
-{"source":{"message":"추가 주문 취소하고 바로 한 번 더 타세요"},"label":{"status":"labeled","correct_actions":[{"type":"CANCEL_ADD","price":null},{"type":"ADD","price":null}]}}
+{"source":{"message":"조금만 더살게요!"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"쪼금만 더 탈게요 지금!"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"위로 열린차트라 물좀 타보고 안되면 본전에 정리하던지 할게요!"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"내려오면 물 조금씩만 더 타주세요 750정도 맞추시면됩니다!"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"296 맞추세여 평단"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"전 정리햇어요 !"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"지금 양전했는데 최대한 타이트하게 사인드려볼게요 집중들 하고계세요!"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"이거 그냥 59약손절 생각하고 그냥 둘게요!"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"아까 재진입 한 비중이랑 똑같이들 잡으심돼요 물 한번 타고 손절 볼거에요"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"슬슬 정리들 하세요 ! 집 가는중"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"숏 ㅂㅈ 이거 못내린다싶음 정리할게요! 일단 잡겠습니다"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_SHORT","price":null}]}}
+{"source":{"message":"이번에 올리면 그냥 다 정리하는쪽으로 볼게요!"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"물타기 걍 탈게요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"지금 터심들 돼요!"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"못 줄이신분들 지금 줄이세요!!"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ADDS","price":null}]}}
+{"source":{"message":"시간도 너무 늦엇고 너무 느리네여 다 털어버릴게요 !"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"이쯤정리들하시죠 ㅜ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
