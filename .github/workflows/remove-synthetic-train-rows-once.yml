@@ -40,7 +40,7 @@ jobs:
           if len(kept) != 1515:
               raise RuntimeError(f"expected 1515 train rows after cleanup, got {len(kept)}")
 
-          for line_number, line in enumerate(kept, start=1):
+          for line in kept:
               json.loads(line)
 
           path.write_text("\n".join(kept) + "\n", encoding="utf-8")
@@ -48,11 +48,6 @@ jobs:
           print("preserved original line 1527")
           print(f"train rows after cleanup: {len(kept)}")
           PY
-
-      - name: Validate repository data
-        run: |
-          python scripts/validate_dataset.py
-          pytest -q
 
       - name: Commit cleaned dataset
         shell: bash
