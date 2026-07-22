@@ -26,26 +26,16 @@ def make_chatml(system_prompt: str, message: str, actions: dict[str, Any]) -> di
     }
 
 
-def build_training_rows(
-    base_train_path: Path,
+def build_feedback_rows(
     labeled_feedback_path: Path,
     system_prompt: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    base_rows = read_jsonl(base_train_path)
+    source_rows = read_jsonl(labeled_feedback_path)
+    rows: list[dict[str, Any]] = []
     labels_by_message: dict[str, str] = {}
+    duplicate_rows = 0
 
-    for index, row in enumerate(base_rows):
-        _, message, canonical = validate_chatml_row(row, f"{base_train_path}[{index}]")
-        previous = labels_by_message.get(message)
-        if previous is not None and previous != canonical:
-            raise ValueError(f"base train has conflicting labels for {message!r}")
-        labels_by_message[message] = canonical
-
-    feedback_rows = read_jsonl(labeled_feedback_path)
-    appended: list[dict[str, Any]] = []
-    skipped_duplicates = 0
-
-    for index, row in enumerate(feedback_rows):
+    for index, row in enumerate(source_rows):
         message, actions_obj = validate_labeled_feedback(
             row, f"{labeled_feedback_path}[{index}]"
         )
@@ -54,24 +44,111 @@ def build_training_rows(
         if previous is not None:
             if previous != canonical:
                 raise ValueError(
-                    f"feedback conflicts with existing label for {message!r}: "
+                    f"feedback has conflicting labels for {message!r}: "
                     f"existing={previous}, feedback={canonical}"
                 )
-            skipped_duplicates += 1
+            duplicate_rows += 1
             continue
-
-        appended.append(make_chatml(system_prompt, message, actions_obj))
+        rows.append(make_chatml(system_prompt, message, actions_obj))
         labels_by_message[message] = canonical
 
-    combined = base_rows + appended
+    return rows, {
+        "feedback_rows_seen": len(source_rows),
+        "feedback_unique_rows": len(rows),
+        "feedback_duplicate_rows_skipped": duplicate_rows,
+    }
+
+
+def _base_labels(path: Path, rows: list[dict[str, Any]]) -> dict[str, str]:
+    labels_by_message: dict[str, str] = {}
+    for index, row in enumerate(rows):
+        _, message, canonical = validate_chatml_row(row, f"{path}[{index}]")
+        previous = labels_by_message.get(message)
+        if previous is not None and previous != canonical:
+            raise ValueError(f"{path} has conflicting labels for {message!r}")
+        labels_by_message[message] = canonical
+    return labels_by_message
+
+
+def build_training_rows(
+    base_train_path: Path,
+    labeled_feedback_path: Path,
+    system_prompt: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    base_rows = read_jsonl(base_train_path)
+    base_labels = _base_labels(base_train_path, base_rows)
+    feedback_rows, feedback_report = build_feedback_rows(
+        labeled_feedback_path, system_prompt
+    )
+
+    matching_base = 0
+    for index, row in enumerate(feedback_rows):
+        _, message, canonical = validate_chatml_row(
+            row, f"{labeled_feedback_path}.converted[{index}]"
+        )
+        previous = base_labels.get(message)
+        if previous is not None:
+            if previous != canonical:
+                raise ValueError(
+                    f"feedback conflicts with existing train label for {message!r}: "
+                    f"existing={previous}, feedback={canonical}"
+                )
+            matching_base += 1
+
+    # Mistakes are intentionally appended even when the same labeled message is
+    # already present in base train. They are hard examples and should receive
+    # explicit weight in every corrective fine-tuning cycle.
+    combined = base_rows + feedback_rows
     report = {
         "base_rows": len(base_rows),
-        "feedback_rows_seen": len(feedback_rows),
-        "feedback_rows_appended": len(appended),
-        "feedback_rows_skipped_as_duplicates": skipped_duplicates,
+        **feedback_report,
+        "feedback_rows_appended": len(feedback_rows),
+        "feedback_rows_already_in_base": matching_base,
+        "feedback_rows_skipped_as_duplicates": feedback_report[
+            "feedback_duplicate_rows_skipped"
+        ],
         "combined_rows": len(combined),
     }
     return combined, report
+
+
+def build_evaluation_rows(
+    base_evaluation_path: Path,
+    labeled_feedback_path: Path,
+    system_prompt: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    base_rows = read_jsonl(base_evaluation_path)
+    base_labels = _base_labels(base_evaluation_path, base_rows)
+    feedback_rows, feedback_report = build_feedback_rows(
+        labeled_feedback_path, system_prompt
+    )
+
+    matching_base = 0
+    for index, row in enumerate(feedback_rows):
+        _, message, canonical = validate_chatml_row(
+            row, f"{labeled_feedback_path}.converted[{index}]"
+        )
+        previous = base_labels.get(message)
+        if previous is not None:
+            if previous != canonical:
+                raise ValueError(
+                    f"feedback conflicts with evaluation label for {message!r}: "
+                    f"existing={previous}, feedback={canonical}"
+                )
+            matching_base += 1
+
+    # Evaluation intentionally includes the feedback rows again, even if they
+    # overlap a stored split. This is a regression/recovery check: after tuning,
+    # every previously observed live mistake must be exercised explicitly.
+    combined = base_rows + feedback_rows
+    report = {
+        "base_evaluation_rows": len(base_rows),
+        **feedback_report,
+        "feedback_rows_added_to_evaluation": len(feedback_rows),
+        "feedback_rows_already_in_base_evaluation": matching_base,
+        "combined_evaluation_rows": len(combined),
+    }
+    return combined, feedback_rows, report
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
