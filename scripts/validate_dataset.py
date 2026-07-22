@@ -48,6 +48,11 @@ def validate_actions(value: Any, location: str) -> list[dict[str, Any]]:
     return actions
 
 
+def validate_message_text(message: str, location: str) -> None:
+    if "<img>" in message:
+        raise ValueError(f"{location}: literal <img> tags are not allowed in model input")
+
+
 def validate_chatml_row(row: dict[str, Any], location: str) -> tuple[str, str, str]:
     if set(row) != {"messages"}:
         raise ValueError(f"{location}: top-level keys must be exactly ['messages']")
@@ -65,6 +70,8 @@ def validate_chatml_row(row: dict[str, Any], location: str) -> tuple[str, str, s
         if not isinstance(message["content"], str) or not message["content"].strip():
             raise ValueError(f"{location}: message[{index}].content must be non-empty")
         contents.append(message["content"])
+
+    validate_message_text(contents[1], f"{location}.user")
 
     try:
         assistant_obj = json.loads(contents[2])
@@ -84,6 +91,7 @@ def validate_labeled_feedback(row: dict[str, Any], location: str) -> tuple[str, 
     label = row.get("label")
     if not isinstance(source, dict) or not isinstance(source.get("message"), str):
         raise ValueError(f"{location}: labeled feedback requires source.message")
+    validate_message_text(source["message"], f"{location}.source.message")
     if not isinstance(label, dict):
         raise ValueError(f"{location}: labeled feedback requires label")
     if label.get("status") not in {"labeled", "approved"}:
