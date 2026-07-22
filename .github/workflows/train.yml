@@ -67,6 +67,23 @@ jobs:
           fi
           echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
           echo "RUN_ID=${RUN_ID}" >> "${GITHUB_ENV}"
+      - name: Build mistake-aware validation and test datasets
+        run: |
+          mkdir -p data/runtime workflow-output/evaluation-data
+          python scripts/build_evaluation_dataset.py \
+            --base-evaluation data/base/validation.jsonl \
+            --labeled-feedback data/feedback/mistakes_labeled.jsonl \
+            --config configs/train.yaml \
+            --combined-output data/runtime/validation-plus-mistakes.jsonl \
+            --feedback-output data/runtime/mistakes-eval.jsonl \
+            --report workflow-output/evaluation-data/validation-plus-mistakes.json
+          python scripts/build_evaluation_dataset.py \
+            --base-evaluation data/base/test.jsonl \
+            --labeled-feedback data/feedback/mistakes_labeled.jsonl \
+            --config configs/train.yaml \
+            --combined-output data/runtime/test-plus-mistakes.jsonl \
+            --feedback-output data/runtime/mistakes-eval.jsonl \
+            --report workflow-output/evaluation-data/test-plus-mistakes.json
       - name: Check for completed Modal training stage
         id: cached_training
         shell: bash
@@ -125,20 +142,29 @@ jobs:
           python -m pip install -r build/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
       - name: Convert and quantize on GitHub runner CPU
         run: |
-          mkdir -p build/gguf workflow-output/q8-evaluation
+          mkdir -p build/gguf workflow-output/q8-evaluation workflow-output/q8-mistake-evaluation
           python build/llama.cpp/convert_hf_to_gguf.py "${MERGED_MODEL_DIR}" \
             --outfile build/gguf/model-F16.gguf --outtype f16
           build/llama.cpp/build/bin/llama-quantize \
             build/gguf/model-F16.gguf build/gguf/model-Q8_0.gguf Q8_0
           rm -f build/gguf/model-F16.gguf
-      - name: Evaluate Q8 on GitHub runner CPU
+      - name: Evaluate Q8 on test plus mistakes
         run: |
           python scripts/evaluate_cli.py \
             --model build/gguf/model-Q8_0.gguf \
             --server-bin build/llama.cpp/build/bin/llama-server \
-            --data data/base/test.jsonl \
+            --data data/runtime/test-plus-mistakes.jsonl \
             --config configs/train.yaml \
             --output-dir workflow-output/q8-evaluation \
+            --quant-name Q8_0 --gpu-layers 0
+      - name: Evaluate Q8 mistake recovery
+        run: |
+          python scripts/evaluate_cli.py \
+            --model build/gguf/model-Q8_0.gguf \
+            --server-bin build/llama.cpp/build/bin/llama-server \
+            --data data/runtime/mistakes-eval.jsonl \
+            --config configs/train.yaml \
+            --output-dir workflow-output/q8-mistake-evaluation \
             --quant-name Q8_0 --gpu-layers 0
       - name: Finalize manifest and release gate
         run: |
@@ -146,6 +172,8 @@ jobs:
           python scripts/finalize_manifest.py \
             --training-manifest workflow-output/training-manifest.json \
             --metrics workflow-output/q8-evaluation/metrics.json \
+            --mistake-metrics workflow-output/q8-mistake-evaluation/metrics.json \
+            --evaluation-report workflow-output/evaluation-data/test-plus-mistakes.json \
             --model build/gguf/model-Q8_0.gguf \
             --config configs/train.yaml \
             --remote-model-path "${REMOTE_MODEL_PATH}" \
@@ -157,23 +185,29 @@ jobs:
           modal volume put --force "${ARTIFACT_VOLUME}" workflow-output/manifest.json \
             "runs/${RUN_ID}/manifest.json"
           modal volume put --force "${ARTIFACT_VOLUME}" workflow-output/q8-evaluation \
-            "runs/${RUN_ID}/evaluation/original_test/Q8_0/"
+            "runs/${RUN_ID}/evaluation/test_plus_mistakes/Q8_0/"
+          modal volume put --force "${ARTIFACT_VOLUME}" workflow-output/q8-mistake-evaluation \
+            "runs/${RUN_ID}/evaluation/mistake_recovery/Q8_0/"
       - name: Render summary
         run: |
           python - <<'PY'
           import json, os
           from pathlib import Path
           m = json.loads(Path('workflow-output/manifest.json').read_text())
-          q8 = m['evaluation']['original_test']['Q8_0']
-          errors = q8.get('errors', {})
+          combined = m['evaluation']['test_plus_mistakes']['Q8_0']
+          mistakes = m['evaluation']['mistake_recovery']['Q8_0']
+          errors = combined.get('errors', {})
           lines = [
               f"# Model run `{m['run_id']}`", "",
               f"- Deploy eligible: **{m['deploy_eligible']}**",
               f"- Train rows: {m['dataset']['combined_rows']}",
-              f"- Feedback rows: {m['dataset']['feedback_rows_appended']}",
-              f"- Transformers test exact: {m['evaluation']['transformers_test']['exact_match_rate']}",
-              f"- Q8 exact match: {q8['exact_match_rate']}",
-              f"- Q8 JSON valid: {q8['json_valid_rate']}",
+              f"- Feedback rows trained: {m['dataset']['feedback_rows_appended']}",
+              f"- Transformers test+mistakes exact: {m['evaluation']['transformers_test']['exact_match_rate']}",
+              f"- Q8 test+mistakes rows: {combined['test_rows']}",
+              f"- Q8 test+mistakes exact: {combined['exact_match_rate']}",
+              f"- Q8 mistake recovery rows: {mistakes['test_rows']}",
+              f"- Q8 mistake recovery exact: {mistakes['exact_match_rate']}",
+              f"- Q8 JSON valid: {combined['json_valid_rate']}",
               f"- OPEN_TO_CLOSE: {errors.get('OPEN_TO_CLOSE', 0)}",
           ]
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
@@ -185,6 +219,9 @@ jobs:
           name: model-run-${{ steps.run.outputs.run_id }}
           path: |
             workflow-output/manifest.json
+            workflow-output/evaluation-data/*.json
             workflow-output/q8-evaluation/metrics.json
             workflow-output/q8-evaluation/wrong_predictions.jsonl
+            workflow-output/q8-mistake-evaluation/metrics.json
+            workflow-output/q8-mistake-evaluation/wrong_predictions.jsonl
           retention-days: 90
