@@ -5,6 +5,7 @@ from scripts.validate_dataset import validate_repository_data
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Base train contains only the user-identified real channel rows after synthetic cleanup.
 EXPECTED_REAL_TRAIN_ROWS = 1515
 
 
