@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - data/remove-synthetic-and-use-real-mistakes
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
 
 permissions:
   contents: write
