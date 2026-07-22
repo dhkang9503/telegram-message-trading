@@ -13,5 +13,6 @@
 {"source":{"message":"물타기 걍 탈게요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
 {"source":{"message":"지금 터심들 돼요!"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
 {"source":{"message":"못 줄이신분들 지금 줄이세요!!"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ADDS","price":null}]}}
-{"source":{"message":"시간도 너무 늦엇고 너무 느리네여 다 털어버릴게요 !"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"시간도 늦엇고 너무 느리네여 다 털어버릴게요 !"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
 {"source":{"message":"이쯤정리들하시죠 ㅜ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"첫비중 만들고 볼게요 ! 조금 더 산것도 날리세요 !"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ADDS","price":null}]}}
