@@ -6,7 +6,12 @@ import sys
 
 import httpx
 
-from live_bot import LLAMA_TIMEOUT_SECONDS, LLAMA_URL, infer
+from live_bot import (
+    LLAMA_TIMEOUT_SECONDS,
+    LLAMA_URL,
+    infer,
+    normalize_trading_shorthand,
+)
 
 
 async def main() -> int:
@@ -14,11 +19,13 @@ async def main() -> int:
         print(f'사용법: python {sys.argv[0]} "테스트할 메시지"')
         return 1
 
-    message = " ".join(sys.argv[1:]).strip()
+    original_message = " ".join(sys.argv[1:]).strip()
 
-    if not message:
+    if not original_message:
         print("오류: 빈 메시지는 테스트할 수 없습니다.")
         return 1
+
+    message = normalize_trading_shorthand(original_message)
 
     try:
         async with httpx.AsyncClient(timeout=LLAMA_TIMEOUT_SECONDS) as client:
@@ -27,7 +34,9 @@ async def main() -> int:
         print(f"추론 실패: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
-    print(f"입력: {message}")
+    print(f"입력: {original_message}")
+    if message != original_message:
+        print(f"정규화 입력: {message}")
     print(f"추론 시간: {result['inference_seconds']:.3f}초")
     print("원본 출력:")
     print(result["raw_output"])

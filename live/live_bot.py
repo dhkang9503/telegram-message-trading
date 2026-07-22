@@ -410,6 +410,13 @@ def normalize_message(message: Any) -> str:
     return f"<img>{text}" if text and message.photo is not None else text
 
 
+def normalize_trading_shorthand(text: str) -> str:
+    replacements = {
+        "물ㅂㅈ": "물 ㅂㅈ",
+    }
+    return replacements.get(text, text)
+
+
 def author_matches(post_author: Optional[str]) -> bool:
     if not POST_AUTHOR_FILTER:
         return True
@@ -1091,17 +1098,20 @@ async def run_bot() -> None:
             message = event.message
             if not author_matches(message.post_author):
                 return
-            text = normalize_message(message)
-            if not text:
+            source_text = normalize_message(message)
+            if not source_text:
                 return
+            text = normalize_trading_shorthand(source_text)
             record: dict[str, Any] = {
                 "received_at": now_iso(),
                 "message_date": message.date.isoformat() if message.date else None,
                 "telegram_message_id": message.id,
                 "post_author": message.post_author,
-                "message": text,
+                "message": source_text,
                 "ok": False,
             }
+            if text != source_text:
+                record["normalized_message"] = text
             try:
                 parsed = await infer(llama, text)
                 record.update(parsed)
@@ -1116,7 +1126,7 @@ async def run_bot() -> None:
                         actions = list(parsed["actions"])
                         if (
                             not actions
-                            and "자유" in text
+                            and "자유" in source_text
                             and D(state.data["position"].get("total_qty")) > 0
                         ):
                             actions = [{"type": "CLOSE_ALL", "price": None}]
@@ -1124,7 +1134,7 @@ async def run_bot() -> None:
                             engine.log(
                                 "MODEL_EMPTY_CLOSE_ALL_FALLBACK",
                                 message_id=message.id,
-                                message=text,
+                                message=source_text,
                                 keyword="자유",
                             )
 
@@ -1136,7 +1146,7 @@ async def run_bot() -> None:
                         executions = []
                         for index, action in enumerate(actions):
                             try:
-                                result = await engine.execute(action, message.id, index, text)
+                                result = await engine.execute(action, message.id, index, source_text)
                                 executions.append({"action": action, "ok": True, "result": result})
                             except Exception as exc:
                                 executions.append({"action": action, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
