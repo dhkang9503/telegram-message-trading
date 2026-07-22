@@ -14,7 +14,7 @@ def test_repository_data_is_valid():
     assert report["splits"]["test"]["rows"] == 325
 
 
-def test_empty_feedback_keeps_original_train_count():
+def test_labeled_feedback_is_appended_to_train():
     rows, report = build_training_rows(
         ROOT / "data/base/train.jsonl",
         ROOT / "data/feedback/mistakes_labeled.jsonl",
@@ -24,5 +24,15 @@ def test_empty_feedback_keeps_original_train_count():
             "출력은 actions 배열을 가진 JSON 하나만 반환한다."
         ),
     )
-    assert len(rows) == 1604
-    assert report["feedback_rows_appended"] == 0
+
+    assert report["base_rows"] == 1604
+    assert report["feedback_rows_seen"] > 0
+    assert (
+        report["feedback_rows_seen"]
+        == report["feedback_rows_appended"]
+        + report["feedback_rows_skipped_as_duplicates"]
+    )
+    assert report["combined_rows"] == (
+        report["base_rows"] + report["feedback_rows_appended"]
+    )
+    assert len(rows) == report["combined_rows"]
