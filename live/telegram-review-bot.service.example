@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram inference review bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<LINUX_USER>
+WorkingDirectory=<PROJECT_DIR>
+EnvironmentFile=<PROJECT_DIR>/.env
+ExecStart=<PROJECT_DIR>/.venv/bin/python <PROJECT_DIR>/review_bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
