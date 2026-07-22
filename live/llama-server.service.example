@@ -1,0 +1,26 @@
+# /etc/systemd/system/llama-server.service
+[Unit]
+Description=Qwen Telegram Parser llama.cpp Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/telegram-trading-bot
+
+ExecStart=/home/ubuntu/llama.cpp/build/bin/llama-server \
+  -m /home/ubuntu/telegram-trading-bot/model/qwen3_0.6b_telegram_parser-Q8_0.gguf \
+  -c 512 \
+  -t 2 \
+  --host 127.0.0.1 \
+  --port 8080
+
+Restart=always
+RestartSec=5
+
+# 로그가 즉시 journalctl에 찍히도록 설정
+Environment=LLAMA_LOG_COLORS=0
+
+[Install]
+WantedBy=multi-user.target
