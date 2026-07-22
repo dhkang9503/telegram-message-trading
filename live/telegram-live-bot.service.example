@@ -1,0 +1,20 @@
+# /etc/systemd/system/telegram-live-bot.service
+[Unit]
+Description=Telegram Bitget Live Trading Bot
+After=network-online.target llama-server.service
+Wants=network-online.target
+Requires=llama-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/telegram-trading-bot
+
+ExecStart=/home/ubuntu/telegram-trading-bot/.venv/bin/python /home/ubuntu/telegram-trading-bot/live_bot.py
+
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
