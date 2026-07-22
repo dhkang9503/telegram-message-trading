@@ -1,0 +1,17 @@
+{"source":{"message":"매수 비중 아주 조금만 더 보탤게요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"지금 한 번 더 추가매수 들어갑니다"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"상방 여지는 있어 보여서 한 차례 더 물 탑니다. 안되면 본청할게요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"가격 더 밀리면 그때 조금씩 추가하고 평단 맞추시면 돼요"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"평단 312까지 맞춰주세요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"저는 이미 전량 정리한 상태예요"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"수익권 들어왔네요. 신호는 촘촘하게 드릴 테니 집중해서 기다려주세요"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"이건 63 부근 약손절 정도만 생각하고 일단 유지할게요"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"재진입했던 정도 비중으로 보고 있고, 한 번 더 물 탄 다음 손절 판단할게요"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"<img>이제 포지션 전부 정리해주세요. 이동 중이에요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"숏 소액으로 우선 진입할게요. 안 빠지면 그때 정리하겠습니다"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_SHORT","price":null}]}}
+{"source":{"message":"다음 반등이 나오면 전부 정리하는 방향으로 생각해볼게요"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"그냥 추가매수 한 번 들어갈게요"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"지금 전부 털고 나오시면 됩니다"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"추가로 탄 물량 아직 못 덜어낸 분들은 지금 줄이세요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ADDS","price":null}]}}
+{"source":{"message":"<img>너무 늦었고 움직임도 답답해서 여기서 전량 정리할게요"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"<img>이 정도 자리에서 다 정리하시죠 ㅠㅠ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
