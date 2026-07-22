@@ -30,6 +30,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--training-manifest", type=Path, required=True)
     parser.add_argument("--metrics", type=Path, required=True)
+    parser.add_argument("--mistake-metrics", type=Path, required=True)
+    parser.add_argument("--evaluation-report", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -38,6 +40,8 @@ def main() -> None:
 
     manifest = json.loads(args.training_manifest.read_text(encoding="utf-8"))
     metrics = json.loads(args.metrics.read_text(encoding="utf-8"))
+    mistake_metrics = json.loads(args.mistake_metrics.read_text(encoding="utf-8"))
+    evaluation_report = json.loads(args.evaluation_report.read_text(encoding="utf-8"))
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     gate = compare_metrics(metrics, config)
     manifest.update(
@@ -46,7 +50,14 @@ def main() -> None:
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "evaluation": {
                 **manifest.get("evaluation", {}),
+                # Keep the historical key for downstream compatibility. Its scope
+                # is now explicitly base test plus all labeled live mistakes.
                 "original_test": {"Q8_0": metrics},
+                "test_plus_mistakes": {
+                    "dataset": evaluation_report,
+                    "Q8_0": metrics,
+                },
+                "mistake_recovery": {"Q8_0": mistake_metrics},
                 "release_gate": gate,
             },
             "artifacts": {
