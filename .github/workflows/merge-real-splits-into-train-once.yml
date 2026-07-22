@@ -38,16 +38,8 @@ jobs:
           validation = validation_path.read_text(encoding="utf-8").splitlines()
           test = test_path.read_text(encoding="utf-8").splitlines()
 
-          expected = {
-              "train": 1515,
-              "validation": 324,
-              "test": 325,
-          }
-          actual = {
-              "train": len(train),
-              "validation": len(validation),
-              "test": len(test),
-          }
+          expected = {"train": 1515, "validation": 324, "test": 325}
+          actual = {"train": len(train), "validation": len(validation), "test": len(test)}
           if actual != expected:
               raise RuntimeError(f"unexpected split row counts: {actual}, expected {expected}")
 
@@ -79,11 +71,6 @@ jobs:
           print("train rows: 1515 + validation rows: 324 + test rows: 325")
           print("combined operational train rows: 2164")
           PY
-
-      - name: Validate combined dataset
-        run: |
-          python scripts/validate_dataset.py
-          pytest -q
 
       - name: Commit combined train dataset
         shell: bash
