@@ -407,7 +407,7 @@ class BitgetClient:
 
 def normalize_message(message: Any) -> str:
     text = (message.text or "").replace("\r", " ").replace("\n", " ").strip()
-    return f"<img>{text}" if text and message.photo is not None else text
+    return f"{text}" if text and message.photo is not None else text
 
 
 def normalize_trading_shorthand(text: str) -> str:
