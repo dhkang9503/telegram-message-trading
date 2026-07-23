@@ -33,7 +33,7 @@ CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "-1002170337088"))
 POST_AUTHOR_FILTER = (os.getenv("TELEGRAM_POST_AUTHOR") or "").strip()
 LLAMA_URL = os.getenv("LLAMA_URL", "http://127.0.0.1:8080/completion")
 LLAMA_TIMEOUT_SECONDS = float(os.getenv("LLAMA_TIMEOUT_SECONDS", "30"))
-RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "10"))
+RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "2"))
 
 # Fixed trading rules
 BITGET_BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com").rstrip("/")
@@ -1076,6 +1076,7 @@ async def run_bot() -> None:
         print(f"Bitget {SYMBOL} | crossed | one-way | 98x")
         print(f"Author filter: {POST_AUTHOR_FILTER or '(none)'}")
         print(f"State: {STATE_PATH}")
+        print(f"Reconcile interval: {RECONCILE_INTERVAL_SECONDS:g}s")
 
         async def periodic_reconcile() -> None:
             while True:
