@@ -33,7 +33,7 @@ CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "-1002170337088"))
 POST_AUTHOR_FILTER = (os.getenv("TELEGRAM_POST_AUTHOR") or "").strip()
 LLAMA_URL = os.getenv("LLAMA_URL", "http://127.0.0.1:8080/completion")
 LLAMA_TIMEOUT_SECONDS = float(os.getenv("LLAMA_TIMEOUT_SECONDS", "30"))
-RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "3"))
+RECONCILE_INTERVAL_SECONDS = float(os.getenv("RECONCILE_INTERVAL_SECONDS", "2"))
 
 # Fixed trading rules
 BITGET_BASE_URL = os.getenv("BITGET_BASE_URL", "https://api.bitget.com").rstrip("/")
