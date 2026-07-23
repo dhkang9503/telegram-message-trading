@@ -1076,6 +1076,7 @@ async def run_bot() -> None:
         print(f"Bitget {SYMBOL} | crossed | one-way | 98x")
         print(f"Author filter: {POST_AUTHOR_FILTER or '(none)'}")
         print(f"State: {STATE_PATH}")
+        print(f"Reconcile interval: {RECONCILE_INTERVAL_SECONDS:g}s")
 
         async def periodic_reconcile() -> None:
             while True:
