@@ -60,7 +60,7 @@ SYSTEM_PROMPT = (
     "출력은 actions 배열을 가진 JSON 하나만 반환한다."
 )
 ALLOWED_ACTIONS = {
-    "OPEN_LONG", "OPEN_SHORT", "ADD", "SET_STOP", "SET_TP",
+    "OPEN_LONG", "OPEN_SHORT", "OPEN_REENTRY", "ADD", "SET_STOP", "SET_TP",
     "CLOSE_HALF", "CLOSE_ADDS", "CLOSE_ALL", "CANCEL_ADD", "CANCEL_STOP",
 }
 TRADE_LOCK = asyncio.Lock()
@@ -851,28 +851,35 @@ class TradingEngine:
 
     async def open(
         self,
-        long: bool,
+        action_type: str,
         raw_price: Any,
         message_id: int,
         index: int,
-        source_text: str,
     ) -> dict[str, Any]:
         if D(self.state.data["position"]["total_qty"]) > 0:
             raise BotError("OPEN rejected: position already exists")
         if self.state.data["pending"]["entry_order"]:
             raise BotError("OPEN rejected: entry order already pending")
-        reference = await self.reference_price()
 
-        is_reentry_message = "재진입" in re.sub(r"\s+", "", source_text)
         stopped = self.state.data.get("stopped_position")
         use_reentry = bool(
-            is_reentry_message
-            and stopped
+            stopped
             and stopped.get("available_for_reentry")
+            and stopped.get("side") in {"long", "short"}
+            and stopped.get("stop_order_id")
             and D(stopped.get("total_margin_usdt")) > 0
         )
-        if is_reentry_message and not use_reentry:
-            raise BotError("REENTRY rejected: no available SL-closed position margin is tracked")
+
+        if action_type == "OPEN_REENTRY":
+            if not use_reentry:
+                raise BotError("REENTRY rejected: no verified SL-closed position is available")
+            position_side = str(stopped["side"])
+        elif action_type == "OPEN_LONG":
+            position_side = "long"
+        elif action_type == "OPEN_SHORT":
+            position_side = "short"
+        else:
+            raise BotError(f"Unsupported open action: {action_type}")
 
         if use_reentry:
             margin = D(stopped.get("total_margin_usdt"))
@@ -881,6 +888,7 @@ class TradingEngine:
             margin = INITIAL_MARGIN_USDT
             sizing_source = "fixed_1_usdt"
 
+        reference = await self.reference_price()
         notional = margin * LEVERAGE
         if notional < self.config.min_trade_usdt:
             raise BotError(
@@ -889,15 +897,18 @@ class TradingEngine:
             )
         qty = self.config.floor_size(notional / reference)
         return await self.place_opening_order(
-            kind="entry", side="buy" if long else "sell", qty=qty, raw_price=raw_price,
-            message_id=message_id, index=index,
+            kind="entry",
+            side="buy" if position_side == "long" else "sell",
+            qty=qty,
+            raw_price=raw_price,
+            message_id=message_id,
+            index=index,
             entry_sizing={
                 "source": sizing_source,
                 "margin_usdt": ds(margin),
                 "use_reentry": use_reentry,
             },
         )
-
     async def add(self, raw_price: Any, message_id: int, index: int) -> dict[str, Any]:
         pos = self.require_position()
         if self.state.data["pending"]["entry_order"]:
@@ -989,10 +1000,8 @@ class TradingEngine:
     ) -> dict[str, Any]:
         await self.reconcile()
         kind, price = action["type"], action["price"]
-        if kind == "OPEN_LONG":
-            return await self.open(True, price, message_id, index, source_text)
-        if kind == "OPEN_SHORT":
-            return await self.open(False, price, message_id, index, source_text)
+        if kind in {"OPEN_LONG", "OPEN_SHORT", "OPEN_REENTRY"}:
+            return await self.open(kind, price, message_id, index)
         if kind == "ADD":
             return await self.add(price, message_id, index)
         if kind == "SET_STOP":
