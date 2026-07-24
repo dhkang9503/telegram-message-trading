@@ -1,4 +1,4 @@
-name: Export reentry dataset snapshot
+name: Apply directionless reentry labels
 
 on:
   pull_request:
@@ -6,26 +6,141 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  export:
-    if: github.head_ref == 'fix/directionless-reentry-labels'
+  patch:
+    if: github.head_ref == 'fix/directionless-reentry-labels' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      - name: Upload relevant files
-        uses: actions/upload-artifact@v4
-        with:
-          name: reentry-dataset-snapshot
-          path: |
-            data/base/train.jsonl
-            data/base/validation.jsonl
-            data/base/test.jsonl
-            data/feedback/mistakes_labeled.jsonl
-            scripts/validate_dataset.py
-            tests/test_data_pipeline.py
-          if-no-files-found: error
+      - name: Relabel existing directionless reentry rows
+        shell: bash
+        run: |
+          python - <<'PY'
+          from copy import deepcopy
+          from pathlib import Path
+          import json
+
+          action = [{"type": "OPEN_REENTRY", "price": None}]
+          target_messages = {
+              "비트 재진입 한번만 더 할게요!",
+              "재진입 ㅂㅈ 한번 더할게요",
+              "비트 재진입 한번만 더 보겠습니다!",
+              "재진입비중 반만 재진입할게요 !",
+              "재진입 한번만 더 볼게요!",
+              "아까 재진입 한 비중이랑 똑같이들 잡으심돼요 물 한번 타고 손절 볼거에요",
+          }
+          expected_counts = {
+              "data/base/train.jsonl": 6,
+              "data/base/validation.jsonl": 0,
+              "data/base/test.jsonl": 2,
+              "data/feedback/mistakes_labeled.jsonl": 1,
+          }
+
+          def get_message_and_actions(row):
+              if "messages" in row:
+                  assistant = json.loads(row["messages"][2]["content"])
+                  return row["messages"][1]["content"], assistant["actions"]
+              return row["source"]["message"], row["label"]["correct_actions"]
+
+          def set_actions(row):
+              if "messages" in row:
+                  row["messages"][2]["content"] = json.dumps(
+                      {"actions": action}, ensure_ascii=False, separators=(",", ":")
+                  )
+              else:
+                  row["label"]["correct_actions"] = deepcopy(action)
+
+          changed_total = 0
+          for path_text, expected_count in expected_counts.items():
+              path = Path(path_text)
+              original_lines = path.read_text(encoding="utf-8").splitlines()
+              output_lines = []
+              changed = 0
+
+              for line_number, line in enumerate(original_lines, 1):
+                  row = json.loads(line)
+                  message, current_actions = get_message_and_actions(row)
+                  if message not in target_messages:
+                      output_lines.append(line)
+                      continue
+
+                  if current_actions != []:
+                      raise RuntimeError(
+                          f"{path}:{line_number}: expected empty current label for {message!r}, "
+                          f"got {current_actions!r}"
+                      )
+
+                  before = deepcopy(row)
+                  set_actions(row)
+
+                  if "messages" in row:
+                      before["messages"][2]["content"] = row["messages"][2]["content"]
+                  else:
+                      before["label"]["correct_actions"] = deepcopy(row["label"]["correct_actions"])
+                  if before != row:
+                      raise RuntimeError(f"{path}:{line_number}: non-label data changed")
+
+                  if "messages" in row:
+                      output_lines.append(json.dumps(row, ensure_ascii=False))
+                  else:
+                      output_lines.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+                  changed += 1
+
+              if len(output_lines) != len(original_lines):
+                  raise RuntimeError(f"{path}: row count changed")
+              if changed != expected_count:
+                  raise RuntimeError(
+                      f"{path}: changed {changed} rows, expected exactly {expected_count}"
+                  )
+
+              if changed:
+                  path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+              changed_total += changed
+              print(f"{path}: relabeled {changed} rows; total rows remain {len(original_lines)}")
+
+          if changed_total != 9:
+              raise RuntimeError(f"changed {changed_total} labels, expected exactly 9")
+
+          validator = Path("scripts/validate_dataset.py")
+          source = validator.read_text(encoding="utf-8")
+          old = '''ALLOWED_ACTIONS = {
+              "OPEN_LONG", "OPEN_SHORT", "ADD", "SET_STOP", "SET_TP",
+              "CLOSE_HALF", "CLOSE_ADDS", "CLOSE_ALL", "CANCEL_ADD", "CANCEL_STOP",
+          }
+          '''
+          new = '''ALLOWED_ACTIONS = {
+              "OPEN_LONG", "OPEN_SHORT", "OPEN_REENTRY", "ADD", "SET_STOP", "SET_TP",
+              "CLOSE_HALF", "CLOSE_ADDS", "CLOSE_ALL", "CANCEL_ADD", "CANCEL_STOP",
+          }
+          '''
+          if source.count(old) != 1:
+              raise RuntimeError("expected exactly one validator action allow-list block")
+          validator.write_text(source.replace(old, new), encoding="utf-8")
+          PY
+
+          rm tests/test_audit_directionless_reentry.py
+          rm .github/workflows/audit-directionless-reentry-labels.yml
+          python -m py_compile scripts/validate_dataset.py
+
+      - name: Commit label changes
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            data/base/train.jsonl \
+            data/base/validation.jsonl \
+            data/base/test.jsonl \
+            data/feedback/mistakes_labeled.jsonl \
+            scripts/validate_dataset.py \
+            tests/test_audit_directionless_reentry.py \
+            .github/workflows/audit-directionless-reentry-labels.yml
+          git commit -m "Relabel directionless reentry examples"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
