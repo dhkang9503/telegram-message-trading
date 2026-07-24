@@ -1,0 +1,52 @@
+name: Audit directionless reentry labels
+
+on:
+  push:
+    branches: [fix/directionless-reentry-labels]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate dataset files and reentry candidates
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          roots = []
+          for path in Path('.').rglob('*'):
+              if not path.is_file():
+                  continue
+              if any(part in {'.git', '.github', '.venv', 'venv', '__pycache__'} for part in path.parts):
+                  continue
+              lower = path.name.lower()
+              if path.suffix.lower() in {'.csv', '.json', '.jsonl'} and any(
+                  key in lower for key in ('train', 'test', 'valid', 'mistake')
+              ):
+                  roots.append(path)
+
+          print('=== DATASET FILES ===')
+          for path in sorted(roots):
+              print(f'{path} bytes={path.stat().st_size}')
+
+          print('\n=== LITERAL REENTRY CANDIDATES ===')
+          found = 0
+          for path in sorted(roots):
+              text = path.read_text(encoding='utf-8')
+              for lineno, line in enumerate(text.splitlines(), 1):
+                  compact = re.sub(r'\s+', '', line)
+                  if '재진입' not in compact:
+                      continue
+                  found += 1
+                  print(f'FILE={path} LINE={lineno}')
+                  print(line[:4000])
+                  print('---')
+          print(f'TOTAL_CANDIDATE_LINES={found}')
+          PY
