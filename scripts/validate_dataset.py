@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 ALLOWED_ACTIONS = {
-    "OPEN_LONG", "OPEN_SHORT", "ADD", "SET_STOP", "SET_TP",
+    "OPEN_LONG", "OPEN_SHORT", "OPEN_REENTRY", "ADD", "SET_STOP", "SET_TP",
     "CLOSE_HALF", "CLOSE_ADDS", "CLOSE_ALL", "CANCEL_ADD", "CANCEL_STOP",
 }
 EXPECTED_ROLES = ["system", "user", "assistant"]
