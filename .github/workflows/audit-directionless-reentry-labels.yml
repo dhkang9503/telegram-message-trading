@@ -14,40 +14,61 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Locate dataset files and reentry candidates
+      - name: Write reentry candidate audit
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
+          import json
           import re
 
-          roots = []
-          for path in Path('.').rglob('*'):
-              if not path.is_file():
-                  continue
-              if any(part in {'.git', '.github', '.venv', 'venv', '__pycache__'} for part in path.parts):
-                  continue
-              lower = path.name.lower()
-              if path.suffix.lower() in {'.csv', '.json', '.jsonl'} and any(
-                  key in lower for key in ('train', 'test', 'valid', 'mistake')
-              ):
-                  roots.append(path)
+          paths = [
+              Path('data/base/train.jsonl'),
+              Path('data/base/validation.jsonl'),
+              Path('data/base/test.jsonl'),
+              Path('data/feedback/mistakes_labeled.jsonl'),
+          ]
 
-          print('=== DATASET FILES ===')
-          for path in sorted(roots):
-              print(f'{path} bytes={path.stat().st_size}')
+          def message_and_actions(row):
+              if 'messages' in row:
+                  return row['messages'][1]['content'], json.loads(row['messages'][2]['content'])['actions']
+              return row['source']['message'], row['label']['correct_actions']
 
-          print('\n=== LITERAL REENTRY CANDIDATES ===')
-          found = 0
-          for path in sorted(roots):
-              text = path.read_text(encoding='utf-8')
-              for lineno, line in enumerate(text.splitlines(), 1):
-                  compact = re.sub(r'\s+', '', line)
+          report = {'files': {}, 'literal_reentry': [], 'directionless_reentry': []}
+          for path in paths:
+              lines = path.read_text(encoding='utf-8').splitlines()
+              report['files'][str(path)] = {'rows': len(lines)}
+              for line_number, line in enumerate(lines, 1):
+                  row = json.loads(line)
+                  message, actions = message_and_actions(row)
+                  compact = re.sub(r'\s+', '', message)
                   if '재진입' not in compact:
                       continue
-                  found += 1
-                  print(f'FILE={path} LINE={lineno}')
-                  print(line[:4000])
-                  print('---')
-          print(f'TOTAL_CANDIDATE_LINES={found}')
+                  item = {
+                      'path': str(path),
+                      'line': line_number,
+                      'message': message,
+                      'actions': actions,
+                      'has_long': '롱' in compact,
+                      'has_short': '숏' in compact,
+                  }
+                  report['literal_reentry'].append(item)
+                  if not item['has_long'] and not item['has_short']:
+                      report['directionless_reentry'].append(item)
+
+          Path('reentry_candidates.json').write_text(
+              json.dumps(report, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8',
+          )
+          print(json.dumps({
+              'literal_reentry_count': len(report['literal_reentry']),
+              'directionless_reentry_count': len(report['directionless_reentry']),
+          }, ensure_ascii=False))
           PY
+
+      - name: Upload audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: directionless-reentry-audit
+          path: reentry_candidates.json
+          if-no-files-found: error
