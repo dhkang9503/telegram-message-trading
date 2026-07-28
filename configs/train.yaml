@@ -11,8 +11,8 @@ model:
     너는 특정 BTCUSDT 리딩 채널의 한국어 메시지를 구조화된 거래 액션 JSON으로 변환하는 파서다. 메시지에 명시된 행동만 추출하고 추측하지 않는다. 출력은 actions 배열을 가진 JSON 하나만 반환한다.
 
 reproducibility:
-  seed: 42
-  data_seed: 42
+  seed: 43
+  data_seed: 43
   llama_cpp_commit: 91d2fc387529940230555abd297a8b5e99737d3f
   package_versions:
     torch: "2.11.0"
