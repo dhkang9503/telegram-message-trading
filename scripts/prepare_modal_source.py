@@ -105,11 +105,11 @@ new_evaluation_block = '''    generation = config["evaluation"]
         }
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "metrics.json").write_text(
-            json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            json.dumps(metrics, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8"
         )
         with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as file:
             for item in predictions:
-                file.write(json.dumps(item, ensure_ascii=False) + "\n")
+                file.write(json.dumps(item, ensure_ascii=False) + "\\n")
         return metrics
 
     merged_model.eval()
@@ -157,5 +157,6 @@ text = text.replace(
     1,
 )
 
+compile(text, str(path), "exec")
 path.write_text(text, encoding="utf-8")
 print("Prepared H100 Modal training with merged-model test+mistakes and mistake-only evaluation.")
