@@ -18,3 +18,5 @@
 {"source":{"message":"첫비중 만들고 볼게요 ! 조금 더 산것도 날리세요 !"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ADDS","price":null}]}}
 {"source":{"message":"물ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
 {"source":{"message":"첫비중 더 살게요!"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"손절 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"손절ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
