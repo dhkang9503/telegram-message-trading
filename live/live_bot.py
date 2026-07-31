@@ -45,6 +45,10 @@ POSITION_MODE = "one_way_mode"
 LEVERAGE = Decimal("98")
 INITIAL_MARGIN_USDT = Decimal("1")
 PRICE_RESTORE_MAX_GAP_RATIO = Decimal(os.getenv("PRICE_RESTORE_MAX_GAP_RATIO", "0.03"))
+FAILED_STOP_CORRECTION_TTL_SECONDS = int(os.getenv("FAILED_STOP_CORRECTION_TTL_SECONDS", "300"))
+FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP = int(os.getenv("FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP", "3"))
+STOP_CORRECTION_CUE_RE = re.compile(r"(?:죄송|잘못|정정|오타|실수|아니다|아니고)")
+STOP_CORRECTION_NUMBER_RE = re.compile(r"(?<!\d)(\d{1,4})(?!\d)")
 
 STATE_DIR = BASE_DIR / "state"
 LOG_DIR = BASE_DIR / "logs"
@@ -132,7 +136,13 @@ def default_state() -> dict[str, Any]:
     return {
         "version": 1,
         "position": empty_position(),
-        "pending": {"entry_order": None, "add_orders": [], "stop_order": None, "tp_order": None},
+        "pending": {
+            "entry_order": None,
+            "add_orders": [],
+            "stop_order": None,
+            "tp_order": None,
+            "failed_stop": None,
+        },
         "stopped_position": None,
         "processed_message_ids": [],
         "last_telegram_message_id": None,
@@ -163,6 +173,7 @@ class StateStore:
         pending.setdefault("add_orders", [])
         pending.setdefault("stop_order", None)
         pending.setdefault("tp_order", None)
+        pending.setdefault("failed_stop", None)
         self.data.setdefault("processed_message_ids", [])
         self.data.setdefault("last_telegram_message_id", None)
 
@@ -244,10 +255,20 @@ class BitgetClient:
             content=body_text.encode() if body_text else None,
             headers=headers,
         )
-        response.raise_for_status()
-        payload = response.json()
-        if str(payload.get("code")) != "00000":
-            raise BitgetAPIError(str(payload.get("code")), str(payload.get("msg")), payload)
+        try:
+            payload = response.json()
+        except ValueError:
+            response.raise_for_status()
+            raise BotError(
+                f"Bitget returned non-JSON response: HTTP {response.status_code}"
+            )
+        if not isinstance(payload, dict):
+            response.raise_for_status()
+            raise BotError(f"Bitget returned unexpected payload: {payload!r}")
+        if response.is_error or str(payload.get("code")) != "00000":
+            code = str(payload.get("code") or f"HTTP_{response.status_code}")
+            message = str(payload.get("msg") or response.reason_phrase)
+            raise BitgetAPIError(code, message, payload)
         return payload.get("data")
 
     async def contract_config(self) -> ContractConfig:
@@ -491,6 +512,59 @@ def restore_btc_price(raw_price: Any, reference: Decimal, config: ContractConfig
     return config.floor_price(restored)
 
 
+def extract_stop_correction_fragment(text: str) -> Optional[str]:
+    if not STOP_CORRECTION_CUE_RE.search(text):
+        return None
+    tokens = STOP_CORRECTION_NUMBER_RE.findall(text.replace(",", ""))
+    return tokens[0] if len(tokens) == 1 else None
+
+
+def build_stop_prefix_correction(
+    failed_price: Decimal,
+    fragment: str,
+    reference: Decimal,
+    position_side: str,
+    config: ContractConfig,
+) -> Decimal:
+    failed_integer = failed_price.to_integral_value()
+    if failed_price != failed_integer:
+        raise BotError(f"Failed stop price is not an integer: {failed_price}")
+    failed_digits = str(abs(int(failed_integer)))
+    if not fragment.isdigit() or len(fragment) >= len(failed_digits):
+        raise BotError(
+            f"Invalid stop correction fragment: fragment={fragment!r}, failed={failed_price}"
+        )
+    candidate = config.floor_price(
+        Decimal(int(fragment + failed_digits[len(fragment):]))
+    )
+    if candidate <= 0 or candidate == failed_price:
+        raise BotError(
+            f"Stop correction did not produce a new positive price: {candidate}"
+        )
+    gap = abs(candidate - reference) / reference
+    if gap > PRICE_RESTORE_MAX_GAP_RATIO:
+        raise BotError(
+            f"Corrected stop too far from market: candidate={candidate}, "
+            f"reference={reference}, gap={gap:.2%}"
+        )
+    if abs(candidate - reference) >= abs(failed_price - reference):
+        raise BotError(
+            f"Corrected stop is not closer to market: failed={failed_price}, "
+            f"candidate={candidate}, reference={reference}"
+        )
+    if position_side == "long" and candidate >= reference:
+        raise BotError(
+            f"Long stop correction must be below market: {candidate} >= {reference}"
+        )
+    if position_side == "short" and candidate <= reference:
+        raise BotError(
+            f"Short stop correction must be above market: {candidate} <= {reference}"
+        )
+    if position_side not in {"long", "short"}:
+        raise BotError(f"Invalid position side for stop correction: {position_side}")
+    return candidate
+
+
 def client_oid(message_id: int, index: int, kind: str) -> str:
     return f"tg{message_id}-{index}-{kind}-{uuid.uuid4().hex[:5]}"[:40]
 
@@ -707,6 +781,7 @@ class TradingEngine:
             self.state.data["position"] = empty_position()
             self.state.data["pending"]["stop_order"] = None
             self.state.data["pending"]["tp_order"] = None
+            self.state.data["pending"]["failed_stop"] = None
             return
         total = D(actual.get("total"))
         side = str(actual.get("holdSide"))
@@ -757,6 +832,98 @@ class TradingEngine:
         if D(pos.get("total_qty")) <= 0 or pos.get("side") not in {"long", "short"}:
             raise BotError("No open position")
         return pos
+
+    def _clear_failed_stop(self, reason: str, *, log_event: bool = True) -> None:
+        failed = self.state.data["pending"].get("failed_stop")
+        if failed is None:
+            return
+        self.state.data["pending"]["failed_stop"] = None
+        self.state.save()
+        if log_event:
+            self.log("FAILED_STOP_CLEARED", reason=reason, failed_stop=failed)
+
+    def _record_failed_stop(
+        self,
+        *,
+        trigger: Decimal,
+        raw_price: Any,
+        message_id: int,
+        index: int,
+        position_side: str,
+        error: Exception,
+    ) -> None:
+        record = {
+            "failed_price": ds(trigger),
+            "raw_price": None if raw_price is None else str(raw_price),
+            "message_id": message_id,
+            "action_index": index,
+            "position_side": position_side,
+            "failed_at": now_iso(),
+            "error_type": type(error).__name__,
+            "error_code": getattr(error, "code", None),
+            "error": str(error),
+        }
+        self.state.data["pending"]["failed_stop"] = record
+        self.state.save()
+        self.log("STOP_PLAN_REJECTED", failed_stop=record.copy())
+
+    def _failed_stop_is_fresh(
+        self, failed: dict[str, Any], message_id: int
+    ) -> bool:
+        failed_message_id = int(failed.get("message_id") or 0)
+        message_gap = message_id - failed_message_id
+        if message_gap <= 0 or message_gap > FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP:
+            return False
+        try:
+            failed_at = datetime.fromisoformat(str(failed["failed_at"]))
+        except (KeyError, TypeError, ValueError):
+            return False
+        age = (datetime.now(timezone.utc) - failed_at).total_seconds()
+        return 0 <= age <= FAILED_STOP_CORRECTION_TTL_SECONDS
+
+    async def maybe_failed_stop_correction(
+        self, source_text: str, message_id: int
+    ) -> Optional[dict[str, Any]]:
+        failed = self.state.data["pending"].get("failed_stop")
+        if not failed:
+            return None
+        if not self._failed_stop_is_fresh(failed, message_id):
+            self._clear_failed_stop("correction_window_expired")
+            return None
+        fragment = extract_stop_correction_fragment(source_text)
+        if fragment is None:
+            return None
+        pos = self.require_position()
+        if pos["side"] != failed.get("position_side"):
+            self._clear_failed_stop("position_side_changed")
+            return None
+        reference = await self.reference_price()
+        try:
+            candidate = build_stop_prefix_correction(
+                D(failed.get("failed_price")),
+                fragment,
+                reference,
+                str(pos["side"]),
+                self.config,
+            )
+        except BotError as exc:
+            self.log(
+                "FAILED_STOP_CORRECTION_REJECTED",
+                message_id=message_id,
+                message=source_text,
+                fragment=fragment,
+                failed_stop=failed.copy(),
+                error=str(exc),
+            )
+            return None
+        return {
+            "action": {"type": "SET_STOP", "price": int(candidate)},
+            "failed_price": str(failed["failed_price"]),
+            "fragment": fragment,
+            "candidate_price": ds(candidate),
+            "reference_price": ds(reference),
+            "failed_message_id": int(failed["message_id"]),
+        }
 
     async def wait_change(self, before: Decimal, increase: bool) -> None:
         deadline = time.monotonic() + 6
@@ -964,6 +1131,8 @@ class TradingEngine:
 
     async def set_plan(self, stop: bool, raw_price: Any, message_id: int, index: int) -> dict[str, Any]:
         pos = self.require_position()
+        if stop:
+            self._clear_failed_stop("superseded_by_set_stop", log_event=False)
         if raw_price is None:
             if stop:
                 raise BotError("SET_STOP requires an explicit price")
@@ -976,17 +1145,42 @@ class TradingEngine:
         plan_type = "pos_loss" if stop else "pos_profit"
         await self.cancel_plan_slot(slot)
         coid = client_oid(message_id, index, "sl" if stop else "tp")
-        result = await self.api.place_plan(
-            plan_type=plan_type,
-            hold_side="buy" if pos["side"] == "long" else "sell",
-            trigger_price=trigger,
-            client_oid=coid,
-        )
+        try:
+            result = await self.api.place_plan(
+                plan_type=plan_type,
+                hold_side="buy" if pos["side"] == "long" else "sell",
+                trigger_price=trigger,
+                client_oid=coid,
+            )
+        except BitgetAPIError as exc:
+            if stop:
+                self._record_failed_stop(
+                    trigger=trigger,
+                    raw_price=raw_price,
+                    message_id=message_id,
+                    index=index,
+                    position_side=str(pos["side"]),
+                    error=exc,
+                )
+            raise
+        except httpx.HTTPStatusError as exc:
+            if stop and 400 <= exc.response.status_code < 500:
+                self._record_failed_stop(
+                    trigger=trigger,
+                    raw_price=raw_price,
+                    message_id=message_id,
+                    index=index,
+                    position_side=str(pos["side"]),
+                    error=exc,
+                )
+            raise
         record = {
             "order_id": str(result.get("orderId")), "client_oid": coid, "price": ds(trigger),
             "plan_type": plan_type, "source": source, "created_at": now_iso(),
         }
         self.state.data["pending"][slot] = record
+        if stop:
+            self.state.data["pending"]["failed_stop"] = None
         self.state.save()
         self.log("POSITION_PLAN_SET", slot=slot, **record)
         return record
@@ -1028,6 +1222,7 @@ class TradingEngine:
             return {"cancelled_order_ids": cancelled}
         if kind == "CANCEL_STOP":
             oid = await self.cancel_plan_slot("stop_order")
+            self._clear_failed_stop("cancel_stop_action")
             self.log("STOP_CANCELLED", order_id=oid)
             return {"cancelled_order_id": oid}
         raise BotError(f"Unhandled action: {kind}")
@@ -1134,6 +1329,24 @@ async def run_bot() -> None:
                         await engine.reconcile()
 
                         actions = list(parsed["actions"])
+                        if not actions:
+                            correction = await engine.maybe_failed_stop_correction(
+                                source_text, message.id
+                            )
+                            if correction:
+                                actions = [correction["action"]]
+                                record["fallback"] = "FAILED_SET_STOP_PREFIX_CORRECTION"
+                                record["stop_correction"] = {
+                                    key: value
+                                    for key, value in correction.items()
+                                    if key != "action"
+                                }
+                                engine.log(
+                                    "FAILED_STOP_CORRECTION_INFERRED",
+                                    message_id=message.id,
+                                    message=source_text,
+                                    **record["stop_correction"],
+                                )
                         if (
                             not actions
                             and "자유" in source_text
