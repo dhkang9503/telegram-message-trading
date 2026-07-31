@@ -244,8 +244,28 @@ class BitgetClient:
             content=body_text.encode() if body_text else None,
             headers=headers,
         )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if response.is_error:
+            if isinstance(payload, dict):
+                raise BitgetAPIError(
+                    str(payload.get("code") or f"HTTP_{response.status_code}"),
+                    str(payload.get("msg") or response.reason_phrase),
+                    payload,
+                )
+            raise BitgetAPIError(
+                f"HTTP_{response.status_code}",
+                response.text[:500] or response.reason_phrase,
+                {"status_code": response.status_code, "body": response.text[:500]},
+            )
+        if not isinstance(payload, dict):
+            raise BitgetAPIError(
+                "INVALID_RESPONSE",
+                "Bitget returned a non-JSON response",
+                {"status_code": response.status_code, "body": response.text[:500]},
+            )
         if str(payload.get("code")) != "00000":
             raise BitgetAPIError(str(payload.get("code")), str(payload.get("msg")), payload)
         return payload.get("data")
@@ -962,26 +982,108 @@ class TradingEngine:
         self.log("POSITION_CLOSED_ALL", reason=reason, result=result)
         return {"result": result}
 
+    async def _close_after_stop_failure(
+        self,
+        *,
+        position_snapshot: dict[str, Any],
+        trigger: Decimal,
+        reference: Decimal,
+        message_id: int,
+        index: int,
+        reason: str,
+        error: Optional[str] = None,
+    ) -> dict[str, Any]:
+        failsafe_client_oid = client_oid(message_id, index, "sl-failsafe")
+        close_result = await self.close_all(message_id, index, reason)
+        self._remember_stopped_position(
+            position_snapshot,
+            {
+                "order_id": f"failsafe-{failsafe_client_oid}",
+                "client_oid": failsafe_client_oid,
+                "price": ds(trigger),
+            },
+            {
+                "executeOrderId": "failsafe-market-close",
+                "uTime": str(int(time.time() * 1000)),
+            },
+        )
+        self.state.save()
+        record: dict[str, Any] = {
+            "closed_immediately": True,
+            "reason": reason,
+            "trigger_price": ds(trigger),
+            "reference_price": ds(reference),
+            "close": close_result,
+        }
+        if error:
+            record["plan_error"] = error
+        self.log("STOP_FAILSAFE_CLOSED", **record)
+        return record
+
     async def set_plan(self, stop: bool, raw_price: Any, message_id: int, index: int) -> dict[str, Any]:
         pos = self.require_position()
+        position_snapshot = pos.copy()
+        reference = await self.reference_price()
         if raw_price is None:
             if stop:
                 raise BotError("SET_STOP requires an explicit price")
             trigger = self.config.floor_price(D(pos.get("break_even_price")))
             source = "break_even"
         else:
-            trigger = restore_btc_price(raw_price, await self.reference_price(), self.config)
+            trigger = restore_btc_price(raw_price, reference, self.config)
             source = "message"
         slot = "stop_order" if stop else "tp_order"
         plan_type = "pos_loss" if stop else "pos_profit"
         await self.cancel_plan_slot(slot)
-        coid = client_oid(message_id, index, "sl" if stop else "tp")
-        result = await self.api.place_plan(
-            plan_type=plan_type,
-            hold_side="buy" if pos["side"] == "long" else "sell",
-            trigger_price=trigger,
-            client_oid=coid,
+
+        stop_already_crossed = stop and (
+            (pos["side"] == "long" and reference <= trigger)
+            or (pos["side"] == "short" and reference >= trigger)
         )
+        if stop_already_crossed:
+            self.log(
+                "STOP_TRIGGER_ALREADY_CROSSED",
+                side=pos["side"],
+                trigger_price=ds(trigger),
+                reference_price=ds(reference),
+            )
+            return await self._close_after_stop_failure(
+                position_snapshot=position_snapshot,
+                trigger=trigger,
+                reference=reference,
+                message_id=message_id,
+                index=index,
+                reason="SET_STOP_TRIGGER_ALREADY_CROSSED",
+            )
+
+        coid = client_oid(message_id, index, "sl" if stop else "tp")
+        try:
+            result = await self.api.place_plan(
+                plan_type=plan_type,
+                hold_side="buy" if pos["side"] == "long" else "sell",
+                trigger_price=trigger,
+                client_oid=coid,
+            )
+        except Exception as exc:
+            if not stop:
+                raise
+            error = f"{type(exc).__name__}: {exc}"
+            self.log(
+                "STOP_PLAN_PLACE_FAILED",
+                error=error,
+                side=pos["side"],
+                trigger_price=ds(trigger),
+                reference_price=ds(reference),
+            )
+            return await self._close_after_stop_failure(
+                position_snapshot=position_snapshot,
+                trigger=trigger,
+                reference=reference,
+                message_id=message_id,
+                index=index,
+                reason="SET_STOP_PLACE_FAILED",
+                error=error,
+            )
         record = {
             "order_id": str(result.get("orderId")), "client_oid": coid, "price": ds(trigger),
             "plan_type": plan_type, "source": source, "created_at": now_iso(),
