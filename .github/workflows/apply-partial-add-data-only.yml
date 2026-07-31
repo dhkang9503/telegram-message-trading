@@ -1,0 +1,118 @@
+name: Apply partial ADD data relabels
+
+on:
+  push:
+    branches:
+      - fix/relabel-partial-add-data-only
+    paths:
+      - .github/workflows/apply-partial-add-data-only.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/relabel-partial-add-data-only
+          fetch-depth: 0
+
+      - name: Relabel partial non-official ADD messages
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          BASE_PATHS = [
+              Path("data/base/train.jsonl"),
+              Path("data/base/validation.jsonl"),
+              Path("data/base/test.jsonl"),
+          ]
+          MISTAKES_PATH = Path("data/feedback/mistakes_labeled.jsonl")
+          LIVE_MESSAGE = "물 조금만 더 태울게요!"
+
+          partial_cue = re.compile(
+              r"(?:조금|쪼금|짤짤이|반만|반\s*탈|반탈|나머지\s*반|20\s*퍼|"
+              r"첫비중\s*(?:만\s*)?더|물\s*좀|소액|살짝|약간)"
+          )
+          official_add = re.compile(r"(?:물\s*ㅂㅈ|\d+\s*물타기|물타기\s*\d+)")
+
+          def should_relabel(message, actions):
+              has_add = any(action.get("type") == "ADD" for action in actions)
+              return has_add and bool(partial_cue.search(message)) and not bool(official_add.search(message))
+
+          changed_counts = {}
+          for path in BASE_PATHS:
+              output = []
+              changed = 0
+              for raw in path.read_text(encoding="utf-8").splitlines():
+                  if not raw.strip():
+                      continue
+                  row = json.loads(raw)
+                  message = row["messages"][1]["content"]
+                  result = json.loads(row["messages"][2]["content"])
+                  if should_relabel(message, result["actions"]):
+                      result["actions"] = []
+                      row["messages"][2]["content"] = json.dumps(
+                          result, ensure_ascii=False, separators=(",", ":")
+                      )
+                      raw = json.dumps(row, ensure_ascii=False)
+                      changed += 1
+                  output.append(raw)
+              path.write_text("\n".join(output) + "\n", encoding="utf-8")
+              changed_counts[path.as_posix()] = changed
+
+          output = []
+          changed = 0
+          seen_live = False
+          for raw in MISTAKES_PATH.read_text(encoding="utf-8").splitlines():
+              if not raw.strip():
+                  continue
+              row = json.loads(raw)
+              message = row["source"]["message"]
+              seen_live = seen_live or message == LIVE_MESSAGE
+              actions = row["label"]["correct_actions"]
+              if should_relabel(message, actions):
+                  row["label"]["correct_actions"] = []
+                  raw = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                  changed += 1
+              output.append(raw)
+
+          if not seen_live:
+              output.append(json.dumps({
+                  "source": {"message": LIVE_MESSAGE},
+                  "label": {"status": "labeled", "correct_actions": []},
+              }, ensure_ascii=False, separators=(",", ":")))
+
+          MISTAKES_PATH.write_text("\n".join(output) + "\n", encoding="utf-8")
+          changed_counts[MISTAKES_PATH.as_posix()] = changed + (0 if seen_live else 1)
+
+          expected = {
+              "data/base/train.jsonl": 48,
+              "data/base/validation.jsonl": 10,
+              "data/base/test.jsonl": 12,
+              "data/feedback/mistakes_labeled.jsonl": 5,
+          }
+          if changed_counts != expected:
+              raise SystemExit(f"unexpected relabel counts: {changed_counts}, expected: {expected}")
+
+          print(json.dumps(changed_counts, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Validate datasets and tests
+        run: |
+          python scripts/validate_dataset.py --root .
+          python -m pip install -r requirements-ci.txt
+          pytest -q
+
+      - name: Commit only dataset files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/base/train.jsonl data/base/validation.jsonl data/base/test.jsonl data/feedback/mistakes_labeled.jsonl
+          git commit -m "Relabel partial non-official ADD messages as no action"
+          git push origin HEAD:fix/relabel-partial-add-data-only
