@@ -1,0 +1,243 @@
+name: Apply stop-loss fail-safe fix
+
+on:
+  push:
+    branches:
+      - fix/bitget-stop-loss-failsafe
+    paths:
+      - .github/workflows/apply-stop-loss-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/bitget-stop-loss-failsafe
+          fetch-depth: 0
+
+      - name: Patch live stop-loss handling
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("live/live_bot.py")
+          text = path.read_text(encoding="utf-8")
+
+          old_request = '''        response.raise_for_status()
+          payload = response.json()
+          if str(payload.get("code")) != "00000":
+              raise BitgetAPIError(str(payload.get("code")), str(payload.get("msg")), payload)
+          return payload.get("data")
+          '''
+          new_request = '''        try:
+              payload = response.json()
+          except ValueError:
+              payload = None
+          if response.is_error:
+              if isinstance(payload, dict):
+                  raise BitgetAPIError(
+                      str(payload.get("code") or f"HTTP_{response.status_code}"),
+                      str(payload.get("msg") or response.reason_phrase),
+                      payload,
+                  )
+              raise BitgetAPIError(
+                  f"HTTP_{response.status_code}",
+                  response.text[:500] or response.reason_phrase,
+                  {"status_code": response.status_code, "body": response.text[:500]},
+              )
+          if not isinstance(payload, dict):
+              raise BitgetAPIError(
+                  "INVALID_RESPONSE",
+                  "Bitget returned a non-JSON response",
+                  {"status_code": response.status_code, "body": response.text[:500]},
+              )
+          if str(payload.get("code")) != "00000":
+              raise BitgetAPIError(str(payload.get("code")), str(payload.get("msg")), payload)
+          return payload.get("data")
+          '''
+          if text.count(old_request) != 1:
+              raise SystemExit("Expected Bitget request response block exactly once")
+          text = text.replace(old_request, new_request, 1)
+
+          old_helper_anchor = '''def client_oid(message_id: int, index: int, kind: str) -> str:
+              return f"tg{message_id}-{index}-{kind}-{uuid.uuid4().hex[:5]}"[:40]
+          '''
+          new_helper_anchor = '''def plan_trigger_already_crossed(
+              *, side: str, stop: bool, trigger: Decimal, mark: Decimal,
+          ) -> bool:
+              if side not in {"long", "short"}:
+                  raise BotError(f"Unsupported position side for TP/SL: {side}")
+              if trigger <= 0 or mark <= 0:
+                  raise BotError(f"Invalid TP/SL prices: trigger={trigger}, mark={mark}")
+              if side == "long":
+                  return mark <= trigger if stop else mark >= trigger
+              return mark >= trigger if stop else mark <= trigger
+
+
+          def client_oid(message_id: int, index: int, kind: str) -> str:
+              return f"tg{message_id}-{index}-{kind}-{uuid.uuid4().hex[:5]}"[:40]
+          '''
+          if text.count(old_helper_anchor) != 1:
+              raise SystemExit("Expected client_oid helper exactly once")
+          text = text.replace(old_helper_anchor, new_helper_anchor, 1)
+
+          old_set_plan = '''    async def set_plan(self, stop: bool, raw_price: Any, message_id: int, index: int) -> dict[str, Any]:
+              pos = self.require_position()
+              if raw_price is None:
+                  if stop:
+                      raise BotError("SET_STOP requires an explicit price")
+                  trigger = self.config.floor_price(D(pos.get("break_even_price")))
+                  source = "break_even"
+              else:
+                  trigger = restore_btc_price(raw_price, await self.reference_price(), self.config)
+                  source = "message"
+              slot = "stop_order" if stop else "tp_order"
+              plan_type = "pos_loss" if stop else "pos_profit"
+              await self.cancel_plan_slot(slot)
+              coid = client_oid(message_id, index, "sl" if stop else "tp")
+              result = await self.api.place_plan(
+                  plan_type=plan_type,
+                  hold_side="buy" if pos["side"] == "long" else "sell",
+                  trigger_price=trigger,
+                  client_oid=coid,
+              )
+              record = {
+                  "order_id": str(result.get("orderId")), "client_oid": coid, "price": ds(trigger),
+                  "plan_type": plan_type, "source": source, "created_at": now_iso(),
+              }
+              self.state.data["pending"][slot] = record
+              self.state.save()
+              self.log("POSITION_PLAN_SET", slot=slot, **record)
+              return record
+          '''
+          new_set_plan = '''    async def close_as_stop_failsafe(
+              self,
+              *,
+              position: dict[str, Any],
+              trigger: Decimal,
+              reference: Decimal,
+              message_id: int,
+              index: int,
+              reason: str,
+              error: Optional[str] = None,
+          ) -> dict[str, Any]:
+              failsafe_client_oid = client_oid(message_id, index, "sl-failsafe")
+              close_result = await self.close_all(message_id, index, reason)
+              synthetic_order_id = f"failsafe-{failsafe_client_oid}"
+              self._remember_stopped_position(
+                  position,
+                  {
+                      "order_id": synthetic_order_id,
+                      "client_oid": failsafe_client_oid,
+                      "price": ds(trigger),
+                  },
+                  {
+                      "executeOrderId": "failsafe-market-close",
+                      "uTime": str(int(time.time() * 1000)),
+                  },
+              )
+              self.state.save()
+              record = {
+                  "closed_immediately": True,
+                  "reason": reason,
+                  "trigger_price": ds(trigger),
+                  "reference_price": ds(reference),
+                  "close": close_result,
+              }
+              if error:
+                  record["plan_error"] = error
+              self.log("STOP_FAILSAFE_CLOSED", **record)
+              return record
+
+              async def set_plan(self, stop: bool, raw_price: Any, message_id: int, index: int) -> dict[str, Any]:
+              pos = self.require_position()
+              reference = await self.reference_price()
+              if raw_price is None:
+                  if stop:
+                      raise BotError("SET_STOP requires an explicit price")
+                  trigger = self.config.floor_price(D(pos.get("break_even_price")))
+                  source = "break_even"
+              else:
+                  trigger = restore_btc_price(raw_price, reference, self.config)
+                  source = "message"
+              slot = "stop_order" if stop else "tp_order"
+              plan_type = "pos_loss" if stop else "pos_profit"
+              await self.cancel_plan_slot(slot)
+
+              if stop and plan_trigger_already_crossed(
+                  side=str(pos["side"]), stop=True, trigger=trigger, mark=reference,
+              ):
+                  self.log(
+                      "STOP_TRIGGER_ALREADY_CROSSED",
+                      side=pos["side"],
+                      trigger_price=ds(trigger),
+                      reference_price=ds(reference),
+                  )
+                  return await self.close_as_stop_failsafe(
+                      position=pos.copy(),
+                      trigger=trigger,
+                      reference=reference,
+                      message_id=message_id,
+                      index=index,
+                      reason="SET_STOP_TRIGGER_ALREADY_CROSSED",
+                  )
+
+              coid = client_oid(message_id, index, "sl" if stop else "tp")
+              try:
+                  result = await self.api.place_plan(
+                      plan_type=plan_type,
+                      hold_side="buy" if pos["side"] == "long" else "sell",
+                      trigger_price=trigger,
+                      client_oid=coid,
+                  )
+              except Exception as exc:
+                  if not stop:
+                      raise
+                  error = f"{type(exc).__name__}: {exc}"
+                  self.log(
+                      "STOP_PLAN_PLACE_FAILED",
+                      error=error,
+                      side=pos["side"],
+                      trigger_price=ds(trigger),
+                      reference_price=ds(reference),
+                  )
+                  return await self.close_as_stop_failsafe(
+                      position=pos.copy(),
+                      trigger=trigger,
+                      reference=reference,
+                      message_id=message_id,
+                      index=index,
+                      reason="SET_STOP_PLACE_FAILED",
+                      error=error,
+                  )
+              record = {
+                  "order_id": str(result.get("orderId")), "client_oid": coid, "price": ds(trigger),
+                  "plan_type": plan_type, "source": source, "created_at": now_iso(),
+              }
+              self.state.data["pending"][slot] = record
+              self.state.save()
+              self.log("POSITION_PLAN_SET", slot=slot, **record)
+              return record
+          '''
+          if text.count(old_set_plan) != 1:
+              raise SystemExit("Expected set_plan block exactly once")
+          text = text.replace(old_set_plan, new_set_plan, 1)
+
+          compile(text, str(path), "exec")
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          python -m py_compile live/live_bot.py
+
+      - name: Commit patched source and remove temporary workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add live/live_bot.py
+          git rm .github/workflows/apply-stop-loss-fix.yml
+          git commit -m "Add fail-safe handling for rejected stop-loss plans"
+          git push origin HEAD:fix/bitget-stop-loss-failsafe
