@@ -12,6 +12,9 @@ if __package__ in {None, ""}:
 from scripts.validate_dataset import read_jsonl, validate_chatml_row, validate_labeled_feedback
 
 
+LABEL_OVERRIDE_RELATIVE_PATH = Path("data/label_overrides/partial_add.jsonl")
+
+
 def compact_actions(obj: dict[str, Any]) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
@@ -23,6 +26,72 @@ def make_chatml(system_prompt: str, message: str, actions: dict[str, Any]) -> di
             {"role": "user", "content": message},
             {"role": "assistant", "content": compact_actions(actions)},
         ]
+    }
+
+
+def _find_label_override_path(reference_path: Path) -> Path | None:
+    resolved = reference_path.resolve()
+    for parent in (resolved.parent, *resolved.parents):
+        candidate = parent / LABEL_OVERRIDE_RELATIVE_PATH
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_label_overrides(reference_path: Path) -> tuple[dict[str, str], Path | None]:
+    override_path = _find_label_override_path(reference_path)
+    if override_path is None:
+        return {}, None
+
+    labels_by_message: dict[str, str] = {}
+    for index, row in enumerate(read_jsonl(override_path)):
+        if not isinstance(row, dict) or set(row) != {"message", "actions"}:
+            raise ValueError(
+                f"{override_path}[{index}] must contain exactly message and actions"
+            )
+        message = row["message"]
+        actions = row["actions"]
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError(f"{override_path}[{index}].message must be non-empty")
+        if not isinstance(actions, list):
+            raise ValueError(f"{override_path}[{index}].actions must be a list")
+
+        # Reuse the repository's ChatML validator so override actions obey the
+        # same action/price schema as stored training rows.
+        _, _, canonical = validate_chatml_row(
+            make_chatml("override-validation", message, {"actions": actions}),
+            f"{override_path}[{index}]",
+        )
+        previous = labels_by_message.get(message)
+        if previous is not None and previous != canonical:
+            raise ValueError(f"{override_path} has conflicting overrides for {message!r}")
+        labels_by_message[message] = canonical
+    return labels_by_message, override_path
+
+
+def apply_label_overrides(
+    source_path: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    overrides, override_path = _load_label_overrides(source_path)
+    matched_messages: set[str] = set()
+    changed_rows = 0
+
+    for index, row in enumerate(rows):
+        _, message, canonical = validate_chatml_row(row, f"{source_path}[{index}]")
+        replacement = overrides.get(message)
+        if replacement is None:
+            continue
+        matched_messages.add(message)
+        if replacement != canonical:
+            row["messages"][2]["content"] = replacement
+            changed_rows += 1
+
+    return rows, {
+        "label_override_path": str(override_path) if override_path else None,
+        "label_overrides_defined": len(overrides),
+        "label_override_messages_matched": len(matched_messages),
+        "label_override_rows_changed": changed_rows,
     }
 
 
@@ -75,7 +144,9 @@ def build_training_rows(
     labeled_feedback_path: Path,
     system_prompt: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    base_rows = read_jsonl(base_train_path)
+    base_rows, override_report = apply_label_overrides(
+        base_train_path, read_jsonl(base_train_path)
+    )
     base_labels = _base_labels(base_train_path, base_rows)
     feedback_rows, feedback_report = build_feedback_rows(
         labeled_feedback_path, system_prompt
@@ -101,6 +172,7 @@ def build_training_rows(
     combined = base_rows + feedback_rows
     report = {
         "base_rows": len(base_rows),
+        **override_report,
         **feedback_report,
         "feedback_rows_appended": len(feedback_rows),
         "feedback_rows_already_in_base": matching_base,
@@ -117,7 +189,9 @@ def build_evaluation_rows(
     labeled_feedback_path: Path,
     system_prompt: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    base_rows = read_jsonl(base_evaluation_path)
+    base_rows, override_report = apply_label_overrides(
+        base_evaluation_path, read_jsonl(base_evaluation_path)
+    )
     base_labels = _base_labels(base_evaluation_path, base_rows)
     feedback_rows, feedback_report = build_feedback_rows(
         labeled_feedback_path, system_prompt
@@ -143,6 +217,7 @@ def build_evaluation_rows(
     combined = base_rows + feedback_rows
     report = {
         "base_evaluation_rows": len(base_rows),
+        **override_report,
         **feedback_report,
         "feedback_rows_added_to_evaluation": len(feedback_rows),
         "feedback_rows_already_in_base_evaluation": matching_base,
