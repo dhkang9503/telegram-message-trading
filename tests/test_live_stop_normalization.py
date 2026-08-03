@@ -95,10 +95,12 @@ def test_last_valid_stop_wins_after_validation():
         action("SET_STOP", 64500),
     ]
     assert rejected == []
-    assert deduplicated == [{
-        "action": action("SET_STOP", 64410),
-        "reason": "superseded_by_later_valid_set_stop",
-    }]
+    assert deduplicated == [
+        {
+            "action": action("SET_STOP", 64410),
+            "reason": "superseded_by_later_valid_set_stop",
+        }
+    ]
 
 
 def test_long_stop_must_be_below_mark_price():
@@ -115,6 +117,20 @@ def test_long_stop_must_be_below_mark_price():
 
     assert normalized == [action("SET_STOP", 63000)]
     assert rejected[0]["action"] == action("SET_STOP", 64410)
+    assert deduplicated == []
+
+
+def test_non_stop_actions_are_not_changed():
+    actions = [action("ADD", 64100), action("CANCEL_ADD")]
+
+    normalized, rejected, deduplicated = (
+        validate_and_deduplicate_stop_actions(
+            actions, Decimal("63872.2"), "short", Config()
+        )
+    )
+
+    assert normalized == actions
+    assert rejected == []
     assert deduplicated == []
 
 
