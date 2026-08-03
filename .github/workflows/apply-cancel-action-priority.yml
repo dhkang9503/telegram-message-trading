@@ -1,0 +1,127 @@
+name: Apply cancel action priority fix
+
+on:
+  push:
+    branches:
+      - fix/prioritize-cancel-actions
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/prioritize-cancel-actions
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply implementation and tests
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          bot_path = Path("live/live_bot.py")
+          text = bot_path.read_text(encoding="utf-8")
+
+          helper_marker = "\n\ndef now_iso() -> str:\n"
+          helper = '''
+
+
+def prioritize_cancel_actions(
+    actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Move cancellation actions ahead without changing either group's order."""
+    if len(actions) < 2:
+        return list(actions)
+    return sorted(
+        actions,
+        key=lambda action: not str(action.get("type", "")).startswith("CANCEL_"),
+    )
+'''
+          if "def prioritize_cancel_actions(" in text:
+              raise SystemExit("prioritize_cancel_actions already exists")
+          if text.count(helper_marker) != 1:
+              raise SystemExit("Expected now_iso insertion point exactly once")
+          text = text.replace(helper_marker, helper + helper_marker, 1)
+
+          execution_marker = '                        record["actions"] = actions\n'
+          execution_replacement = (
+              '                        actions = prioritize_cancel_actions(actions)\n'
+              '                        record["actions"] = actions\n'
+          )
+          if text.count(execution_marker) != 1:
+              raise SystemExit("Expected action execution insertion point exactly once")
+          text = text.replace(execution_marker, execution_replacement, 1)
+          bot_path.write_text(text, encoding="utf-8")
+
+          test_path = Path("tests/test_live_action_order.py")
+          test_path.write_text('''from __future__ import annotations
+
+from live.live_bot import prioritize_cancel_actions
+
+
+def action(action_type: str, price: int | None = None) -> dict:
+    return {"type": action_type, "price": price}
+
+
+def test_cancel_add_runs_before_add_without_mutating_model_output():
+    actions = [action("ADD"), action("CANCEL_ADD")]
+
+    reordered = prioritize_cancel_actions(actions)
+
+    assert reordered == [action("CANCEL_ADD"), action("ADD")]
+    assert actions == [action("ADD"), action("CANCEL_ADD")]
+
+
+def test_cancel_actions_and_other_actions_keep_relative_order():
+    actions = [
+        action("ADD"),
+        action("CANCEL_STOP"),
+        action("SET_STOP", 67110),
+        action("CANCEL_ADD"),
+    ]
+
+    assert prioritize_cancel_actions(actions) == [
+        action("CANCEL_STOP"),
+        action("CANCEL_ADD"),
+        action("ADD"),
+        action("SET_STOP", 67110),
+    ]
+
+
+def test_non_cancel_actions_keep_model_order():
+    actions = [action("ADD", 800), action("SET_STOP", 67110)]
+
+    assert prioritize_cancel_actions(actions) == actions
+
+
+def test_single_action_is_unchanged():
+    actions = [action("CANCEL_ADD")]
+
+    assert prioritize_cancel_actions(actions) == actions
+''', encoding="utf-8")
+          PY
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check pytest httpx python-dotenv telethon
+
+      - name: Validate
+        run: |
+          python -m py_compile live/live_bot.py
+          pytest -q tests/test_live_action_order.py
+
+      - name: Commit patch and remove temporary workflow
+        run: |
+          rm .github/workflows/apply-cancel-action-priority.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add live/live_bot.py tests/test_live_action_order.py .github/workflows/apply-cancel-action-priority.yml
+          git commit -m "Prioritize cancel actions before execution"
+          git push origin HEAD:fix/prioritize-cancel-actions
