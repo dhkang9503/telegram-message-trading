@@ -43,7 +43,7 @@ MARGIN_COIN = "USDT"
 MARGIN_MODE = "crossed"
 POSITION_MODE = "one_way_mode"
 LEVERAGE = Decimal("98")
-INITIAL_MARGIN_USDT = Decimal("1")
+INITIAL_MARGIN_USDT = Decimal("6")
 PRICE_RESTORE_MAX_GAP_RATIO = Decimal(os.getenv("PRICE_RESTORE_MAX_GAP_RATIO", "0.03"))
 FAILED_STOP_CORRECTION_TTL_SECONDS = int(os.getenv("FAILED_STOP_CORRECTION_TTL_SECONDS", "300"))
 FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP = int(os.getenv("FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP", "3"))
@@ -522,6 +522,76 @@ def restore_btc_price(raw_price: Any, reference: Decimal, config: ContractConfig
             f"Restored price too far from market: raw={raw}, restored={restored}, reference={reference}, gap={gap:.2%}"
         )
     return config.floor_price(restored)
+
+
+def stop_action_validation_error(
+    action: dict[str, Any],
+    reference: Decimal,
+    position_side: str,
+    config: ContractConfig,
+) -> Optional[str]:
+    """Return a rejection reason when a SET_STOP cannot safely execute."""
+    if action.get("type") != "SET_STOP":
+        return None
+    raw_price = action.get("price")
+    if raw_price is None:
+        return "SET_STOP requires an explicit price"
+    try:
+        trigger = restore_btc_price(raw_price, reference, config)
+    except BotError as exc:
+        return str(exc)
+    if position_side == "long":
+        if trigger >= reference:
+            return f"Long stop {trigger} must be below mark price {reference}"
+    elif position_side == "short":
+        if trigger <= reference:
+            return f"Short stop {trigger} must be above mark price {reference}"
+    else:
+        return f"Invalid position side for stop validation: {position_side}"
+    return None
+
+
+def validate_and_deduplicate_stop_actions(
+    actions: list[dict[str, Any]],
+    reference: Decimal,
+    position_side: str,
+    config: ContractConfig,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Validate every SET_STOP, then keep only the last valid one."""
+    validated: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for action in actions:
+        error = stop_action_validation_error(
+            action, reference, position_side, config
+        )
+        if error is not None:
+            rejected.append({"action": action, "reason": error})
+        else:
+            validated.append(action)
+
+    last_stop_index = next(
+        (
+            index
+            for index in range(len(validated) - 1, -1, -1)
+            if validated[index].get("type") == "SET_STOP"
+        ),
+        None,
+    )
+    normalized: list[dict[str, Any]] = []
+    deduplicated: list[dict[str, Any]] = []
+    for index, action in enumerate(validated):
+        if action.get("type") == "SET_STOP" and index != last_stop_index:
+            deduplicated.append({
+                "action": action,
+                "reason": "superseded_by_later_valid_set_stop",
+            })
+        else:
+            normalized.append(action)
+    return normalized, rejected, deduplicated
 
 
 def extract_stop_correction_fragment(text: str) -> Optional[str]:
@@ -1065,7 +1135,7 @@ class TradingEngine:
             sizing_source = "previous_sl_margin_usdt"
         else:
             margin = INITIAL_MARGIN_USDT
-            sizing_source = "fixed_1_usdt"
+            sizing_source = "fixed_6_usdt"
 
         reference = await self.reference_price()
         notional = margin * LEVERAGE
@@ -1372,6 +1442,24 @@ async def run_bot() -> None:
                                 message=source_text,
                                 keyword="자유",
                             )
+
+                        if any(
+                            action.get("type") == "SET_STOP"
+                            for action in actions
+                        ):
+                            reference = await engine.reference_price()
+                            position_side = str(engine.require_position()["side"])
+                            (
+                                actions,
+                                rejected_actions,
+                                deduplicated_actions,
+                            ) = validate_and_deduplicate_stop_actions(
+                                actions, reference, position_side, config
+                            )
+                            if rejected_actions:
+                                record["rejected_actions"] = rejected_actions
+                            if deduplicated_actions:
+                                record["deduplicated_actions"] = deduplicated_actions
 
                         actions = prioritize_cancel_actions(actions)
                         record["actions"] = actions
