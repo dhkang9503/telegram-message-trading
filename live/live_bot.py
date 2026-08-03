@@ -82,6 +82,18 @@ class BitgetAPIError(BotError):
         self.payload = payload
 
 
+def prioritize_cancel_actions(
+    actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Move cancellation actions ahead without changing either group's order."""
+    if len(actions) < 2:
+        return list(actions)
+    return sorted(
+        actions,
+        key=lambda action: not str(action.get("type", "")).startswith("CANCEL_"),
+    )
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1361,6 +1373,7 @@ async def run_bot() -> None:
                                 keyword="자유",
                             )
 
+                        actions = prioritize_cancel_actions(actions)
                         record["actions"] = actions
 
                         # Deliberately claim before orders: losing one signal after a
