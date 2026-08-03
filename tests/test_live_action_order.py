@@ -1,6 +1,28 @@
 from __future__ import annotations
 
-from live.live_bot import prioritize_cancel_actions
+import ast
+from pathlib import Path
+
+
+def load_prioritize_cancel_actions():
+    source = Path("live/live_bot.py").read_text(encoding="utf-8")
+    module = ast.parse(source)
+    function = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "prioritize_cancel_actions"
+    )
+    function_source = ast.get_source_segment(source, function)
+    namespace: dict = {}
+    exec(
+        "from __future__ import annotations\n" + function_source,
+        namespace,
+    )
+    return namespace["prioritize_cancel_actions"]
+
+
+prioritize_cancel_actions = load_prioritize_cancel_actions()
 
 
 def action(action_type: str, price: int | None = None) -> dict:
