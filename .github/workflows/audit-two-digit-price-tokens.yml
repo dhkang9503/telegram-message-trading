@@ -1,20 +1,19 @@
 name: Audit two-digit price tokens
 
 on:
-  push:
+  pull_request:
     branches:
-      - fix/preserve-leading-zero-price-fragments
+      - main
 
 permissions:
   contents: read
 
 jobs:
   audit:
+    if: github.head_ref == 'fix/preserve-leading-zero-price-fragments'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: fix/preserve-leading-zero-price-fragments
 
       - uses: actions/setup-python@v5
         with:
@@ -28,7 +27,7 @@ jobs:
 
           import json
           import re
-          from collections import Counter, defaultdict
+          from collections import Counter
           from pathlib import Path
           from typing import Any
 
@@ -127,13 +126,13 @@ jobs:
               'parsed_message_rows': parsed_rows,
               'occurrence_rows_with_two_digit_tokens': len(occurrences),
               'unique_message_action_pairs_with_two_digit_tokens': len(unique),
-              'token_counts_occurrences': Counter(
+              'token_counts_occurrences': dict(Counter(
                   token for item in occurrences for token in item['two_digit_tokens']
-              ),
-              'token_counts_unique': Counter(
+              )),
+              'token_counts_unique': dict(Counter(
                   token for item in unique.values() for token in item['two_digit_tokens']
-              ),
-          }, ensure_ascii=False, indent=2, default=dict))
+              )),
+          }, ensure_ascii=False, indent=2))
 
           print('=== UNIQUE CASES ===')
           for index, item in enumerate(sorted(unique.values(), key=lambda x: x['message']), 1):
