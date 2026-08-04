@@ -1482,8 +1482,8 @@ async def run_bot() -> None:
                         await engine.reconcile()
 
                         actions = align_action_prices_to_source(
-                    source_text, list(parsed["actions"])
-                )
+                            source_text, list(parsed["actions"])
+                        )
                         if not actions:
                             correction = await engine.maybe_failed_stop_correction(
                                 source_text, message.id
