@@ -1,0 +1,174 @@
+name: Deploy live bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref containing the live_bot.py to deploy
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-live-bot-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy live_bot.py to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      EC2_PORT: ${{ vars.EC2_SSH_PORT || '22' }}
+      BOT_PATH: ${{ vars.EC2_LIVE_BOT_PATH || '/home/ubuntu/telegram-trading-bot/live_bot.py' }}
+      BOT_SERVICE: ${{ vars.EC2_LIVE_BOT_SERVICE || 'telegram-live-bot' }}
+
+    steps:
+      - name: Check out requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate live bot
+        run: |
+          set -euo pipefail
+          python -m py_compile live/live_bot.py
+          python -m pip install --disable-pip-version-check --quiet pytest
+          python scripts/validate_dataset.py --root .
+          python -m pytest -q
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+
+          for variable in EC2_HOST EC2_USER EC2_SSH_KEY; do
+            if [ -z "${!variable}" ]; then
+              echo "Required secret is empty: ${variable}" >&2
+              exit 1
+            fi
+          done
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          ssh-keyscan -p "$EC2_PORT" -H "$EC2_HOST" >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Upload and restart live bot
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          remote_tmp="/tmp/live_bot.py.${DEPLOY_SHA}.${RUN_ID}"
+          ssh_target="${EC2_USER}@${EC2_HOST}"
+          ssh_options=(
+            -i "$HOME/.ssh/deploy_key"
+            -p "$EC2_PORT"
+            -o BatchMode=yes
+            -o ConnectTimeout=15
+            -o StrictHostKeyChecking=yes
+          )
+
+          scp \
+            -i "$HOME/.ssh/deploy_key" \
+            -P "$EC2_PORT" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            live/live_bot.py \
+            "${ssh_target}:${remote_tmp}"
+
+          ssh "${ssh_options[@]}" "$ssh_target" \
+            "bash -s -- '$remote_tmp' '$BOT_PATH' '$BOT_SERVICE' '$DEPLOY_SHA'" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          remote_tmp=$1
+          bot_path=$2
+          service=$3
+          deploy_sha=$4
+          bot_dir=$(dirname "$bot_path")
+          staged_path="${bot_path}.new"
+          backup_path="${bot_path}.rollback-${deploy_sha}"
+          had_previous=0
+
+          cleanup() {
+            rm -f "$remote_tmp" "$staged_path"
+          }
+          trap cleanup EXIT
+
+          wait_until_active() {
+            local attempt
+            for attempt in $(seq 1 10); do
+              if sudo systemctl is-active --quiet "$service"; then
+                sleep 2
+                sudo systemctl is-active --quiet "$service" && return 0
+              fi
+              sudo systemctl is-failed --quiet "$service" && return 1
+              sleep 1
+            done
+            return 1
+          }
+
+          test -f "$remote_tmp"
+          test -d "$bot_dir"
+          python3 -m py_compile "$remote_tmp"
+
+          if [ -f "$bot_path" ]; then
+            cp -p "$bot_path" "$backup_path"
+            had_previous=1
+          fi
+
+          install -m 0644 "$remote_tmp" "$staged_path"
+          mv -f "$staged_path" "$bot_path"
+
+          if sudo systemctl restart "$service" && wait_until_active; then
+            rm -f "$backup_path"
+            echo "Deployed ${bot_path} and restarted ${service} successfully."
+            exit 0
+          fi
+
+          echo "Deployment failed; showing recent service logs." >&2
+          sudo journalctl -u "$service" -n 80 --no-pager || true
+
+          if [ "$had_previous" -eq 1 ] && [ -f "$backup_path" ]; then
+            echo "Rolling back to the previous live_bot.py." >&2
+            mv -f "$backup_path" "$bot_path"
+            sudo systemctl restart "$service" || true
+            if wait_until_active; then
+              echo "Rollback succeeded; deployment remains failed." >&2
+            else
+              echo "Rollback also failed; inspect the EC2 service immediately." >&2
+              sudo journalctl -u "$service" -n 80 --no-pager || true
+            fi
+          else
+            echo "No previous live_bot.py existed, so there is nothing to roll back." >&2
+            rm -f "$bot_path"
+          fi
+
+          exit 1
+          REMOTE_SCRIPT
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          {
+            echo "### Live bot deployed"
+            echo "- Ref: \`${{ inputs.ref }}\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Target: \`${BOT_PATH}\`"
+            echo "- Service: \`${BOT_SERVICE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
