@@ -134,9 +134,10 @@ def test_non_stop_actions_are_not_changed():
     assert deduplicated == []
 
 
-def test_initial_margin_is_six_usdt():
+def test_initial_margin_uses_account_equity_ratio():
     source = Path("live/live_bot.py").read_text(encoding="utf-8")
 
-    assert 'INITIAL_MARGIN_USDT = Decimal("6")' in source
-    assert 'sizing_source = "fixed_6_usdt"' in source
-    assert 'sizing_source = "fixed_1_usdt"' not in source
+    assert 'INITIAL_MARGIN_EQUITY_RATIO = Decimal("0.0125")' in source
+    assert 'sizing_source = "account_usdt_equity_1_25_percent"' in source
+    assert "INITIAL_MARGIN_USDT" not in source
+    assert "fixed_6_usdt" not in source

@@ -43,7 +43,7 @@ MARGIN_COIN = "USDT"
 MARGIN_MODE = "crossed"
 POSITION_MODE = "one_way_mode"
 LEVERAGE = Decimal("98")
-INITIAL_MARGIN_USDT = Decimal("6")
+INITIAL_MARGIN_EQUITY_RATIO = Decimal("0.0125")
 PRICE_RESTORE_MAX_GAP_RATIO = Decimal(os.getenv("PRICE_RESTORE_MAX_GAP_RATIO", "0.03"))
 FAILED_STOP_CORRECTION_TTL_SECONDS = int(os.getenv("FAILED_STOP_CORRECTION_TTL_SECONDS", "300"))
 FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP = int(os.getenv("FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP", "3"))
@@ -108,6 +108,23 @@ def require_env(name: str) -> str:
 
 def D(value: Any, default: str = "0") -> Decimal:
     return Decimal(default) if value is None or value == "" else Decimal(str(value))
+
+
+def initial_margin_from_account(
+    account: dict[str, Any],
+) -> tuple[Decimal, Decimal]:
+    raw_equity = account.get("usdtEquity")
+    try:
+        equity = D(raw_equity)
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise BotError(
+            f"Invalid account usdtEquity for initial sizing: {raw_equity!r}"
+        ) from exc
+    if equity <= 0:
+        raise BotError(
+            f"Account usdtEquity must be positive for initial sizing: {raw_equity!r}"
+        )
+    return equity, equity * INITIAL_MARGIN_EQUITY_RATIO
 
 
 def ds(value: Decimal) -> str:
@@ -1124,6 +1141,7 @@ class TradingEngine:
         raw_price: Any,
         message_id: int,
         index: int,
+        resolved_price: Optional[Decimal] = None,
         entry_sizing: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         qty = self.config.floor_size(qty)
@@ -1131,7 +1149,12 @@ class TradingEngine:
             raise BotError(f"Order qty {qty} below minTradeNum {self.config.min_trade_num}")
         order_type, price = "market", None
         if raw_price is not None:
-            price = restore_btc_price(raw_price, await self.reference_price(), self.config)
+            if resolved_price is None:
+                price = restore_btc_price(
+                    raw_price, await self.reference_price(), self.config
+                )
+            else:
+                price = self.config.floor_price(resolved_price)
             order_type = "limit"
         coid = client_oid(message_id, index, kind)
         before = D(self.state.data["position"]["total_qty"])
@@ -1145,6 +1168,13 @@ class TradingEngine:
         if entry_sizing:
             record["sizing_source"] = entry_sizing["source"]
             record["margin_usdt"] = entry_sizing["margin_usdt"]
+            for key in (
+                "account_usdt_equity",
+                "equity_ratio",
+                "sizing_price",
+            ):
+                if key in entry_sizing:
+                    record[key] = entry_sizing[key]
 
         # Consume or invalidate the old SL-reentry allowance immediately after
         # Bitget accepts a new entry order. This prevents a crash/replay from
@@ -1201,21 +1231,39 @@ class TradingEngine:
         else:
             raise BotError(f"Unsupported open action: {action_type}")
 
+        account_equity: Optional[Decimal] = None
         if use_reentry:
             margin = D(stopped.get("total_margin_usdt"))
             sizing_source = "previous_sl_margin_usdt"
         else:
-            margin = INITIAL_MARGIN_USDT
-            sizing_source = "fixed_6_usdt"
+            account_equity, margin = initial_margin_from_account(
+                await self.api.account()
+            )
+            sizing_source = "account_usdt_equity_1_25_percent"
 
         reference = await self.reference_price()
+        entry_price: Optional[Decimal] = None
+        sizing_price = reference
+        if raw_price is not None:
+            entry_price = restore_btc_price(raw_price, reference, self.config)
+            sizing_price = entry_price
+
         notional = margin * LEVERAGE
         if notional < self.config.min_trade_usdt:
             raise BotError(
                 f"{sizing_source} gives {notional} USDT notional, "
                 f"below minimum {self.config.min_trade_usdt}"
             )
-        qty = self.config.floor_size(notional / reference)
+        qty = self.config.floor_size(notional / sizing_price)
+        entry_sizing = {
+            "source": sizing_source,
+            "margin_usdt": ds(margin),
+            "sizing_price": ds(sizing_price),
+            "use_reentry": use_reentry,
+        }
+        if account_equity is not None:
+            entry_sizing["account_usdt_equity"] = ds(account_equity)
+            entry_sizing["equity_ratio"] = ds(INITIAL_MARGIN_EQUITY_RATIO)
         return await self.place_opening_order(
             kind="entry",
             side="buy" if position_side == "long" else "sell",
@@ -1223,11 +1271,8 @@ class TradingEngine:
             raw_price=raw_price,
             message_id=message_id,
             index=index,
-            entry_sizing={
-                "source": sizing_source,
-                "margin_usdt": ds(margin),
-                "use_reentry": use_reentry,
-            },
+            resolved_price=entry_price,
+            entry_sizing=entry_sizing,
         )
     async def add(self, raw_price: Any, message_id: int, index: int) -> dict[str, Any]:
         pos = self.require_position()
