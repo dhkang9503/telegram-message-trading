@@ -49,6 +49,7 @@ FAILED_STOP_CORRECTION_TTL_SECONDS = int(os.getenv("FAILED_STOP_CORRECTION_TTL_S
 FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP = int(os.getenv("FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP", "3"))
 STOP_CORRECTION_CUE_RE = re.compile(r"(?:죄송|잘못|정정|오타|실수|아니다|아니고)")
 STOP_CORRECTION_NUMBER_RE = re.compile(r"(?<!\d)(\d{1,4})(?!\d)")
+SOURCE_PRICE_TOKEN_RE = re.compile(r"(?<![\d,])(\d[\d,]*(?:\.\d+)?)(?![\d,]|\.\d)")
 
 STATE_DIR = BASE_DIR / "state"
 LOG_DIR = BASE_DIR / "logs"
@@ -504,18 +505,88 @@ async def infer(http: httpx.AsyncClient, text: str) -> dict[str, Any]:
     return {"raw_output": raw, "actions": parse_actions(raw), "inference_seconds": elapsed}
 
 
+def extract_source_price_tokens(text: str) -> list[str]:
+    """Return numeric source tokens without discarding leading zeroes."""
+    return [
+        match.group(1).replace(",", "")
+        for match in SOURCE_PRICE_TOKEN_RE.finditer(text)
+    ]
+
+
+def _has_significant_leading_zero(token: str) -> bool:
+    integer_part = token.split(".", 1)[0]
+    return len(integer_part) > 1 and integer_part.startswith("0")
+
+
+def align_action_prices_to_source(
+    source_text: str,
+    actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Preserve source token width for uniquely matched priced actions."""
+    available_tokens = extract_source_price_tokens(source_text)
+    aligned = [dict(action) for action in actions]
+
+    for action in aligned:
+        price = action.get("price")
+        if price is None:
+            continue
+        price_value = D(price)
+        matches = [
+            (index, token)
+            for index, token in enumerate(available_tokens)
+            if D(token) == price_value
+        ]
+        if len(matches) != 1:
+            raise BotError(
+                "Could not uniquely align action price to source text: "
+                f"action={action!r}, source={source_text!r}, matches={matches!r}"
+            )
+        index, token = matches[0]
+        del available_tokens[index]
+        if _has_significant_leading_zero(token):
+            action["price"] = token
+    return aligned
+
+
 def restore_btc_price(raw_price: Any, reference: Decimal, config: ContractConfig) -> Decimal:
     raw = D(raw_price)
-    if raw <= 0:
+    if isinstance(raw_price, str):
+        raw_text = raw_price.strip().replace(",", "")
+        parts = raw_text.split(".")
+        if (
+            len(parts) > 2
+            or not parts[0].isdigit()
+            or (len(parts) == 2 and not parts[1].isdigit())
+        ):
+            raise BotError(f"Invalid price token: {raw_price!r}")
+        integer_text = parts[0]
+    else:
+        integer_text = str(abs(int(raw)))
+
+    zero_fragment = (
+        isinstance(raw_price, str)
+        and raw == 0
+        and len(integer_text) > 1
+        and set(integer_text) == {"0"}
+    )
+    if raw < 0 or (raw == 0 and not zero_fragment):
         raise BotError(f"Price must be positive: {raw}")
     if raw >= 10000:
         restored = raw
     else:
-        digits = len(str(abs(int(raw))))
+        digits = len(integer_text)
         modulus = Decimal(10) ** digits
         base = (reference // modulus) * modulus
-        candidates = [p for p in (base + raw - modulus, base + raw, base + raw + modulus) if p > 0]
-        restored = min(candidates, key=lambda p: abs(p - reference))
+        candidates = [
+            price
+            for price in (
+                base + raw - modulus,
+                base + raw,
+                base + raw + modulus,
+            )
+            if price > 0
+        ]
+        restored = min(candidates, key=lambda price: abs(price - reference))
     gap = abs(restored - reference) / reference
     if gap > PRICE_RESTORE_MAX_GAP_RATIO:
         raise BotError(
@@ -1410,7 +1481,9 @@ async def run_bot() -> None:
                         # executing any action. This also detects manual closes.
                         await engine.reconcile()
 
-                        actions = list(parsed["actions"])
+                        actions = align_action_prices_to_source(
+                            source_text, list(parsed["actions"])
+                        )
                         if not actions:
                             correction = await engine.maybe_failed_stop_correction(
                                 source_text, message.id
