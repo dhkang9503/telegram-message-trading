@@ -1,0 +1,392 @@
+name: Apply leading-zero price fix
+
+on:
+  push:
+    branches:
+      - fix/preserve-leading-zero-price-fragments
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/preserve-leading-zero-price-fragments
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply source and test changes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("live/live_bot.py")
+          text = path.read_text(encoding="utf-8")
+
+          old_constants = '''STOP_CORRECTION_CUE_RE = re.compile(r"(?:죄송|잘못|정정|오타|실수|아니다|아니고)")
+          STOP_CORRECTION_NUMBER_RE = re.compile(r"(?<!\\d)(\\d{1,4})(?!\\d)")
+          '''
+          new_constants = '''STOP_CORRECTION_CUE_RE = re.compile(r"(?:죄송|잘못|정정|오타|실수|아니다|아니고)")
+          STOP_CORRECTION_NUMBER_RE = re.compile(r"(?<!\\d)(\\d{1,4})(?!\\d)")
+          SOURCE_PRICE_TOKEN_RE = re.compile(r"(?<![\\d,.])(\\d[\\d,]*(?:\\.\\d+)?)(?![\\d,.])")
+          '''
+          if text.count(old_constants) != 1:
+              raise SystemExit("Expected stop-correction constants exactly once")
+          text = text.replace(old_constants, new_constants, 1)
+
+          old_restore = '''def restore_btc_price(raw_price: Any, reference: Decimal, config: ContractConfig) -> Decimal:
+              raw = D(raw_price)
+              if raw <= 0:
+                  raise BotError(f"Price must be positive: {raw}")
+              if raw >= 10000:
+                  restored = raw
+              else:
+                  digits = len(str(abs(int(raw))))
+                  modulus = Decimal(10) ** digits
+                  base = (reference // modulus) * modulus
+                  candidates = [p for p in (base + raw - modulus, base + raw, base + raw + modulus) if p > 0]
+                  restored = min(candidates, key=lambda p: abs(p - reference))
+              gap = abs(restored - reference) / reference
+              if gap > PRICE_RESTORE_MAX_GAP_RATIO:
+                  raise BotError(
+                      f"Restored price too far from market: raw={raw}, restored={restored}, reference={reference}, gap={gap:.2%}"
+                  )
+              return config.floor_price(restored)
+          '''
+          new_restore = '''def extract_source_price_tokens(text: str) -> list[str]:
+              """Return numeric source tokens without discarding leading zeroes."""
+              return [
+                  match.group(1).replace(",", "")
+                  for match in SOURCE_PRICE_TOKEN_RE.finditer(text)
+              ]
+
+
+          def _has_significant_leading_zero(token: str) -> bool:
+              integer_part = token.split(".", 1)[0]
+              return len(integer_part) > 1 and integer_part.startswith("0")
+
+
+          def align_action_prices_to_source(
+              source_text: str,
+              actions: list[dict[str, Any]],
+          ) -> list[dict[str, Any]]:
+              """Preserve source token width for uniquely matched priced actions."""
+              available_tokens = extract_source_price_tokens(source_text)
+              aligned = [dict(action) for action in actions]
+
+              for action in aligned:
+                  price = action.get("price")
+                  if price is None:
+                      continue
+                  price_value = D(price)
+                  matches = [
+                      (index, token)
+                      for index, token in enumerate(available_tokens)
+                      if D(token) == price_value
+                  ]
+                  if len(matches) != 1:
+                      raise BotError(
+                          "Could not uniquely align action price to source text: "
+                          f"action={action!r}, source={source_text!r}, matches={matches!r}"
+                      )
+                  index, token = matches[0]
+                  del available_tokens[index]
+                  if _has_significant_leading_zero(token):
+                      action["price"] = token
+              return aligned
+
+
+          def restore_btc_price(raw_price: Any, reference: Decimal, config: ContractConfig) -> Decimal:
+              raw = D(raw_price)
+              if isinstance(raw_price, str):
+                  raw_text = raw_price.strip().replace(",", "")
+                  parts = raw_text.split(".")
+                  if (
+                      len(parts) > 2
+                      or not parts[0].isdigit()
+                      or (len(parts) == 2 and not parts[1].isdigit())
+                  ):
+                      raise BotError(f"Invalid price token: {raw_price!r}")
+                  integer_text = parts[0]
+              else:
+                  integer_text = str(abs(int(raw)))
+
+              zero_fragment = (
+                  isinstance(raw_price, str)
+                  and raw == 0
+                  and len(integer_text) > 1
+                  and set(integer_text) == {"0"}
+              )
+              if raw < 0 or (raw == 0 and not zero_fragment):
+                  raise BotError(f"Price must be positive: {raw}")
+              if raw >= 10000:
+                  restored = raw
+              else:
+                  digits = len(integer_text)
+                  modulus = Decimal(10) ** digits
+                  base = (reference // modulus) * modulus
+                  candidates = [
+                      price
+                      for price in (
+                          base + raw - modulus,
+                          base + raw,
+                          base + raw + modulus,
+                      )
+                      if price > 0
+                  ]
+                  restored = min(candidates, key=lambda price: abs(price - reference))
+              gap = abs(restored - reference) / reference
+              if gap > PRICE_RESTORE_MAX_GAP_RATIO:
+                  raise BotError(
+                      f"Restored price too far from market: raw={raw}, restored={restored}, reference={reference}, gap={gap:.2%}"
+                  )
+              return config.floor_price(restored)
+          '''
+          if text.count(old_restore) != 1:
+              raise SystemExit("Expected restore_btc_price implementation exactly once")
+          text = text.replace(old_restore, new_restore, 1)
+
+          old_actions = '                        actions = list(parsed["actions"])\n'
+          new_actions = '''                        actions = align_action_prices_to_source(
+                              source_text, list(parsed["actions"])
+                          )
+          '''
+          if text.count(old_actions) != 1:
+              raise SystemExit("Expected parsed actions assignment exactly once")
+          text = text.replace(old_actions, new_actions, 1)
+
+          compile(text, str(path), "exec")
+          path.write_text(text, encoding="utf-8")
+
+          test_path = Path("tests/test_live_price_token_alignment.py")
+          test_path.write_text(r'''from __future__ import annotations
+
+          import ast
+          import json
+          import re
+          from decimal import Decimal, ROUND_DOWN
+          from pathlib import Path
+          from typing import Any
+
+          import pytest
+
+
+          ROOT = Path(__file__).resolve().parents[1]
+
+
+          def load_price_alignment():
+              source = (ROOT / "live/live_bot.py").read_text(encoding="utf-8")
+              module = ast.parse(source)
+              names = {
+                  "BotError",
+                  "D",
+                  "extract_source_price_tokens",
+                  "_has_significant_leading_zero",
+                  "align_action_prices_to_source",
+                  "restore_btc_price",
+              }
+              nodes = [
+                  node
+                  for node in module.body
+                  if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                  and node.name in names
+              ]
+              namespace: dict[str, Any] = {
+                  "Decimal": Decimal,
+                  "ROUND_DOWN": ROUND_DOWN,
+                  "PRICE_RESTORE_MAX_GAP_RATIO": Decimal("0.03"),
+                  "SOURCE_PRICE_TOKEN_RE": re.compile(
+                      r"(?<![\d,.])(\d[\d,]*(?:\.\d+)?)(?![\d,.])"
+                  ),
+              }
+              exec(
+                  "from __future__ import annotations\n"
+                  "from typing import Any\n"
+                  + "\n\n".join(
+                      ast.get_source_segment(source, node) for node in nodes
+                  ),
+                  namespace,
+              )
+              return namespace
+
+
+          class Config:
+              price_step = Decimal("0.1")
+
+              def floor_price(self, value: Decimal) -> Decimal:
+                  units = (value / self.price_step).to_integral_value(
+                      rounding=ROUND_DOWN
+                  )
+                  return units * self.price_step
+
+
+          ns = load_price_alignment()
+          BotError = ns["BotError"]
+          align_action_prices_to_source = ns["align_action_prices_to_source"]
+          restore_btc_price = ns["restore_btc_price"]
+
+
+          def action(action_type: str, price: int | float | None = None) -> dict:
+              return {"type": action_type, "price": price}
+
+
+          def dataset_actions(message: str) -> list[dict]:
+              for path in sorted((ROOT / "data/base").glob("*.jsonl")):
+                  for line in path.read_text(encoding="utf-8").splitlines():
+                      row = json.loads(line)
+                      if row["messages"][1]["content"] == message:
+                          return json.loads(row["messages"][2]["content"])["actions"]
+              raise AssertionError(f"Dataset message not found: {message!r}")
+
+
+          def feedback_actions(message: str) -> list[dict]:
+              path = ROOT / "data/feedback/mistakes_labeled.jsonl"
+              for line in path.read_text(encoding="utf-8").splitlines():
+                  row = json.loads(line)
+                  if row["source"]["message"] == message:
+                      return row["label"]["correct_actions"]
+              raise AssertionError(f"Feedback message not found: {message!r}")
+
+
+          def restored_prices(
+              source_text: str,
+              actions: list[dict],
+              reference: str,
+          ) -> list[Decimal | None]:
+              aligned = align_action_prices_to_source(source_text, actions)
+              return [
+                  None
+                  if item["price"] is None
+                  else restore_btc_price(
+                      item["price"], Decimal(reference), Config()
+                  )
+                  for item in aligned
+              ]
+
+
+          def test_feedback_leading_zero_fragment_restores_64050():
+              message = "다들 계시죠? 050 물타기 걸어두고 보겠습니다!"
+              actions = feedback_actions(message)
+
+              aligned = align_action_prices_to_source(message, actions)
+
+              assert aligned == [{"type": "ADD", "price": "050"}]
+              assert restored_prices(message, actions, "63734.2") == [
+                  Decimal("64050")
+              ]
+
+
+          def test_two_different_short_prices_align_independently():
+              message = "150 손절 050 물타기 걸게요"
+              actions = [action("SET_STOP", 150), action("ADD", 50)]
+
+              aligned = align_action_prices_to_source(message, actions)
+
+              assert aligned == [
+                  {"type": "SET_STOP", "price": 150},
+                  {"type": "ADD", "price": "050"},
+              ]
+              assert restored_prices(message, actions, "63734.2") == [
+                  Decimal("64150"),
+                  Decimal("64050"),
+              ]
+
+
+          @pytest.mark.parametrize(
+              ("message", "reference", "expected"),
+              [
+                  (
+                      "800물타기 67110손절 걸고보겠습니다!",
+                      "67350",
+                      [Decimal("67800"), Decimal("67110")],
+                  ),
+                  (
+                      "650물타기 910손절 걸고 보겠습니다!",
+                      "67600",
+                      [Decimal("67650"), Decimal("67910")],
+                  ),
+                  (
+                      "59350물타기 58990손절들 거시면돼요!",
+                      "59100",
+                      [Decimal("59350"), Decimal("58990")],
+                  ),
+              ],
+          )
+          def test_dataset_priced_actions_restore_from_source_tokens(
+              message: str,
+              reference: str,
+              expected: list[Decimal],
+          ):
+              actions = dataset_actions(message)
+
+              assert restored_prices(message, actions, reference) == expected
+
+
+          def test_full_price_dataset_action_is_unchanged():
+              message = "59350 물타기 하나 걸겠습니다!"
+              actions = dataset_actions(message)
+
+              assert align_action_prices_to_source(message, actions) == actions
+              assert restored_prices(message, actions, "59100") == [
+                  Decimal("59350")
+              ]
+
+
+          def test_three_digit_zero_suffix_restores_next_thousand():
+              message = "000 물타기 걸게요"
+              actions = [action("ADD", 0)]
+
+              assert align_action_prices_to_source(message, actions) == [
+                  {"type": "ADD", "price": "000"}
+              ]
+              assert restored_prices(message, actions, "63734.2") == [
+                  Decimal("64000")
+              ]
+
+
+          def test_plain_numeric_zero_remains_invalid():
+              with pytest.raises(BotError, match="Price must be positive"):
+                  restore_btc_price(0, Decimal("63734.2"), Config())
+
+
+          def test_unmatched_or_ambiguous_price_fails_closed():
+              with pytest.raises(BotError, match="Could not uniquely align"):
+                  align_action_prices_to_source(
+                      "150 손절 걸게요", [action("ADD", 50)]
+                  )
+              with pytest.raises(BotError, match="Could not uniquely align"):
+                  align_action_prices_to_source(
+                      "050 손절, 50 물타기", [action("ADD", 50)]
+                  )
+          ''', encoding="utf-8")
+          PY
+
+      - name: Install test dependencies
+        run: python -m pip install -e '.[dev]'
+
+      - name: Compile live bot
+        run: python -m py_compile live/live_bot.py
+
+      - name: Validate datasets
+        run: python scripts/validate_dataset.py
+
+      - name: Run tests
+        run: python -m pytest
+
+      - name: Commit tested changes
+        shell: bash
+        run: |
+          rm .github/workflows/apply-leading-zero-price-fix.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add live/live_bot.py tests/test_live_price_token_alignment.py .github/workflows/apply-leading-zero-price-fix.yml
+          git commit -m 'Preserve leading-zero price fragments'
+          git push origin HEAD:fix/preserve-leading-zero-price-fragments
