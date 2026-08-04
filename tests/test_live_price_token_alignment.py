@@ -35,7 +35,7 @@ def load_price_alignment():
         "ROUND_DOWN": ROUND_DOWN,
         "PRICE_RESTORE_MAX_GAP_RATIO": Decimal("0.03"),
         "SOURCE_PRICE_TOKEN_RE": re.compile(
-            r"(?<![\d,.])(\d[\d,]*(?:\.\d+)?)(?![\d,.])"
+            r"(?<![\d,])(\d[\d,]*(?:\.\d+)?)(?![\d,]|\.\d)"
         ),
     }
     exec(
@@ -110,6 +110,18 @@ def test_feedback_leading_zero_fragment_restores_64050():
     aligned = align_action_prices_to_source(message, actions)
 
     assert aligned == [{"type": "ADD", "price": "050"}]
+    assert restored_prices(message, actions, "63734.2") == [
+        Decimal("64050")
+    ]
+
+
+def test_sentence_period_after_leading_zero_price_is_not_a_decimal():
+    message = "050. 물타기 걸게요"
+    actions = [action("ADD", 50)]
+
+    assert align_action_prices_to_source(message, actions) == [
+        {"type": "ADD", "price": "050"}
+    ]
     assert restored_prices(message, actions, "63734.2") == [
         Decimal("64050")
     ]

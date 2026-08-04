@@ -49,7 +49,7 @@ FAILED_STOP_CORRECTION_TTL_SECONDS = int(os.getenv("FAILED_STOP_CORRECTION_TTL_S
 FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP = int(os.getenv("FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP", "3"))
 STOP_CORRECTION_CUE_RE = re.compile(r"(?:죄송|잘못|정정|오타|실수|아니다|아니고)")
 STOP_CORRECTION_NUMBER_RE = re.compile(r"(?<!\d)(\d{1,4})(?!\d)")
-SOURCE_PRICE_TOKEN_RE = re.compile(r"(?<![\d,.])(\d[\d,]*(?:\.\d+)?)(?![\d,.])")
+SOURCE_PRICE_TOKEN_RE = re.compile(r"(?<![\d,])(\d[\d,]*(?:\.\d+)?)(?![\d,]|\.\d)")
 
 STATE_DIR = BASE_DIR / "state"
 LOG_DIR = BASE_DIR / "logs"
