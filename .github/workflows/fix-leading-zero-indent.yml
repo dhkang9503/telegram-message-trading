@@ -28,18 +28,27 @@ jobs:
           from pathlib import Path
 
           path = Path('live/live_bot.py')
-          text = path.read_text(encoding='utf-8')
-          old = '''                        actions = align_action_prices_to_source(
-                    source_text, list(parsed["actions"])
-                )
-          '''
-          new = '''                        actions = align_action_prices_to_source(
-                            source_text, list(parsed["actions"])
-                        )
-          '''
-          if text.count(old) != 1:
-              raise SystemExit('Expected misindented alignment call exactly once')
-          text = text.replace(old, new, 1)
+          lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+          matches = [
+              index
+              for index, line in enumerate(lines)
+              if line.strip() == 'actions = align_action_prices_to_source('
+          ]
+          if len(matches) != 1:
+              raise SystemExit(f'Expected alignment call exactly once, got {matches}')
+          index = matches[0]
+          if (
+              lines[index + 1].strip()
+              != 'source_text, list(parsed["actions"])'
+              or lines[index + 2].strip() != ')'
+          ):
+              raise SystemExit('Unexpected alignment call body')
+          lines[index:index + 3] = [
+              '                        actions = align_action_prices_to_source(\n',
+              '                            source_text, list(parsed["actions"])\n',
+              '                        )\n',
+          ]
+          text = ''.join(lines)
           compile(text, str(path), 'exec')
           path.write_text(text, encoding='utf-8')
           PY
