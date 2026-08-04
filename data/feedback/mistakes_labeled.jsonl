@@ -21,3 +21,6 @@
 {"source":{"message":"손절 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
 {"source":{"message":"손절ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
 {"source":{"message":"물 조금만 더 태울게요!"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"비트 자유롭게!"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"평단 좋으신 분들은 정리하실게요!"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"다들 계시죠? 050 물타기 걸어두고 보겠습니다!"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":50}]}}
