@@ -36,6 +36,9 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      - name: Resolve deployed commit
+        run: echo "DEPLOY_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -68,7 +71,6 @@ jobs:
 
       - name: Upload and restart live bot
         env:
-          DEPLOY_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -168,7 +170,7 @@ jobs:
           {
             echo "### Live bot deployed"
             echo "- Ref: \`${{ inputs.ref }}\`"
-            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Commit: \`${DEPLOY_SHA}\`"
             echo "- Target: \`${BOT_PATH}\`"
             echo "- Service: \`${BOT_SERVICE}\`"
           } >> "$GITHUB_STEP_SUMMARY"
