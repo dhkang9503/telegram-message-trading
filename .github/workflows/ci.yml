@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   validate:
@@ -31,3 +32,48 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+      - name: Delete obsolete workflow run history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t active_workflow_ids < <(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows?per_page=100" \
+              --jq '.workflows[] | select(
+                .path == ".github/workflows/ci.yml" or
+                .path == ".github/workflows/deploy.yml" or
+                .path == ".github/workflows/train.yml" or
+                .path == ".github/workflows/deploy-live-bot.yml"
+              ) | .id'
+          )
+
+          if [ "${#active_workflow_ids[@]}" -ne 4 ]; then
+            printf 'Expected 4 active workflows, found %s: %s\n' \
+              "${#active_workflow_ids[@]}" "${active_workflow_ids[*]}" >&2
+            exit 1
+          fi
+
+          declare -A active_workflows=()
+          for workflow_id in "${active_workflow_ids[@]}"; do
+            active_workflows["$workflow_id"]=1
+          done
+
+          deleted=0
+          while IFS=$'\t' read -r run_id workflow_id workflow_name status; do
+            [ "$status" = "completed" ] || continue
+            [ -z "${active_workflows[$workflow_id]:-}" ] || continue
+
+            echo "Deleting obsolete run ${run_id}: ${workflow_name} (workflow ${workflow_id})"
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}"
+            ((deleted += 1))
+          done < <(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+              --jq '.workflow_runs[] | [.id, .workflow_id, .name, .status] | @tsv'
+          )
+
+          echo "Deleted ${deleted} obsolete workflow run(s)."
