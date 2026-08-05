@@ -492,13 +492,28 @@ def parse_actions(raw: str) -> list[dict[str, Any]]:
         raise BotError(f"Invalid model JSON: {obj!r}")
     out = []
     for action in obj["actions"]:
-        if not isinstance(action, dict) or set(action.keys()) != {"type", "price"}:
+        if not isinstance(action, dict):
             raise BotError(f"Invalid action object: {action!r}")
-        if action["type"] not in ALLOWED_ACTIONS:
-            raise BotError(f"Invalid action type: {action['type']}")
-        if action["price"] is not None and not isinstance(action["price"], (int, float)):
+        action_type = action.get("type")
+        if action_type not in ALLOWED_ACTIONS:
+            raise BotError(f"Invalid action type: {action_type}")
+        keys = set(action)
+        if action_type == "OPEN_REENTRY":
+            if keys not in ({"type", "price"}, {"type", "price", "side"}):
+                raise BotError(f"Invalid OPEN_REENTRY object: {action!r}")
+            side = action.get("side")
+            if side not in {None, "long", "short"}:
+                raise BotError(f"Invalid OPEN_REENTRY side: {side!r}")
+        else:
+            if keys != {"type", "price"}:
+                raise BotError(f"Invalid action object: {action!r}")
+            side = None
+        if action.get("price") is not None and not isinstance(action["price"], (int, float)):
             raise BotError(f"Invalid price: {action['price']!r}")
-        out.append({"type": action["type"], "price": action["price"]})
+        normalized = {"type": action_type, "price": action.get("price")}
+        if action_type == "OPEN_REENTRY":
+            normalized["side"] = side
+        out.append(normalized)
     return out
 
 
@@ -1205,6 +1220,7 @@ class TradingEngine:
         raw_price: Any,
         message_id: int,
         index: int,
+        reentry_side: Optional[str] = None,
     ) -> dict[str, Any]:
         if D(self.state.data["position"]["total_qty"]) > 0:
             raise BotError("OPEN rejected: position already exists")
@@ -1212,21 +1228,30 @@ class TradingEngine:
             raise BotError("OPEN rejected: entry order already pending")
 
         stopped = self.state.data.get("stopped_position")
-        use_reentry = bool(
+        reentry_available = bool(
             stopped
             and stopped.get("available_for_reentry")
             and stopped.get("side") in {"long", "short"}
             and stopped.get("stop_order_id")
             and D(stopped.get("total_margin_usdt")) > 0
         )
+        use_reentry = action_type == "OPEN_REENTRY"
 
-        if action_type == "OPEN_REENTRY":
-            if not use_reentry:
+        if use_reentry:
+            if not reentry_available:
                 raise BotError("REENTRY rejected: no verified SL-closed position is available")
             position_side = str(stopped["side"])
+            if reentry_side is not None and reentry_side != position_side:
+                raise BotError(
+                    "REENTRY rejected: requested side does not match the SL-closed position"
+                )
         elif action_type == "OPEN_LONG":
+            if reentry_side is not None:
+                raise BotError("OPEN_LONG rejected: reentry side is not allowed")
             position_side = "long"
         elif action_type == "OPEN_SHORT":
+            if reentry_side is not None:
+                raise BotError("OPEN_SHORT rejected: reentry side is not allowed")
             position_side = "short"
         else:
             raise BotError(f"Unsupported open action: {action_type}")
@@ -1275,11 +1300,11 @@ class TradingEngine:
             entry_sizing=entry_sizing,
         )
     async def add(self, raw_price: Any, message_id: int, index: int) -> dict[str, Any]:
-        pos = self.require_position()
         if self.state.data["pending"]["entry_order"]:
             raise BotError("ADD rejected: initial entry limit order still has an unfilled remainder")
         if self.state.data["pending"]["add_orders"]:
             raise BotError("ADD rejected: another ADD limit order is still pending")
+        pos = self.require_position()
         qty = D(pos["total_qty"])
         return await self.place_opening_order(
             kind="add", side="buy" if pos["side"] == "long" else "sell", qty=qty,
@@ -1393,7 +1418,7 @@ class TradingEngine:
         await self.reconcile()
         kind, price = action["type"], action["price"]
         if kind in {"OPEN_LONG", "OPEN_SHORT", "OPEN_REENTRY"}:
-            return await self.open(kind, price, message_id, index)
+            return await self.open(kind, price, message_id, index, action.get("side"))
         if kind == "ADD":
             return await self.add(price, message_id, index)
         if kind == "SET_STOP":

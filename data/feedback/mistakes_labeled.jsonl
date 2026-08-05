@@ -6,7 +6,7 @@
 {"source":{"message":"전 정리햇어요 !"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"지금 양전했는데 최대한 타이트하게 사인드려볼게요 집중들 하고계세요!"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"이거 그냥 59약손절 생각하고 그냥 둘게요!"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"아까 재진입 한 비중이랑 똑같이들 잡으심돼요 물 한번 타고 손절 볼거에요"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_REENTRY","price":null}]}}
+{"source":{"message":"아까 재진입 한 비중이랑 똑같이들 잡으심돼요 물 한번 타고 손절 볼거에요"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_REENTRY","price":null,"side":null}]}}
 {"source":{"message":"슬슬 정리들 하세요 ! 집 가는중"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
 {"source":{"message":"숏 ㅂㅈ 이거 못내린다싶음 정리할게요! 일단 잡겠습니다"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_SHORT","price":null}]}}
 {"source":{"message":"이번에 올리면 그냥 다 정리하는쪽으로 볼게요!"},"label":{"status":"labeled","correct_actions":[]}}

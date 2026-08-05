@@ -41,7 +41,7 @@ new_evaluation_block = '''    generation = config["evaluation"]
 
     def evaluate_merged(data_path: Path, output_dir: Path) -> dict[str, Any]:
         rows = read_jsonl(data_path)
-        exact = json_valid = type_exact = price_exact = 0
+        exact = json_valid = type_exact = price_exact = side_exact = 0
         error_counts: Counter[str] = Counter()
         predictions: list[dict[str, Any]] = []
 
@@ -87,6 +87,10 @@ new_evaluation_block = '''    generation = config["evaluation"]
                     a["price"] for a in expected["actions"]
                 ]:
                     price_exact += 1
+                if [a.get("side") for a in predicted["actions"]] == [
+                    a.get("side") for a in expected["actions"]
+                ]:
+                    side_exact += 1
                 classify_errors(expected, predicted, error_counts)
             except Exception as exc:
                 result["parse_error"] = f"{type(exc).__name__}: {exc}"
@@ -101,6 +105,7 @@ new_evaluation_block = '''    generation = config["evaluation"]
             "exact_match_rate": exact / total if total else 0.0,
             "action_type_exact_rate": type_exact / total if total else 0.0,
             "price_exact_rate": price_exact / total if total else 0.0,
+            "action_side_exact_rate": side_exact / total if total else 0.0,
             "errors": dict(error_counts),
         }
         output_dir.mkdir(parents=True, exist_ok=True)

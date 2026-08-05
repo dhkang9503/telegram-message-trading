@@ -39,12 +39,24 @@ def validate_actions(value: Any, location: str) -> list[dict[str, Any]]:
     if not isinstance(actions, list):
         raise ValueError(f"{location}: actions must be a list")
     for index, action in enumerate(actions):
-        if not isinstance(action, dict) or set(action) != {"type", "price"}:
-            raise ValueError(f"{location}: action[{index}] must contain type and price")
-        if action["type"] not in ALLOWED_ACTIONS:
-            raise ValueError(f"{location}: unsupported action type {action['type']!r}")
+        if not isinstance(action, dict):
+            raise ValueError(f"{location}: action[{index}] must be an object")
+        action_type = action.get("type")
+        expected_keys = (
+            {"type", "price", "side"}
+            if action_type == "OPEN_REENTRY"
+            else {"type", "price"}
+        )
+        if set(action) != expected_keys:
+            raise ValueError(
+                f"{location}: action[{index}] has invalid keys for {action_type!r}"
+            )
+        if action_type not in ALLOWED_ACTIONS:
+            raise ValueError(f"{location}: unsupported action type {action_type!r}")
         if action["price"] is not None and not isinstance(action["price"], (int, float)):
             raise ValueError(f"{location}: price must be null or a number")
+        if action_type == "OPEN_REENTRY" and action["side"] not in {None, "long", "short"}:
+            raise ValueError(f"{location}: OPEN_REENTRY side must be null, long, or short")
     return actions
 
 

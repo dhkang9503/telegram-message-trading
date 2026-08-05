@@ -89,8 +89,12 @@ def normalize_result(obj: Any) -> dict[str, Any]:
         return {"actions": []}
     actions = []
     for action in obj["actions"]:
-        if isinstance(action, dict):
-            actions.append({"type": action.get("type"), "price": action.get("price")})
+        if not isinstance(action, dict):
+            continue
+        normalized = {"type": action.get("type"), "price": action.get("price")}
+        if normalized["type"] == "OPEN_REENTRY":
+            normalized["side"] = action.get("side")
+        actions.append(normalized)
     return {"actions": actions}
 
 
@@ -316,7 +320,7 @@ def train_and_evaluate(run_id: str, git_sha: str) -> str:
 
     merged_model.eval()
     test_rows = read_jsonl(Path("/repo/data/base/test.jsonl"))
-    exact = json_valid = type_exact = price_exact = 0
+    exact = json_valid = type_exact = price_exact = side_exact = 0
     error_counts: Counter[str] = Counter()
     predictions: list[dict[str, Any]] = []
     generation = config["evaluation"]
@@ -357,6 +361,10 @@ def train_and_evaluate(run_id: str, git_sha: str) -> str:
                 type_exact += 1
             if [a["price"] for a in predicted["actions"]] == [a["price"] for a in expected["actions"]]:
                 price_exact += 1
+            if [a.get("side") for a in predicted["actions"]] == [
+                a.get("side") for a in expected["actions"]
+            ]:
+                side_exact += 1
             classify_errors(expected, predicted, error_counts)
         except Exception as exc:
             result["parse_error"] = f"{type(exc).__name__}: {exc}"
@@ -371,6 +379,7 @@ def train_and_evaluate(run_id: str, git_sha: str) -> str:
         "exact_match_rate": exact / total if total else 0.0,
         "action_type_exact_rate": type_exact / total if total else 0.0,
         "price_exact_rate": price_exact / total if total else 0.0,
+        "action_side_exact_rate": side_exact / total if total else 0.0,
         "errors": dict(error_counts),
     }
     (evaluation_dir / "test_metrics.json").write_text(
