@@ -1,0 +1,37 @@
+name: Create v1.1.0 tag
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.head_ref == 'chore/tag-v1.1.0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Create v1.1.0 on pre-PR main
+        env:
+          TARGET_SHA: 0cae460bdf443478fa6f1b1521d2138950739260
+        run: |
+          set -euo pipefail
+          git fetch origin --tags --force
+          if git rev-parse -q --verify refs/tags/v1.1.0 >/dev/null; then
+            existing_sha="$(git rev-list -n 1 v1.1.0)"
+            if [ "$existing_sha" != "$TARGET_SHA" ]; then
+              echo "v1.1.0 already points to $existing_sha, expected $TARGET_SHA" >&2
+              exit 1
+            fi
+            echo "v1.1.0 already points to the expected commit."
+          else
+            git tag v1.1.0 "$TARGET_SHA"
+            git push origin refs/tags/v1.1.0
+          fi
