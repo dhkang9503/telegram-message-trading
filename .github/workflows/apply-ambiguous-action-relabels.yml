@@ -1,0 +1,133 @@
+name: Apply ambiguous action relabels
+
+on:
+  push:
+    branches:
+      - fix/relabel-ambiguous-action-messages
+    paths:
+      - .github/workflows/apply-ambiguous-action-relabels.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: fix/relabel-ambiguous-action-messages
+          fetch-depth: 0
+
+      - name: Relabel ambiguous messages as no action
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          TARGETS = {
+              "296 맞추세여 평단": [{"type": "ADD", "price": None}],
+              "지금 쪼~금만 더 탈게요!": [{"type": "ADD", "price": None}],
+              "일단 대응 안되시는분들은 비중 줄이시는것도 좋을거같아요 !": [
+                  {"type": "CLOSE_ADDS", "price": None}
+              ],
+          }
+          BASE_PATHS = [
+              Path("data/base/train.jsonl"),
+              Path("data/base/validation.jsonl"),
+              Path("data/base/test.jsonl"),
+          ]
+          MISTAKES_PATH = Path("data/feedback/mistakes_labeled.jsonl")
+
+          changed_by_path = {}
+          seen_by_path = {}
+
+          for path in BASE_PATHS:
+              output = []
+              changed = 0
+              seen = Counter()
+              for raw in path.read_text(encoding="utf-8").splitlines():
+                  if not raw.strip():
+                      continue
+                  row = json.loads(raw)
+                  message = row["messages"][1]["content"]
+                  if message in TARGETS:
+                      seen[message] += 1
+                      result = json.loads(row["messages"][2]["content"])
+                      if result["actions"] != TARGETS[message]:
+                          raise SystemExit(
+                              f"unexpected existing label in {path}: {message!r} -> {result['actions']!r}"
+                          )
+                      result["actions"] = []
+                      row["messages"][2]["content"] = json.dumps(
+                          result, ensure_ascii=False, separators=(",", ":")
+                      )
+                      raw = json.dumps(row, ensure_ascii=False)
+                      changed += 1
+                  output.append(raw)
+              path.write_text("\n".join(output) + "\n", encoding="utf-8")
+              changed_by_path[path.as_posix()] = changed
+              seen_by_path[path.as_posix()] = dict(seen)
+
+          output = []
+          mistakes_changed = 0
+          mistakes_seen = Counter()
+          for raw in MISTAKES_PATH.read_text(encoding="utf-8").splitlines():
+              if not raw.strip():
+                  continue
+              row = json.loads(raw)
+              message = row["source"]["message"]
+              if message in TARGETS:
+                  mistakes_seen[message] += 1
+                  actions = row["label"]["correct_actions"]
+                  if actions != TARGETS[message]:
+                      raise SystemExit(
+                          f"unexpected existing feedback label: {message!r} -> {actions!r}"
+                      )
+                  row["label"]["correct_actions"] = []
+                  raw = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                  mistakes_changed += 1
+              output.append(raw)
+          MISTAKES_PATH.write_text("\n".join(output) + "\n", encoding="utf-8")
+          changed_by_path[MISTAKES_PATH.as_posix()] = mistakes_changed
+          seen_by_path[MISTAKES_PATH.as_posix()] = dict(mistakes_seen)
+
+          expected_changed = {
+              "data/base/train.jsonl": 3,
+              "data/base/validation.jsonl": 0,
+              "data/base/test.jsonl": 3,
+              "data/feedback/mistakes_labeled.jsonl": 1,
+          }
+          expected_seen = {
+              "data/base/train.jsonl": {message: 1 for message in TARGETS},
+              "data/base/validation.jsonl": {},
+              "data/base/test.jsonl": {message: 1 for message in TARGETS},
+              "data/feedback/mistakes_labeled.jsonl": {"296 맞추세여 평단": 1},
+          }
+          if changed_by_path != expected_changed:
+              raise SystemExit(
+                  f"unexpected relabel counts: {changed_by_path}, expected: {expected_changed}"
+              )
+          if seen_by_path != expected_seen:
+              raise SystemExit(
+                  f"unexpected message locations: {seen_by_path}, expected: {expected_seen}"
+              )
+
+          print(json.dumps(changed_by_path, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Validate datasets and tests
+        run: |
+          python scripts/validate_dataset.py --root .
+          python -m pip install -r requirements-ci.txt
+          pytest -vv --tb=short -ra
+
+      - name: Commit dataset relabels
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/base/train.jsonl data/base/validation.jsonl data/base/test.jsonl data/feedback/mistakes_labeled.jsonl
+          git commit -m "Relabel ambiguous action messages as no action"
+          git push origin HEAD:fix/relabel-ambiguous-action-messages
