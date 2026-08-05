@@ -31,13 +31,15 @@ def build_prompt(system_prompt: str, message: str) -> str:
 def normalize_result(obj: Any) -> dict[str, Any]:
     if not isinstance(obj, dict) or not isinstance(obj.get("actions"), list):
         return {"actions": []}
-    return {
-        "actions": [
-            {"type": action.get("type"), "price": action.get("price")}
-            for action in obj["actions"]
-            if isinstance(action, dict)
-        ]
-    }
+    actions = []
+    for action in obj["actions"]:
+        if not isinstance(action, dict):
+            continue
+        normalized = {"type": action.get("type"), "price": action.get("price")}
+        if normalized["type"] == "OPEN_REENTRY":
+            normalized["side"] = action.get("side")
+        actions.append(normalized)
+    return {"actions": actions}
 
 
 def extract_json(raw_text: str) -> dict[str, Any]:
@@ -107,7 +109,7 @@ def evaluate_gguf(
     load_started = time.perf_counter()
     results: list[dict[str, Any]] = []
     latencies: list[float] = []
-    exact_count = type_count = price_count = json_valid_count = 0
+    exact_count = type_count = price_count = side_count = json_valid_count = 0
     error_counts: Counter[str] = Counter()
 
     with llama_server(
@@ -143,6 +145,8 @@ def evaluate_gguf(
                     predicted_types = [a["type"] for a in predicted["actions"]]
                     expected_prices = [a["price"] for a in expected["actions"]]
                     predicted_prices = [a["price"] for a in predicted["actions"]]
+                    expected_sides = [a.get("side") for a in expected["actions"]]
+                    predicted_sides = [a.get("side") for a in predicted["actions"]]
                     if predicted == expected:
                         exact_count += 1
                         result["exact_match"] = True
@@ -150,6 +154,8 @@ def evaluate_gguf(
                         type_count += 1
                     if predicted_prices == expected_prices:
                         price_count += 1
+                    if predicted_sides == expected_sides:
+                        side_count += 1
                     expected_set, predicted_set = set(expected_types), set(predicted_types)
                     if "OPEN_LONG" in expected_set and "OPEN_SHORT" in predicted_set:
                         error_counts["LONG_TO_SHORT"] += 1
@@ -178,6 +184,7 @@ def evaluate_gguf(
         "exact_match_rate": exact_count / total if total else 0.0,
         "action_type_exact_rate": type_count / total if total else 0.0,
         "price_exact_rate": price_count / total if total else 0.0,
+        "action_side_exact_rate": side_count / total if total else 0.0,
         "latency_seconds": {
             "mean": sum(latencies) / len(latencies) if latencies else None,
             "p50": _percentile(sorted_latencies, 0.50),
