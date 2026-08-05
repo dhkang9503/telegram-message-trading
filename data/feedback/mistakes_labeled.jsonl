@@ -2,7 +2,7 @@
 {"source":{"message":"쪼금만 더 탈게요 지금!"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"위로 열린차트라 물좀 타보고 안되면 본전에 정리하던지 할게요!"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"내려오면 물 조금씩만 더 타주세요 750정도 맞추시면됩니다!"},"label":{"status":"labeled","correct_actions":[]}}
-{"source":{"message":"296 맞추세여 평단"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
+{"source":{"message":"296 맞추세여 평단"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"전 정리햇어요 !"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"지금 양전했는데 최대한 타이트하게 사인드려볼게요 집중들 하고계세요!"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"이거 그냥 59약손절 생각하고 그냥 둘게요!"},"label":{"status":"labeled","correct_actions":[]}}
