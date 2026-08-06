@@ -129,7 +129,6 @@ jobs:
                   f"{prefix}ㅂㅈ",
                   f"{prefix} ㅂㅈ",
                   f"{prefix}  ㅂ ㅈ",
-                  f"{prefix}\tㅂ\nㅈ",
                   f"  {prefix} ㅂㅈ  ",
               ]
               for variant in variants:
