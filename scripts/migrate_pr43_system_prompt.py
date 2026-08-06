@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -64,6 +65,23 @@ def migrate_chatml(path: Path) -> int:
     return changed
 
 
+def read_live_prompt(path: Path) -> str:
+    module = ast.parse(path.read_text(encoding="utf-8"))
+    assignment = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "SYSTEM_PROMPT"
+            for target in node.targets
+        )
+    )
+    value = ast.literal_eval(assignment.value)
+    if not isinstance(value, str):
+        raise RuntimeError("live SYSTEM_PROMPT is not a string")
+    return value
+
+
 def main() -> None:
     config_path = ROOT / "configs/train.yaml"
     replace_exact(config_path, CURRENT_PROMPT, PR43_PROMPT)
@@ -85,7 +103,9 @@ def main() -> None:
 '''
     replace_exact(live_path, old_live_block, new_live_block)
 
-    changed_rows = {str(path.relative_to(ROOT)): migrate_chatml(path) for path in CHATML_PATHS}
+    changed_rows = {
+        str(path.relative_to(ROOT)): migrate_chatml(path) for path in CHATML_PATHS
+    }
 
     test_path = ROOT / "tests/test_system_prompt_contract.py"
     test_text = test_path.read_text(encoding="utf-8")
@@ -111,13 +131,13 @@ def main() -> None:
     )
 
     config_text = config_path.read_text(encoding="utf-8")
-    live_text = live_path.read_text(encoding="utf-8")
-    test_text = test_path.read_text(encoding="utf-8")
-    if CURRENT_PROMPT in config_text or CURRENT_PROMPT in live_text:
-        raise RuntimeError("current prompt remains in config or live bot")
-    if PR43_PROMPT not in config_text or PR43_PROMPT not in live_text:
-        raise RuntimeError("PR 43 prompt was not installed in config and live bot")
-    if "PR43_SYSTEM_PROMPT" not in test_text:
+    if CURRENT_PROMPT in config_text:
+        raise RuntimeError("current prompt remains in config")
+    if PR43_PROMPT not in config_text:
+        raise RuntimeError("PR 43 prompt was not installed in config")
+    if read_live_prompt(live_path) != PR43_PROMPT:
+        raise RuntimeError("PR 43 prompt was not installed in live bot")
+    if "PR43_SYSTEM_PROMPT" not in test_path.read_text(encoding="utf-8"):
         raise RuntimeError("prompt contract test was not updated")
 
     print(json.dumps({"changed_chatml_rows": changed_rows}, ensure_ascii=False, indent=2))
