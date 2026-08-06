@@ -7,6 +7,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 ALLOWED_ACTIONS = {
     "OPEN_LONG", "OPEN_SHORT", "OPEN_REENTRY", "ADD", "SET_STOP", "SET_TP",
     "CLOSE_HALF", "CLOSE_ADDS", "CLOSE_ALL", "CANCEL_ADD", "CANCEL_STOP",
@@ -114,7 +116,9 @@ def validate_labeled_feedback(row: dict[str, Any], location: str) -> tuple[str, 
     return source["message"], obj
 
 
-def inspect_split(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def inspect_split(
+    path: Path, expected_system_prompt: str | None = None
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows = read_jsonl(path)
     systems = Counter()
     messages = Counter()
@@ -122,6 +126,10 @@ def inspect_split(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
     for index, row in enumerate(rows):
         system, message, canonical = validate_chatml_row(row, f"{path}[{index}]")
+        if expected_system_prompt is not None and system != expected_system_prompt:
+            raise ValueError(
+                f"{path}[{index}]: system prompt does not match configs/train.yaml"
+            )
         systems[system] += 1
         messages[message] += 1
         labels_by_message[message].add(canonical)
@@ -149,10 +157,12 @@ def inspect_split(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 def validate_repository_data(root: Path) -> dict[str, Any]:
     split_rows: dict[str, list[dict[str, Any]]] = {}
     report: dict[str, Any] = {"splits": {}, "overlap": {}, "feedback": {}}
+    config = yaml.safe_load((root / "configs" / "train.yaml").read_text(encoding="utf-8"))
+    expected_system_prompt = config["model"]["system_prompt"]
 
     for split in ("train", "validation", "test"):
         path = root / "data" / "base" / f"{split}.jsonl"
-        rows, split_report = inspect_split(path)
+        rows, split_report = inspect_split(path, expected_system_prompt)
         split_rows[split] = rows
         report["splits"][split] = split_report
 
@@ -184,7 +194,11 @@ def validate_repository_data(root: Path) -> dict[str, Any]:
 
     regression_rows = read_jsonl(regression_path)
     for index, row in enumerate(regression_rows):
-        validate_chatml_row(row, f"{regression_path}[{index}]")
+        system, _, _ = validate_chatml_row(row, f"{regression_path}[{index}]")
+        if system != expected_system_prompt:
+            raise ValueError(
+                f"{regression_path}[{index}]: system prompt does not match configs/train.yaml"
+            )
     report["feedback"]["regression_rows"] = len(regression_rows)
 
     return report

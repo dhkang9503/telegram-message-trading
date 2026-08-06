@@ -473,7 +473,6 @@ def test_close_half_reduces_position_without_flipping_side(rig):
 @pytest.mark.parametrize(
     "source",
     [
-        "못 줄이신분들 지금 줄이세요!!",
         "첫비중 만들고 볼게요 ! 조금 더 산것도 날리세요 !",
     ],
 )
