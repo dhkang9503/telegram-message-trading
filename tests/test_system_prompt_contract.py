@@ -10,6 +10,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET_MESSAGE = "못 줄이신분들 지금 줄이세요!!"
+PR43_SYSTEM_PROMPT = '너는 특정 BTCUSDT 리딩 채널의 한국어 메시지를 구조화된 거래 액션 JSON으로 변환하는 파서다. 메시지에 명시된 행동만 추출하고 추측하지 않는다. 출력은 actions 배열을 가진 JSON 하나만 반환한다.'
 
 
 def configured_prompt() -> str:
@@ -41,9 +42,7 @@ def chatml_paths() -> list[Path]:
 def test_system_prompt_is_identical_in_config_live_and_chatml_data():
     expected = configured_prompt()
     assert live_prompt() == expected
-    assert "특정 상태의 사람에게만 적용되면" in expected
-    assert "OPEN_REENTRY의 side는 long, short 또는 null만 사용한다." in expected
-    assert "'비트 자유롭게'는 CLOSE_ALL이다." not in expected
+    assert expected == PR43_SYSTEM_PROMPT
 
     for path in chatml_paths():
         for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
