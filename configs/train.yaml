@@ -24,7 +24,7 @@ reproducibility:
     huggingface_hub: "0.30.2"
 
 training:
-  # Feedback dataset revision: 2026-08-06-close-intent-2
+  # Feedback dataset revision: 2026-08-06-close-intent-2-a100-runtime-normalization
   feedback_repeat: 4
   num_epochs: 5
   train_batch_size: 4
