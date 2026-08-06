@@ -464,10 +464,16 @@ def normalize_message(message: Any) -> str:
 
 
 def normalize_trading_shorthand(text: str) -> str:
-    replacements = {
+    canonical_by_compact = {
         "물ㅂㅈ": "물 ㅂㅈ",
+        "롱ㅂㅈ": "롱 ㅂㅈ",
+        "숏ㅂㅈ": "숏 ㅂㅈ",
+        "반익ㅂㅈ": "반익 ㅂㅈ",
+        "익자유ㅂㅈ": "익자유 ㅂㅈ",
+        "익절ㅂㅈ": "익절 ㅂㅈ",
     }
-    return replacements.get(text, text)
+    compact = re.sub(r"\s+", "", text)
+    return canonical_by_compact.get(compact, text)
 
 
 def author_matches(post_author: Optional[str]) -> bool:

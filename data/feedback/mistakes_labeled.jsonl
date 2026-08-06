@@ -29,14 +29,3 @@
 {"source":{"message":"슬슬 정리할 준비들 하세여 사인드릴게요!"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"좀 보시다가 익절들 하셔요 !"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"저 정리햇어요 ! 오늘도 늦은시간까지 고생들 많으셧어요 !"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"물 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":null}]}}
-{"source":{"message":"롱 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_LONG","price":null}]}}
-{"source":{"message":"롱ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_LONG","price":null}]}}
-{"source":{"message":"숏 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_SHORT","price":null}]}}
-{"source":{"message":"숏ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_SHORT","price":null}]}}
-{"source":{"message":"반익 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_HALF","price":null}]}}
-{"source":{"message":"반익ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_HALF","price":null}]}}
-{"source":{"message":"익자유 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"익자유ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"익절 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
-{"source":{"message":"익절ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
