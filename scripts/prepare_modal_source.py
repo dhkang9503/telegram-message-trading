@@ -16,6 +16,23 @@ for old, new in replacements.items():
     text = text.replace(old, new)
     print(f"Replaced {occurrences} occurrence(s): {old!r} -> {new!r}")
 
+training_build = '''    combined_rows, build_report = build_training_rows(
+        Path("/repo/data/base/train.jsonl"),
+        Path("/repo/data/feedback/mistakes_labeled.jsonl"),
+        system_prompt,
+    )
+'''
+training_build_with_repeat = '''    combined_rows, build_report = build_training_rows(
+        Path("/repo/data/base/train.jsonl"),
+        Path("/repo/data/feedback/mistakes_labeled.jsonl"),
+        system_prompt,
+        feedback_repeat=int(config["training"]["feedback_repeat"]),
+    )
+'''
+if text.count(training_build) != 1:
+    raise SystemExit("Expected training dataset builder call was not found exactly once")
+text = text.replace(training_build, training_build_with_repeat, 1)
+
 copy_test = (
     '    shutil.copy2("/repo/data/runtime/test-plus-mistakes.jsonl", '
     'dataset_dir / "test.jsonl")\n'
@@ -164,4 +181,4 @@ text = text.replace(
 
 compile(text, str(path), "exec")
 path.write_text(text, encoding="utf-8")
-print("Prepared H100 Modal training with merged-model test+mistakes and mistake-only evaluation.")
+print("Prepared H100 Modal training with 4x feedback and merged-model mistake evaluation.")
