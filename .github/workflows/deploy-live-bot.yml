@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile live/live_bot.py
-          python -m pip install --disable-pip-version-check --quiet pytest
+          python -m pip install --disable-pip-version-check --quiet -r requirements-ci.txt
           python scripts/validate_dataset.py --root .
           python -m pytest -q
 
