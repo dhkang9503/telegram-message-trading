@@ -1,42 +1,237 @@
 name: Train parser model
 
 on:
-  pull_request:
-    types: [opened, synchronize]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Optional run ID; blank uses Actions run number and commit
+        required: false
+        default: ""
+  push:
     branches:
       - main
     paths:
       - ".github/workflows/train.yml"
-      - "scripts/_migrate_short_prompt.py"
+      - "configs/train.yaml"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: telegram-parser-training
+  cancel-in-progress: false
 
 jobs:
-  migrate-short-prompt:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+  validate-data:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout PR branch
+      - name: Checkout
         uses: actions/checkout@v6
-        with:
-          ref: ${{ github.head_ref }}
-          fetch-depth: 2
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Apply shorter prompt migration
-        run: python scripts/_migrate_short_prompt.py
-      - name: Commit migrated prompt data
+      - name: Install validation dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+      - name: Validate datasets
+        run: |
+          python scripts/validate_dataset.py --root . --write-report workflow-output/dataset-validation.json
+      - name: Upload validation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dataset-validation-${{ github.run_id }}
+          path: workflow-output/dataset-validation.json
+          retention-days: 30
+
+  train:
+    needs: validate-data
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT || 'main' }}
+      ARTIFACT_VOLUME: telegram-parser-artifacts
+      LLAMA_CPP_COMMIT: 91d2fc387529940230555abd297a8b5e99737d3f
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install workflow dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "modal>=1.2.3,<2" PyYAML==6.0.2 httpx==0.28.1
+      - name: Resolve run ID
+        id: run
         shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No migration changes to commit."
-            exit 0
+          if [[ -n "${{ inputs.run_id }}" ]]; then
+            RUN_ID="${{ inputs.run_id }}"
+          else
+            RUN_ID="gh-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::8}"
           fi
-          git commit -m "Apply shorter parser system prompt"
-          git push origin "HEAD:${{ github.head_ref }}"
+          echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
+          echo "RUN_ID=${RUN_ID}" >> "${GITHUB_ENV}"
+      - name: Build mistake-aware validation and test datasets
+        run: |
+          mkdir -p data/runtime workflow-output/evaluation-data
+          python scripts/build_evaluation_dataset.py \
+            --base-evaluation data/base/validation.jsonl \
+            --labeled-feedback data/feedback/mistakes_labeled.jsonl \
+            --config configs/train.yaml \
+            --combined-output data/runtime/validation-plus-mistakes.jsonl \
+            --feedback-output data/runtime/mistakes-eval.jsonl \
+            --report workflow-output/evaluation-data/validation-plus-mistakes.json
+          python scripts/build_evaluation_dataset.py \
+            --base-evaluation data/base/test.jsonl \
+            --labeled-feedback data/feedback/mistakes_labeled.jsonl \
+            --config configs/train.yaml \
+            --combined-output data/runtime/test-plus-mistakes.jsonl \
+            --feedback-output data/runtime/mistakes-eval.jsonl \
+            --report workflow-output/evaluation-data/test-plus-mistakes.json
+      - name: Check for completed Modal training stage
+        id: cached_training
+        shell: bash
+        run: |
+          mkdir -p workflow-output
+          if modal volume get --force "${ARTIFACT_VOLUME}" \
+            "runs/${RUN_ID}/training_manifest.json" \
+            workflow-output/training-manifest.json; then
+            echo "found=true" >> "${GITHUB_OUTPUT}"
+            echo "Reusing completed Modal training stage for ${RUN_ID}."
+          else
+            rm -f workflow-output/training-manifest.json
+            echo "found=false" >> "${GITHUB_OUTPUT}"
+            echo "No completed training stage found for ${RUN_ID}; starting Modal training."
+          fi
+      - name: Prepare Modal source
+        if: steps.cached_training.outputs.found != 'true'
+        run: python scripts/prepare_modal_source.py
+      - name: Train and run Transformers validation/test on Modal A100
+        if: steps.cached_training.outputs.found != 'true'
+        run: |
+          modal run --write-result workflow-output/training-manifest.json modal/train_app.py \
+            --run-id "${RUN_ID}" --git-sha "${GITHUB_SHA}"
+      - name: Download and locate merged model from Modal Volume
+        shell: bash
+        run: |
+          rm -rf build/merged-model-download
+          mkdir -p build/merged-model-download
+          modal volume get --force "${ARTIFACT_VOLUME}" \
+            "runs/${RUN_ID}/merged_model" build/merged-model-download
+
+          CONFIG_PATH="$(find build/merged-model-download -type f -name config.json -print -quit)"
+          if [[ -z "${CONFIG_PATH}" ]]; then
+            echo "config.json was not found in the downloaded merged model."
+            echo "Downloaded files:"
+            find build/merged-model-download -maxdepth 4 -type f -print | sort
+            echo "Remote volume entries:"
+            modal volume ls "${ARTIFACT_VOLUME}" "runs/${RUN_ID}/merged_model" || true
+            exit 1
+          fi
+
+          MERGED_MODEL_DIR="$(dirname "${CONFIG_PATH}")"
+          echo "MERGED_MODEL_DIR=${MERGED_MODEL_DIR}" >> "${GITHUB_ENV}"
+          echo "Using merged model directory: ${MERGED_MODEL_DIR}"
+          test -s "${MERGED_MODEL_DIR}/config.json"
+      - name: Build llama.cpp on GitHub runner CPU
+        run: |
+          git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git build/llama.cpp
+          git -C build/llama.cpp checkout "${LLAMA_CPP_COMMIT}"
+          cmake -S build/llama.cpp -B build/llama.cpp/build \
+            -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_SERVER=ON
+          cmake --build build/llama.cpp/build --target llama-quantize llama-server --parallel 2
+      - name: Install GGUF converter dependencies
+        run: |
+          python -m pip install -r build/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt
+      - name: Convert and quantize on GitHub runner CPU
+        run: |
+          mkdir -p build/gguf workflow-output/q8-evaluation workflow-output/q8-mistake-evaluation
+          python build/llama.cpp/convert_hf_to_gguf.py "${MERGED_MODEL_DIR}" \
+            --outfile build/gguf/model-F16.gguf --outtype f16
+          build/llama.cpp/build/bin/llama-quantize \
+            build/gguf/model-F16.gguf build/gguf/model-Q8_0.gguf Q8_0
+          rm -f build/gguf/model-F16.gguf
+      - name: Evaluate Q8 on test plus mistakes
+        run: |
+          python scripts/evaluate_cli.py \
+            --model build/gguf/model-Q8_0.gguf \
+            --server-bin build/llama.cpp/build/bin/llama-server \
+            --data data/runtime/test-plus-mistakes.jsonl \
+            --config configs/train.yaml \
+            --output-dir workflow-output/q8-evaluation \
+            --quant-name Q8_0 --gpu-layers 0
+      - name: Evaluate Q8 mistake recovery
+        run: |
+          python scripts/evaluate_cli.py \
+            --model build/gguf/model-Q8_0.gguf \
+            --server-bin build/llama.cpp/build/bin/llama-server \
+            --data data/runtime/mistakes-eval.jsonl \
+            --config configs/train.yaml \
+            --output-dir workflow-output/q8-mistake-evaluation \
+            --quant-name Q8_0 --gpu-layers 0
+      - name: Finalize manifest and release gate
+        run: |
+          REMOTE_MODEL_PATH="runs/${RUN_ID}/gguf/${RUN_ID}-Q8_0.gguf"
+          python scripts/finalize_manifest.py \
+            --training-manifest workflow-output/training-manifest.json \
+            --metrics workflow-output/q8-evaluation/metrics.json \
+            --mistake-metrics workflow-output/q8-mistake-evaluation/metrics.json \
+            --evaluation-report workflow-output/evaluation-data/test-plus-mistakes.json \
+            --model build/gguf/model-Q8_0.gguf \
+            --config configs/train.yaml \
+            --remote-model-path "${REMOTE_MODEL_PATH}" \
+            --output workflow-output/manifest.json
+      - name: Upload final artifacts to Modal Volume
+        run: |
+          modal volume put --force "${ARTIFACT_VOLUME}" build/gguf/model-Q8_0.gguf \
+            "runs/${RUN_ID}/gguf/${RUN_ID}-Q8_0.gguf"
+          modal volume put --force "${ARTIFACT_VOLUME}" workflow-output/manifest.json \
+            "runs/${RUN_ID}/manifest.json"
+          modal volume put --force "${ARTIFACT_VOLUME}" workflow-output/q8-evaluation \
+            "runs/${RUN_ID}/evaluation/test_plus_mistakes/Q8_0/"
+          modal volume put --force "${ARTIFACT_VOLUME}" workflow-output/q8-mistake-evaluation \
+            "runs/${RUN_ID}/evaluation/mistake_recovery/Q8_0/"
+      - name: Render summary
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          m = json.loads(Path('workflow-output/manifest.json').read_text())
+          combined = m['evaluation']['test_plus_mistakes']['Q8_0']
+          mistakes = m['evaluation']['mistake_recovery']['Q8_0']
+          errors = combined.get('errors', {})
+          lines = [
+              f"# Model run `{m['run_id']}`", "",
+              f"- Deploy eligible: **{m['deploy_eligible']}**",
+              f"- Train rows: {m['dataset']['combined_rows']}",
+              f"- Feedback rows trained: {m['dataset']['feedback_rows_appended']}",
+              f"- Transformers test+mistakes exact: {m['evaluation']['transformers_test']['exact_match_rate']}",
+              f"- Q8 test+mistakes rows: {combined['test_rows']}",
+              f"- Q8 test+mistakes exact: {combined['exact_match_rate']}",
+              f"- Q8 mistake recovery rows: {mistakes['test_rows']}",
+              f"- Q8 mistake recovery exact: {mistakes['exact_match_rate']}",
+              f"- Q8 JSON valid: {combined['json_valid_rate']}",
+              f"- OPEN_TO_CLOSE: {errors.get('OPEN_TO_CLOSE', 0)}",
+          ]
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('\n'.join(lines) + '\n')
+          PY
+      - name: Upload run manifest and evaluation
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-run-${{ steps.run.outputs.run_id }}
+          path: |
+            workflow-output/manifest.json
+            workflow-output/evaluation-data/*.json
+            workflow-output/q8-evaluation/metrics.json
+            workflow-output/q8-evaluation/wrong_predictions.jsonl
+            workflow-output/q8-mistake-evaluation/metrics.json
+            workflow-output/q8-mistake-evaluation/wrong_predictions.jsonl
+          retention-days: 90
