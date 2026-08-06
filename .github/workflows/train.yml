@@ -12,6 +12,7 @@ on:
       - main
     paths:
       - ".github/workflows/train.yml"
+      - "configs/train.yaml"
 
 permissions:
   contents: read
