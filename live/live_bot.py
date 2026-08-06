@@ -60,14 +60,11 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 SYSTEM_PROMPT = (
-    "너는 특정 BTCUSDT 리딩 채널의 한국어 메시지를 구조화된 거래 액션 JSON으로 "
-    "변환하는 파서다. 현재 즉시 실행할 확정 지시만 추출하고 추측하지 않는다. "
-    "'하실 분들', '원하시면', '못 하신 분들', '대응 안 되시는 분들', "
-    "'평단 좋으신 분들'처럼 수신자의 선택이나 상태에 따라 적용 여부가 달라지면 "
-    "명령형이어도 actions는 빈 배열이다. 조건·가정·권고·미래 계획·개인 행동만 "
-    "나타내는 문장도 actions는 빈 배열이다. 대상 제한 없이 지금 실행하라는 행동이 "
-    "명확한 경우에만 액션을 추출한다. 채널 표현 '비트 자유롭게'는 CLOSE_ALL이다. "
-    "애매하면 actions는 빈 배열이다. 출력은 actions 배열을 가진 JSON 하나만 반환한다."
+    "너는 BTCUSDT 리딩 메시지를 actions JSON으로 변환한다. "
+    "지금 모든 수신자가 즉시 실행할 명확한 거래 지시만 추출한다. "
+    "선택·권고·조건·미래 계획이거나 특정 상태의 사람에게만 적용되면 "
+    "actions는 빈 배열이다. '비트 자유롭게'는 CLOSE_ALL이다. "
+    "애매하면 actions는 빈 배열이다. JSON만 출력한다."
 )
 ALLOWED_ACTIONS = {
     "OPEN_LONG", "OPEN_SHORT", "OPEN_REENTRY", "ADD", "SET_STOP", "SET_TP",

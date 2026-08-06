@@ -41,7 +41,7 @@ def chatml_paths() -> list[Path]:
 def test_system_prompt_is_identical_in_config_live_and_chatml_data():
     expected = configured_prompt()
     assert live_prompt() == expected
-    assert "수신자의 선택이나 상태에 따라 적용 여부가 달라지면" in expected
+    assert "특정 상태의 사람에게만 적용되면" in expected
     assert "채널 표현 '비트 자유롭게'는 CLOSE_ALL이다." in expected
 
     for path in chatml_paths():
