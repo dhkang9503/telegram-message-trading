@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,31 +80,11 @@ def update_contract_test() -> None:
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
 
-def restore_train_workflow() -> None:
-    path = ROOT / ".github" / "workflows" / "train.yml"
-    original = subprocess.check_output(
-        ["git", "show", "HEAD^:.github/workflows/train.yml"],
-        cwd=ROOT,
-        text=True,
-        encoding="utf-8",
-    )
-    old = '    paths:\n      - ".github/workflows/train.yml"\n'
-    new = (
-        '    paths:\n'
-        '      - ".github/workflows/train.yml"\n'
-        '      - "configs/train.yaml"\n'
-    )
-    if old not in original:
-        raise RuntimeError("Could not find train workflow push path block")
-    path.write_text(original.replace(old, new, 1), encoding="utf-8")
-
-
 def main() -> None:
     update_config()
     update_live_prompt()
     update_chatml()
     update_contract_test()
-    restore_train_workflow()
     Path(__file__).unlink()
 
 
