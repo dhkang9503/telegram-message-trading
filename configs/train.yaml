@@ -24,6 +24,7 @@ reproducibility:
     huggingface_hub: "0.30.2"
 
 training:
+  feedback_repeat: 4
   num_epochs: 5
   train_batch_size: 4
   eval_batch_size: 8

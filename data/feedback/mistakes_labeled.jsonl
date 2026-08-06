@@ -26,3 +26,4 @@
 {"source":{"message":"다들 계시죠? 050 물타기 걸어두고 보겠습니다!"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":50}]}}
 {"source":{"message":"유지하고싶은데 힘이없네요ㅜ"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"6시부터 7시까지 사인 못 드릴수도있어서 익절 하실분들 익절 하셔요!"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"슬슬 정리할 준비들 하세여 사인드릴게요!"},"label":{"status":"labeled","correct_actions":[]}}

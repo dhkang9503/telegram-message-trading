@@ -74,7 +74,13 @@ def build_training_rows(
     base_train_path: Path,
     labeled_feedback_path: Path,
     system_prompt: str,
+    feedback_repeat: int = 1,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if isinstance(feedback_repeat, bool) or not isinstance(feedback_repeat, int):
+        raise TypeError("feedback_repeat must be an integer")
+    if feedback_repeat < 1:
+        raise ValueError("feedback_repeat must be at least 1")
+
     base_rows = read_jsonl(base_train_path)
     base_labels = _base_labels(base_train_path, base_rows)
     feedback_rows, feedback_report = build_feedback_rows(
@@ -95,14 +101,19 @@ def build_training_rows(
                 )
             matching_base += 1
 
-    # Mistakes are intentionally appended even when the same labeled message is
-    # already present in base train. They are hard examples and should receive
-    # explicit weight in every corrective fine-tuning cycle.
-    combined = base_rows + feedback_rows
+    # Deduplicate labeled mistakes first, then repeat only those hard examples.
+    # Base training rows remain unchanged, while validation/test builders still
+    # include each unique mistake exactly once.
+    repeated_feedback_rows = [
+        row for _ in range(feedback_repeat) for row in feedback_rows
+    ]
+    combined = base_rows + repeated_feedback_rows
     report = {
         "base_rows": len(base_rows),
         **feedback_report,
-        "feedback_rows_appended": len(feedback_rows),
+        "feedback_repeat": feedback_repeat,
+        "feedback_rows_appended": len(repeated_feedback_rows),
+        "feedback_unique_rows_appended": len(feedback_rows),
         "feedback_rows_already_in_base": matching_base,
         "feedback_rows_skipped_as_duplicates": feedback_report[
             "feedback_duplicate_rows_skipped"
@@ -163,12 +174,16 @@ def main() -> None:
     parser.add_argument("--base-train", type=Path, required=True)
     parser.add_argument("--labeled-feedback", type=Path, required=True)
     parser.add_argument("--system-prompt", required=True)
+    parser.add_argument("--feedback-repeat", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
 
     rows, report = build_training_rows(
-        args.base_train, args.labeled_feedback, args.system_prompt
+        args.base_train,
+        args.labeled_feedback,
+        args.system_prompt,
+        feedback_repeat=args.feedback_repeat,
     )
     write_jsonl(args.output, rows)
     print(json.dumps(report, ensure_ascii=False, indent=2))
