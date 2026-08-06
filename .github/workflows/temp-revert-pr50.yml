@@ -1,0 +1,30 @@
+name: Temp revert PR 50
+
+on:
+  push:
+    branches:
+      - fix/revert-pr50-and-live-bot-deploy
+    paths:
+      - .github/workflows/temp-revert-pr50.yml
+
+permissions:
+  contents: write
+
+jobs:
+  revert:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/revert-pr50-and-live-bot-deploy
+          fetch-depth: 0
+
+      - name: Revert PR 50 merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git revert --no-edit c0263ec7884a82d6a0718e22b2ebc0228cd752f8
+          git push origin HEAD:fix/revert-pr50-and-live-bot-deploy
