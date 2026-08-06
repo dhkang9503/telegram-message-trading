@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Keep the parser contract identical across training data and live inference."""
+
 import ast
 import json
 from pathlib import Path
