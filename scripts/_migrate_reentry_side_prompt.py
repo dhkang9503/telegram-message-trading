@@ -73,7 +73,7 @@ def update_chatml() -> None:
 def update_contract_test() -> None:
     path = ROOT / "tests" / "test_system_prompt_contract.py"
     text = path.read_text(encoding="utf-8")
-    old = '    assert "채널 표현 \'비트 자유롭게\'는 CLOSE_ALL이다." in expected\n'
+    old = '    assert "\'비트 자유롭게\'는 CLOSE_ALL이다." in expected\n'
     new = (
         '    assert "OPEN_REENTRY의 side는 long, short 또는 null만 사용한다." in expected\n'
         '    assert "\'비트 자유롭게\'는 CLOSE_ALL이다." not in expected\n'
