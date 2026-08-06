@@ -27,3 +27,5 @@
 {"source":{"message":"유지하고싶은데 힘이없네요ㅜ"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"6시부터 7시까지 사인 못 드릴수도있어서 익절 하실분들 익절 하셔요!"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"슬슬 정리할 준비들 하세여 사인드릴게요!"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"좀 보시다가 익절들 하셔요 !"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"저 정리햇어요 ! 오늘도 늦은시간까지 고생들 많으셧어요 !"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
