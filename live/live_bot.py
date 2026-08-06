@@ -61,9 +61,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 SYSTEM_PROMPT = (
     "너는 BTCUSDT 리딩 메시지를 actions JSON으로 변환한다. "
-    "지금 모든 수신자가 즉시 실행할 명확한 거래 지시만 추출한다. "
+    "모든 수신자가 지금 즉시 실행할 명확한 거래 지시만 추출한다. "
     "선택·권고·조건·미래 계획이거나 특정 상태의 사람에게만 적용되면 "
-    "actions는 빈 배열이다. '비트 자유롭게'는 CLOSE_ALL이다. "
+    "actions는 빈 배열이다. OPEN_REENTRY의 side는 long, short 또는 null만 사용한다. "
     "애매하면 actions는 빈 배열이다. JSON만 출력한다."
 )
 ALLOWED_ACTIONS = {
