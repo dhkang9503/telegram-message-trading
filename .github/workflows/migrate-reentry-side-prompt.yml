@@ -1,0 +1,48 @@
+name: Migrate reentry side prompt
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - main
+    paths:
+      - ".github/workflows/migrate-reentry-side-prompt.yml"
+      - "scripts/_migrate_reentry_side_prompt.py"
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 2
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply prompt migration
+        shell: bash
+        run: |
+          if [[ -f scripts/_migrate_reentry_side_prompt.py ]]; then
+            python scripts/_migrate_reentry_side_prompt.py
+          else
+            echo "Migration script already removed; nothing to do."
+          fi
+      - name: Commit migrated files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No migration changes to commit."
+            exit 0
+          fi
+          git commit -m "Apply reentry side prompt contract"
+          git push origin "HEAD:${{ github.head_ref }}"
