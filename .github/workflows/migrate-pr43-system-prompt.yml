@@ -1,9 +1,9 @@
 name: Temp migrate PR 43 system prompt
 
 on:
-  push:
+  pull_request:
     branches:
-      - revert/pr43-system-prompt
+      - main
     paths:
       - .github/workflows/migrate-pr43-system-prompt.yml
       - scripts/migrate_pr43_system_prompt.py
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   migrate:
-    if: github.actor != 'github-actions[bot]'
+    if: github.head_ref == 'revert/pr43-system-prompt' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout branch
