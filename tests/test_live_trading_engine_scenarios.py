@@ -729,3 +729,127 @@ def test_directional_reentry_side_mismatch_fails_closed(rig):
 
     assert len(mutations(api)) == before
     assert state.data["stopped_position"]["available_for_reentry"] is True
+
+
+
+def test_price_typo_pair_corrects_93860_93590_and_executes_both(rig):
+    engine, api, state, config = rig
+    api.mark_price = Decimal("64000")
+    execute(engine, "OPEN_LONG")
+    assert D(state.data["position"]["entry_price"]) == Decimal("64000")
+
+    original = [
+        {"type": "ADD", "price": 93860},
+        {"type": "SET_STOP", "price": 93590},
+    ]
+    actions, corrections, rejected = live.preflight_and_correct_add_stop_prices(
+        original, api.mark_price, state.data["position"], config
+    )
+
+    assert actions == [
+        {"type": "ADD", "price": 63860},
+        {"type": "SET_STOP", "price": 63590},
+    ]
+    assert [item["corrected_price"] for item in corrections] == [63860, 63590]
+    assert rejected == []
+
+    start = len(api.calls)
+    for index, action in enumerate(actions):
+        run(engine.execute(action, 14676, index, "93860물타기 93590손절 걸겠습니다!"))
+    calls = mutations(api, start)
+    assert [call["method"] for call in calls] == ["place_order", "place_plan"]
+    assert calls[0]["price"] == Decimal("63860")
+    assert calls[1]["trigger_price"] == Decimal("63590")
+
+
+def test_single_bad_add_is_rejected_instead_of_guessed(rig):
+    engine, api, state, config = rig
+    api.mark_price = Decimal("64000")
+    execute(engine, "OPEN_LONG")
+
+    actions, corrections, rejected = live.preflight_and_correct_add_stop_prices(
+        [{"type": "ADD", "price": 93860}],
+        api.mark_price,
+        state.data["position"],
+        config,
+    )
+
+    assert actions == []
+    assert corrections == []
+    assert len(rejected) == 1
+    assert rejected[0]["action"] == {"type": "ADD", "price": 93860}
+    assert "too far from market" in rejected[0]["reason"]
+
+
+def test_bad_add_does_not_block_valid_stop_in_preflight(rig):
+    engine, api, state, config = rig
+    api.mark_price = Decimal("64000")
+    execute(engine, "OPEN_LONG")
+
+    actions, corrections, rejected = live.preflight_and_correct_add_stop_prices(
+        [
+            {"type": "ADD", "price": 93860},
+            {"type": "SET_STOP", "price": 63590},
+        ],
+        api.mark_price,
+        state.data["position"],
+        config,
+    )
+
+    assert actions == [{"type": "SET_STOP", "price": 63590}]
+    assert corrections == []
+    assert len(rejected) == 1
+    validated, stop_rejected, deduplicated = live.validate_and_deduplicate_stop_actions(
+        actions, api.mark_price, "long", config
+    )
+    assert validated == actions
+    assert stop_rejected == []
+    assert deduplicated == []
+
+
+def test_pair_is_not_corrected_when_long_structure_is_invalid(rig):
+    engine, api, state, config = rig
+    api.mark_price = Decimal("64000")
+    execute(engine, "OPEN_LONG")
+
+    actions, corrections, rejected = live.preflight_and_correct_add_stop_prices(
+        [
+            {"type": "ADD", "price": 93590},
+            {"type": "SET_STOP", "price": 93860},
+        ],
+        api.mark_price,
+        state.data["position"],
+        config,
+    )
+
+    assert corrections == []
+    assert actions == [{"type": "SET_STOP", "price": 93860}]
+    assert len(rejected) == 1
+    validated, stop_rejected, _ = live.validate_and_deduplicate_stop_actions(
+        actions, api.mark_price, "long", config
+    )
+    assert validated == []
+    assert len(stop_rejected) == 1
+
+
+def test_short_pair_uses_mirrored_structure(rig):
+    engine, api, state, config = rig
+    api.mark_price = Decimal("64000")
+    execute(engine, "OPEN_SHORT")
+
+    actions, corrections, rejected = live.preflight_and_correct_add_stop_prices(
+        [
+            {"type": "ADD", "price": 94140},
+            {"type": "SET_STOP", "price": 94410},
+        ],
+        api.mark_price,
+        state.data["position"],
+        config,
+    )
+
+    assert actions == [
+        {"type": "ADD", "price": 64140},
+        {"type": "SET_STOP", "price": 64410},
+    ]
+    assert [item["corrected_price"] for item in corrections] == [64140, 64410]
+    assert rejected == []
