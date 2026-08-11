@@ -29,3 +29,6 @@
 {"source":{"message":"슬슬 정리할 준비들 하세여 사인드릴게요!"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"좀 보시다가 익절들 하셔요 !"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"저 정리햇어요 ! 오늘도 늦은시간까지 고생들 많으셧어요 !"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"이거 지금 시간도 너무 늦었고 저희 억지 수익낸거라 -12퍼에 리밋걸고 그냥 유지하겠습니다 ! 반익한거 잇어서 리밋걸려도 본전이에요 ! 다 익절 하셔도됩니다 !"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"저 걍 리밋 풀엇어요 !"},"label":{"status":"labeled","correct_actions":[]}}
+{"source":{"message":"-4퍼가 본전이에요 ! 수정들 하셔도되고 정리들 하셔도돼요 ! 지금 정리하시면 수익들이실거에요 ! 사인 여기까지 드리겠습니다 !"},"label":{"status":"labeled","correct_actions":[]}}
