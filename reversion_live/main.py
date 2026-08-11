@@ -390,7 +390,11 @@ class Bot:
             raise BotError(f"max-one-position invariant broken: {live_positions}")
         p = live_positions[0]
         equity = D(self.state.data["cycle_equity"])
-        if p.upnl <= -equity*HARD_STOP: self.close_all(p, "cycle_-8pct"); return
+        start_account = D(self.state.data["account_equity_at_start"])
+        account = self.api.account()
+        current_account = D(account.get("totalMarginBalance") or account.get("totalWalletBalance"))
+        if current_account <= start_account - equity*HARD_STOP:
+            self.close_all(p, "cycle_-8pct"); return
         if time.monotonic()-self.last_structure_scan >= 30:
             self.structure_cached = structure_break(self.api, p); self.last_structure_scan = time.monotonic()
         if self.structure_cached: self.close_all(p, "1h_structure_break_atr_expansion"); return
