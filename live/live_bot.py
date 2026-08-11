@@ -705,6 +705,150 @@ def validate_and_deduplicate_stop_actions(
     return normalized, rejected, deduplicated
 
 
+def _json_price(price: Decimal) -> int | float:
+    integer = price.to_integral_value()
+    return int(integer) if price == integer else float(price)
+
+
+def _leading_digit_price_candidate(
+    raw_price: Any,
+    reference: Decimal,
+    config: ContractConfig,
+) -> tuple[str, Decimal]:
+    raw = D(raw_price)
+    integer = raw.to_integral_value()
+    if raw <= 0 or raw != integer:
+        raise BotError(f"Leading-digit correction requires a positive integer price: {raw_price!r}")
+    text = str(abs(int(integer)))
+    if len(text) < 5:
+        raise BotError(f"Leading-digit correction requires a full BTC price: {raw_price!r}")
+    fragment = text[1:]
+    candidate = restore_btc_price(fragment, reference, config)
+    if candidate == config.floor_price(raw):
+        raise BotError(f"Leading-digit correction did not change price: {raw_price!r}")
+    return text[0], candidate
+
+
+def _paired_add_stop_typo_correction(
+    actions: list[dict[str, Any]],
+    reference: Decimal,
+    position: dict[str, Any],
+    config: ContractConfig,
+) -> Optional[tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
+    priced_adds = [
+        (index, action)
+        for index, action in enumerate(actions)
+        if action.get("type") == "ADD" and action.get("price") is not None
+    ]
+    priced_stops = [
+        (index, action)
+        for index, action in enumerate(actions)
+        if action.get("type") == "SET_STOP" and action.get("price") is not None
+    ]
+    if len(priced_adds) != 1 or len(priced_stops) != 1:
+        return None
+
+    add_index, add_action = priced_adds[0]
+    stop_index, stop_action = priced_stops[0]
+
+    # Auto-correction is deliberately narrow: both full prices must already be
+    # invalid against the live market. A single suspicious price is rejected,
+    # never guessed.
+    for action in (add_action, stop_action):
+        try:
+            restore_btc_price(action["price"], reference, config)
+        except BotError:
+            pass
+        else:
+            return None
+
+    try:
+        add_prefix, add_candidate = _leading_digit_price_candidate(
+            add_action["price"], reference, config
+        )
+        stop_prefix, stop_candidate = _leading_digit_price_candidate(
+            stop_action["price"], reference, config
+        )
+    except BotError:
+        return None
+
+    if add_prefix != stop_prefix:
+        return None
+
+    raw_add = D(add_action["price"])
+    raw_stop = D(stop_action["price"])
+    raw_delta = raw_add - raw_stop
+    corrected_delta = add_candidate - stop_candidate
+    if abs(raw_delta - corrected_delta) > config.price_step:
+        return None
+
+    side = str(position.get("side"))
+    entry = D(position.get("entry_price"))
+    if entry <= 0:
+        return None
+    if abs(add_candidate - entry) / entry > PRICE_RESTORE_MAX_GAP_RATIO:
+        return None
+    if side == "long":
+        if not (stop_candidate < add_candidate < entry):
+            return None
+    elif side == "short":
+        if not (stop_candidate > add_candidate > entry):
+            return None
+    else:
+        return None
+
+    corrected = [dict(action) for action in actions]
+    corrected[add_index]["price"] = _json_price(add_candidate)
+    corrected[stop_index]["price"] = _json_price(stop_candidate)
+    corrections = [
+        {
+            "action_index": add_index,
+            "type": "ADD",
+            "original_price": add_action["price"],
+            "corrected_price": corrected[add_index]["price"],
+        },
+        {
+            "action_index": stop_index,
+            "type": "SET_STOP",
+            "original_price": stop_action["price"],
+            "corrected_price": corrected[stop_index]["price"],
+        },
+    ]
+    return corrected, corrections
+
+
+def preflight_and_correct_add_stop_prices(
+    actions: list[dict[str, Any]],
+    reference: Decimal,
+    position: dict[str, Any],
+    config: ContractConfig,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    normalized = [dict(action) for action in actions]
+    corrections: list[dict[str, Any]] = []
+    pair = _paired_add_stop_typo_correction(
+        normalized, reference, position, config
+    )
+    if pair is not None:
+        normalized, corrections = pair
+
+    # ADD used to fail only inside execute(), which prevented a later valid
+    # SET_STOP in the same message from running. Reject an impossible priced
+    # ADD here instead; SET_STOP keeps its existing dedicated validation.
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for action in normalized:
+        if action.get("type") != "ADD" or action.get("price") is None:
+            accepted.append(action)
+            continue
+        try:
+            restore_btc_price(action["price"], reference, config)
+        except BotError as exc:
+            rejected.append({"action": action, "reason": str(exc)})
+        else:
+            accepted.append(action)
+    return accepted, corrections, rejected
+
+
 def extract_stop_correction_fragment(text: str) -> Optional[str]:
     if not STOP_CORRECTION_CUE_RE.search(text):
         return None
@@ -1562,6 +1706,40 @@ async def run_bot() -> None:
                         actions = align_action_prices_to_source(
                             source_text, list(parsed["actions"])
                         )
+                        record["model_actions"] = [dict(action) for action in actions]
+
+                        if (
+                            D(state.data["position"].get("total_qty")) > 0
+                            and any(
+                                action.get("type") in {"ADD", "SET_STOP"}
+                                and action.get("price") is not None
+                                for action in actions
+                            )
+                        ):
+                            reference = await engine.reference_price()
+                            position = engine.require_position()
+                            (
+                                actions,
+                                price_corrections,
+                                price_rejections,
+                            ) = preflight_and_correct_add_stop_prices(
+                                actions, reference, position, config
+                            )
+                            if price_corrections:
+                                record["price_corrections"] = price_corrections
+                                engine.log(
+                                    "PRICE_TYPO_PAIR_CORRECTED",
+                                    message_id=message.id,
+                                    message=source_text,
+                                    reference_price=ds(reference),
+                                    entry_price=str(position.get("entry_price")),
+                                    corrections=price_corrections,
+                                )
+                            if price_rejections:
+                                record.setdefault("rejected_actions", []).extend(
+                                    price_rejections
+                                )
+
                         if not actions:
                             correction = await engine.maybe_failed_stop_correction(
                                 source_text, message.id
@@ -1608,7 +1786,9 @@ async def run_bot() -> None:
                                 actions, reference, position_side, config
                             )
                             if rejected_actions:
-                                record["rejected_actions"] = rejected_actions
+                                record.setdefault("rejected_actions", []).extend(
+                                    rejected_actions
+                                )
                             if deduplicated_actions:
                                 record["deduplicated_actions"] = deduplicated_actions
 
