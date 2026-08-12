@@ -45,6 +45,9 @@ STOP = False
 class BotError(RuntimeError): pass
 
 
+class OrderBelowMinimum(BotError): pass
+
+
 class BinanceError(BotError):
     def __init__(self, status: int, code: int | None, msg: str):
         super().__init__(f"Binance error status={status} code={code}: {msg}")
@@ -277,7 +280,7 @@ class Bot:
     def qty(self, symbol: str, notional: Decimal, price: Decimal) -> Decimal:
         r = self.rules[symbol]; q = r.floor(notional/price)
         if q < r.min_qty or q <= 0 or (r.min_notional > 0 and q*price < r.min_notional):
-            raise BotError(f"{symbol} order below exchange minimum; bot will not auto-upsize")
+            raise OrderBelowMinimum(f"{symbol} order below exchange minimum; bot will not auto-upsize")
         return q
 
     def reconcile_pending(self) -> bool:
@@ -327,7 +330,15 @@ class Bot:
         actual = D(account.get("totalMarginBalance") or account.get("totalWalletBalance"))
         if actual <= 0: raise BotError("invalid futures equity")
         equity = min(actual,SIZING_CAP) if SIZING_CAP > 0 else actual
-        trade,candle = latest_trade(self.api,symbol); q = self.qty(symbol,equity*INITIAL_MARGIN*D(LEVERAGE),trade)
+        trade,candle = latest_trade(self.api,symbol)
+        try:
+            q = self.qty(symbol,equity*INITIAL_MARGIN*D(LEVERAGE),trade)
+        except OrderBelowMinimum as e:
+            self.state.data["last_signal"][symbol] = close_time
+            self.state.save()
+            LOG.warning("SKIP_ENTRY %s %s close_time=%s trade=%s sizing_equity=%s reason=%s",
+                        symbol,side,close_time,ds(trade),ds(equity),e)
+            return
         LOG.warning("OPEN %s %s qty=%s trade=%s sizing_equity=%s",symbol,side,ds(q),ds(trade),ds(equity))
         self.market(symbol,"BUY" if side=="long" else "SELL",q,False,"open"); time.sleep(.4); p = one_position(self.api,symbol)
         if not p.open or p.side != side: raise BotError("entry reconciliation failed")
