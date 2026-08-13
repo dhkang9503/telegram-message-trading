@@ -24,7 +24,9 @@ ADD_ATRS = (D("1.4"), D("3.0"), D("4.6"))
 KEEP_RATIO = D("0.50")
 TAKER_FEE = D("0.0004")
 BE_PRICE_RATIO = D(2) * TAKER_FEE / (D(1) - TAKER_FEE)
-TP_PRICE_RATIO = D("0.50") / D(LEVERAGE)
+TP_ACTIVATION_PRICE_RATIO = D("0.50") / D(LEVERAGE)
+TRAIL_ROI_GIVEBACK = D("0.05")
+TRAIL_PRICE_RATIO = TRAIL_ROI_GIVEBACK / D(LEVERAGE)
 HARD_STOP = D("0.08")
 STRUCTURE_LOOKBACK = 96  # 96 x 15m = 24h
 ATR_MEDIAN_LOOKBACK, ATR_EXPANSION = 100, D("1.8")
@@ -72,7 +74,8 @@ def blank_state() -> dict[str, Any]:
         "cycle_equity": None, "cycle_cash": None, "account_equity_at_start": None,
         "round_anchor": None, "round_atr": None, "add_stage": 0,
         "had_add": False, "rotations": 0, "last_add_candle": None,
-        "last_rotation_candle": None, "last_signal": {}, "pending_order": None,
+        "last_rotation_candle": None, "trail_active": False, "trail_extreme": None,
+        "trail_activation_candle": None, "last_signal": {}, "pending_order": None,
         "updated_at": int(time.time()),
     }
 
@@ -345,7 +348,8 @@ class Bot:
         cycle_cash = equity - p.qty*p.entry*TAKER_FEE
         self.state.data.update({"active_symbol":symbol,"side":side,"cycle_equity":ds(equity),"cycle_cash":ds(cycle_cash),
                                 "account_equity_at_start":ds(actual),"round_anchor":ds(p.entry),"round_atr":ds(atr),
-                                "add_stage":0,"had_add":False,"rotations":0,"last_add_candle":None,"last_rotation_candle":None})
+                                "add_stage":0,"had_add":False,"rotations":0,"last_add_candle":None,"last_rotation_candle":None,
+                                "trail_active":False,"trail_extreme":None,"trail_activation_candle":None})
         self.state.data["last_signal"][symbol] = close_time; self.state.save(); self.clear_pending()
         LOG.info("ENTRY_STATE %s candle=%s cycle_cash=%s",symbol,candle,ds(cycle_cash))
 
@@ -363,6 +367,26 @@ class Bot:
         target = equity*(D(1)-HARD_STOP); delta = (target-cash)/p.qty
         return p.entry+delta if p.side=="long" else p.entry-delta
 
+    def manage_trail(self, p: Position, trade: Decimal, candle: int) -> bool:
+        extreme = D(self.state.data.get("trail_extreme"))
+        activation_candle = int(self.state.data["trail_activation_candle"])
+        distance = p.entry * TRAIL_PRICE_RATIO
+
+        # Match the backtest ordering: evaluate the previously established stop first.
+        stop = extreme-distance if p.side=="long" else extreme+distance
+        hit = trade <= stop if p.side=="long" else trade >= stop
+        if candle != activation_candle and hit:
+            LOG.warning("TRAIL_EXIT %s side=%s trade=%s extreme=%s stop=%s giveback_roi=%s",
+                        p.symbol,p.side,ds(trade),ds(extreme),ds(stop),ds(TRAIL_ROI_GIVEBACK))
+            self.close_all(p,"tp_trail_5pct_roi_giveback",trade)
+            return True
+
+        # The activation candle may establish a better extreme, but cannot trail-exit.
+        better = trade > extreme if p.side=="long" else trade < extreme
+        if better:
+            self.state.data["trail_extreme"] = ds(trade); self.state.save()
+        return True
+
     def manage(self) -> None:
         symbol = self.state.data["active_symbol"]; live_positions = open_positions(self.api)
         if len(live_positions)!=1 or live_positions[0].symbol != symbol:
@@ -370,7 +394,7 @@ class Bot:
             raise BotError(f"max-one-position invariant broken: {live_positions}")
         p = live_positions[0]; equity = D(self.state.data["cycle_equity"]); trade,candle = latest_trade(self.api,symbol)
 
-        # Validated order: completed-15m structure -> hard stop -> ADD(s) -> rotation -> TP.
+        # Validated order: completed-15m structure -> hard stop -> ADD(s) -> rotation -> TP/trail.
         if time.monotonic()-self.last_structure_scan >= 15:
             self.structure_cached = structure_break(self.api,p); self.last_structure_scan = time.monotonic()
         if self.structure_cached: self.close_all(p,"15m_structure_break_atr_expansion",trade); return
@@ -379,6 +403,10 @@ class Bot:
         if (trade <= risk if p.side=="long" else trade >= risk):
             LOG.warning("HARD_STOP %s trade=%s risk_price=%s cycle_cash=%s",symbol,ds(trade),ds(risk),self.state.data["cycle_cash"])
             self.close_all(p,"cycle_-8pct",trade); return
+
+        # Once +50% ROI activates the runner, freeze ADD/rotation and manage only the trail.
+        if self.state.data.get("trail_active"):
+            self.manage_trail(p,trade,candle); return
 
         last_rotation = self.state.data.get("last_rotation_candle")
         can_add = last_rotation is None or int(last_rotation) != candle
@@ -397,7 +425,7 @@ class Bot:
                 self.state.data.update({"cycle_cash":ds(cash),"add_stage":stage+1,"had_add":True,"last_add_candle":candle})
                 self.state.save(); self.clear_pending(); did_add = True; trade,candle = latest_trade(self.api,symbol)
 
-        # Recovery/TP is forbidden on a 5m candle that added.
+        # Recovery/TP activation is forbidden on a 5m candle that added.
         last_add = self.state.data.get("last_add_candle")
         if did_add or (last_add is not None and int(last_add)==candle): return
 
@@ -415,9 +443,14 @@ class Bot:
                                         "add_stage":0,"had_add":False,"rotations":self.state.data["rotations"]+1,"last_rotation_candle":candle})
                 self.state.save(); self.clear_pending(); trade,candle = latest_trade(self.api,symbol)
 
-        # TP is allowed on the same 5m candle after rotation.
-        p = one_position(self.api,symbol); tp = p.entry*(D(1)+TP_PRICE_RATIO) if p.side=="long" else p.entry*(D(1)-TP_PRICE_RATIO)
-        if (trade >= tp if p.side=="long" else trade <= tp): self.close_all(p,"tp_50pct_roi",trade)
+        # +50% ROI no longer closes immediately; it activates a 5%p ROI giveback trail.
+        p = one_position(self.api,symbol)
+        activation = p.entry*(D(1)+TP_ACTIVATION_PRICE_RATIO) if p.side=="long" else p.entry*(D(1)-TP_ACTIVATION_PRICE_RATIO)
+        if (trade >= activation if p.side=="long" else trade <= activation):
+            self.state.data.update({"trail_active":True,"trail_extreme":ds(trade),"trail_activation_candle":candle})
+            self.state.save()
+            LOG.warning("TRAIL_ACTIVATE %s side=%s entry=%s trade=%s activation=%s giveback_roi=%s candle=%s",
+                        symbol,p.side,ds(p.entry),ds(trade),ds(activation),ds(TRAIL_ROI_GIVEBACK),candle)
 
     def scan(self) -> None:
         if time.monotonic()-self.last_signal_scan < 15: return
@@ -435,7 +468,7 @@ class Bot:
 
     def run(self) -> None:
         self.bootstrap()
-        LOG.info("started live=%s symbols=%s 98x cross highfreq initial=1.25%% adds=1.25/1.875/2.5%% keep=50%% BB=1.8 CCI=210 add_atr=1.4/3.0/4.6 TP=50%% structure=15m/96 atr_median=100 atr_expansion=1.8",LIVE,SYMBOLS)
+        LOG.info("started live=%s symbols=%s 98x cross highfreq initial=1.25%% adds=1.25/1.875/2.5%% keep=50%% BB=1.8 CCI=210 add_atr=1.4/3.0/4.6 TP=activate50%% trail_giveback=5%%p structure=15m/96 atr_median=100 atr_expansion=1.8",LIVE,SYMBOLS)
         while not STOP:
             if LIVE and self.state.data.get("pending_order") and self.reconcile_pending():
                 raise BotError("FILLED pending order with incomplete local transition")
