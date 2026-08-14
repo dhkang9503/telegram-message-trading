@@ -1,4 +1,4 @@
-"""Binance USD-M BTCUSDT BB+CCI high-frequency reversion bot."""
+"""Binance USD-M BTC/ETH/SOL BB+CCI high-frequency reversion bot."""
 from __future__ import annotations
 
 import hashlib, hmac, json, logging, os, secrets, signal, statistics, time
@@ -12,16 +12,44 @@ from urllib.request import Request, urlopen
 
 D = lambda x, default="0": Decimal(default) if x is None or x == "" else Decimal(str(x))
 
-# BTC-only high-frequency profile validated on the recovered reference engine.
-SYMBOLS = ("BTCUSDT",)
+
+@dataclass(frozen=True)
+class Profile:
+    bb_std: Decimal
+    cci_extreme: Decimal
+    initial_margin: Decimal
+    add_margins: tuple[Decimal, Decimal, Decimal]
+    add_atrs: tuple[Decimal, Decimal, Decimal]
+    keep_ratio: Decimal
+    atr_expansion: Decimal
+
+
+# Per-symbol 15m profiles validated independently; tuple order is live signal priority.
+PROFILES = {
+    "BTCUSDT": Profile(
+        D("1.8"), D("210"), D("0.0125"),
+        (D("0.0125"), D("0.01875"), D("0.025")),
+        (D("1.4"), D("3.0"), D("4.6")),
+        D("0.50"), D("1.8"),
+    ),
+    "ETHUSDT": Profile(
+        D("1.9"), D("210"), D("0.005"),
+        (D("0.005"), D("0.0075"), D("0.010")),
+        (D("1.0"), D("2.0"), D("3.2")),
+        D("0.20"), D("1.5"),
+    ),
+    "SOLUSDT": Profile(
+        D("1.65"), D("210"), D("0.003"),
+        (D("0.003"), D("0.0045"), D("0.006")),
+        (D("1.0"), D("2.5"), D("4.0")),
+        D("0.80"), D("1.5"),
+    ),
+}
+SYMBOLS = tuple(PROFILES)
 LEVERAGE = 98
-BB_PERIOD, BB_STD = 20, D("1.8")
-CCI_PERIOD, CCI_EXTREME = 20, D("210")
+BB_PERIOD = 20
+CCI_PERIOD = 20
 ATR_PERIOD, ATR_FETCH_LIMIT = 14, 500
-INITIAL_MARGIN = D("0.0125")
-ADD_MARGINS = (D("0.0125"), D("0.01875"), D("0.025"))
-ADD_ATRS = (D("1.4"), D("3.0"), D("4.6"))
-KEEP_RATIO = D("0.50")
 TAKER_FEE = D("0.0004")
 BE_PRICE_RATIO = D(2) * TAKER_FEE / (D(1) - TAKER_FEE)
 TP_ACTIVATION_PRICE_RATIO = D("0.50") / D(LEVERAGE)
@@ -29,7 +57,9 @@ TRAIL_ROI_GIVEBACK = D("0.05")
 TRAIL_PRICE_RATIO = TRAIL_ROI_GIVEBACK / D(LEVERAGE)
 HARD_STOP = D("0.08")
 STRUCTURE_LOOKBACK = 96  # 96 x 15m = 24h
-ATR_MEDIAN_LOOKBACK, ATR_EXPANSION = 100, D("1.8")
+ATR_MEDIAN_LOOKBACK = 100
+SIGNAL_INTERVAL_MS = 15 * 60 * 1000
+SIGNAL_MAX_AGE_MS = int(float(os.getenv("SIGNAL_MAX_AGE_SECONDS", "60")) * 1000)
 BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
 LIVE = os.getenv("LIVE_TRADING", "0") == "1"
 SIZING_CAP = D(os.getenv("SIZING_EQUITY_CAP_USDT", "0"))
@@ -201,10 +231,10 @@ def atr_series(rows: list[list[Any]]) -> list[Decimal | None]:
     return out
 
 
-def bands(closes: list[Decimal], i: int) -> tuple[Decimal,Decimal]:
+def bands(closes: list[Decimal], i: int, bb_std: Decimal) -> tuple[Decimal,Decimal]:
     w = closes[i-BB_PERIOD+1:i+1]; m = sum(w,D("0"))/D(BB_PERIOD)
     sd = (sum((x-m)**2 for x in w)/D(BB_PERIOD)).sqrt()
-    return m+BB_STD*sd, m-BB_STD*sd
+    return m+bb_std*sd, m-bb_std*sd
 
 
 def cci(rows: list[list[Any]], i: int) -> Decimal:
@@ -214,13 +244,17 @@ def cci(rows: list[list[Any]], i: int) -> Decimal:
 
 
 def signal_for(api: Binance, symbol: str) -> tuple[str,int,Decimal] | None:
+    profile = PROFILES[symbol]
     rows = closed(api.klines(symbol,"15m",ATR_FETCH_LIMIT))
     if len(rows) < max(BB_PERIOD,CCI_PERIOD,ATR_PERIOD)+2: return None
     closes = [D(r[4]) for r in rows]; p,c = len(rows)-2,len(rows)-1
-    pu,pl = bands(closes,p); cu,cl = bands(closes,c); pc,cc = cci(rows,p),cci(rows,c); a = atr_series(rows)[c]
+    pu,pl = bands(closes,p,profile.bb_std); cu,cl = bands(closes,c,profile.bb_std)
+    pc,cc = cci(rows,p),cci(rows,c); a = atr_series(rows)[c]
     if a is None: return None
-    if closes[p] < pl and pc < -CCI_EXTREME and closes[c] > cl and cc > pc: return "long",int(rows[c][6]),a
-    if closes[p] > pu and pc > CCI_EXTREME and closes[c] < cu and cc < pc: return "short",int(rows[c][6]),a
+    if closes[p] < pl and pc < -profile.cci_extreme and closes[c] > cl and cc > pc:
+        return "long",int(rows[c][6]),a
+    if closes[p] > pu and pc > profile.cci_extreme and closes[c] < cu and cc < pc:
+        return "short",int(rows[c][6]),a
     return None
 
 
@@ -234,6 +268,11 @@ def latest_trade(api: Binance, symbol: str) -> tuple[Decimal,int]:
     rows = api.klines(symbol,"5m",2)
     if not rows: raise BotError(f"trade price unavailable for {symbol}")
     return D(rows[-1][4]), int(rows[-1][0])
+
+
+def latest_completed_15m_close_time(now_ms: int | None = None) -> int:
+    now_ms = int(time.time()*1000) if now_ms is None else now_ms
+    return (now_ms // SIGNAL_INTERVAL_MS) * SIGNAL_INTERVAL_MS - 1
 
 
 def parse_pos(x: dict[str,Any]) -> Position:
@@ -265,6 +304,7 @@ def load_rules(api: Binance) -> dict[str,Rules]:
 
 
 def structure_break(api: Binance, p: Position) -> bool:
+    profile = PROFILES[p.symbol]
     rows = closed(api.klines(p.symbol,"15m",ATR_FETCH_LIMIT))
     if len(rows) < max(STRUCTURE_LOOKBACK+1,ATR_MEDIAN_LOOKBACK+ATR_PERIOD): return False
     ats = atr_series(rows); cur = ats[-1]; hist = [x for x in ats[-ATR_MEDIAN_LOOKBACK:] if x is not None]
@@ -272,7 +312,7 @@ def structure_break(api: Binance, p: Position) -> bool:
     med = D(statistics.median(hist)); prev = rows[-(STRUCTURE_LOOKBACK+1):-1]
     close = D(rows[-1][4]); low = min(D(r[3]) for r in prev); high = max(D(r[2]) for r in prev)
     broken = close < low if p.side=="long" else close > high
-    return broken and med > 0 and cur >= ATR_EXPANSION*med
+    return broken and med > 0 and cur >= profile.atr_expansion*med
 
 
 class Bot:
@@ -329,13 +369,14 @@ class Bot:
     def open_signal(self, symbol: str, side: str, close_time: int, atr: Decimal) -> None:
         if open_positions(self.api) or self.api.open_orders(): return
         if self.api.position_mode(): raise BotError("one-way mode required")
+        profile = PROFILES[symbol]
         self.api.configure(symbol); account = self.api.account()
         actual = D(account.get("totalMarginBalance") or account.get("totalWalletBalance"))
         if actual <= 0: raise BotError("invalid futures equity")
         equity = min(actual,SIZING_CAP) if SIZING_CAP > 0 else actual
         trade,candle = latest_trade(self.api,symbol)
         try:
-            q = self.qty(symbol,equity*INITIAL_MARGIN*D(LEVERAGE),trade)
+            q = self.qty(symbol,equity*profile.initial_margin*D(LEVERAGE),trade)
         except OrderBelowMinimum as e:
             self.state.data["last_signal"][symbol] = close_time
             self.state.save()
@@ -388,7 +429,8 @@ class Bot:
         return True
 
     def manage(self) -> None:
-        symbol = self.state.data["active_symbol"]; live_positions = open_positions(self.api)
+        symbol = self.state.data["active_symbol"]; profile = PROFILES[symbol]
+        live_positions = open_positions(self.api)
         if len(live_positions)!=1 or live_positions[0].symbol != symbol:
             if not live_positions: self.state.reset_cycle(); return
             raise BotError(f"max-one-position invariant broken: {live_positions}")
@@ -414,9 +456,9 @@ class Bot:
         if can_add:
             while int(self.state.data["add_stage"]) < 3:
                 stage = int(self.state.data["add_stage"]); anchor = D(self.state.data["round_anchor"]); a = D(self.state.data["round_atr"])
-                trigger = anchor-ADD_ATRS[stage]*a if p.side=="long" else anchor+ADD_ATRS[stage]*a
+                trigger = anchor-profile.add_atrs[stage]*a if p.side=="long" else anchor+profile.add_atrs[stage]*a
                 if not (trade <= trigger if p.side=="long" else trade >= trigger): break
-                before = p; q = self.qty(symbol,equity*ADD_MARGINS[stage]*D(LEVERAGE),trade)
+                before = p; q = self.qty(symbol,equity*profile.add_margins[stage]*D(LEVERAGE),trade)
                 LOG.warning("ADD%d %s qty=%s trigger=%s trade=%s",stage+1,symbol,ds(q),ds(trigger),ds(trade))
                 self.market(symbol,"BUY" if p.side=="long" else "SELL",q,False,f"add{stage+1}"); time.sleep(.4); p = one_position(self.api,symbol)
                 if not p.open or p.side != before.side or p.qty <= before.qty: raise BotError("add reconciliation failed")
@@ -432,9 +474,10 @@ class Bot:
         if self.state.data["had_add"]:
             before = p; rotation = p.entry*(D(1)+BE_PRICE_RATIO) if p.side=="long" else p.entry*(D(1)-BE_PRICE_RATIO)
             if (trade >= rotation if p.side=="long" else trade <= rotation):
-                q = self.rules[symbol].floor(p.qty*(D(1)-KEEP_RATIO))
+                q = self.rules[symbol].floor(p.qty*(D(1)-profile.keep_ratio))
                 if q <= 0: raise BotError("rotation quantity rounds to zero")
-                LOG.warning("ROTATE %s close=%s total=%s target=%s trade=%s keep=%s",symbol,ds(q),ds(p.qty),ds(rotation),ds(trade),ds(KEEP_RATIO))
+                LOG.warning("ROTATE %s close=%s total=%s target=%s trade=%s keep=%s",
+                            symbol,ds(q),ds(p.qty),ds(rotation),ds(trade),ds(profile.keep_ratio))
                 self.market(symbol,"SELL" if p.side=="long" else "BUY",q,True,"rotate"); time.sleep(.4); p = one_position(self.api,symbol)
                 if not p.open: self.clear_pending(); self.state.reset_cycle(); return
                 sign = D(1) if before.side=="long" else D(-1); cash = D(self.state.data["cycle_cash"])
@@ -452,28 +495,79 @@ class Bot:
             LOG.warning("TRAIL_ACTIVATE %s side=%s entry=%s trade=%s activation=%s giveback_roi=%s candle=%s",
                         symbol,p.side,ds(p.entry),ds(trade),ds(activation),ds(TRAIL_ROI_GIVEBACK),candle)
 
+    def consume_occupied_bar(self) -> None:
+        """Prevent a signal that occurred while occupied from being entered after the position closes."""
+        close_time = latest_completed_15m_close_time()
+        changed = False
+        for symbol in SYMBOLS:
+            previous = int(self.state.data["last_signal"].get(symbol,0))
+            if close_time > previous:
+                self.state.data["last_signal"][symbol] = close_time
+                changed = True
+        if changed: self.state.save()
+
     def scan(self) -> None:
         if time.monotonic()-self.last_signal_scan < 15: return
         self.last_signal_scan = time.monotonic()
-        if LIVE and open_positions(self.api): return
+        now_ms = int(time.time()*1000)
+        candidates: list[tuple[str,str,int,Decimal,int]] = []
+
+        # Evaluate every symbol before selecting one so simultaneous lower-priority signals are consumed too.
         for symbol in SYMBOLS:
             s = signal_for(self.api,symbol)
             if not s: continue
             side,close_time,a = s
             if close_time <= int(self.state.data["last_signal"].get(symbol,0)): continue
-            LOG.info("SIGNAL %s %s close_time=%s atr=%s",symbol,side,close_time,ds(a))
-            if LIVE: self.open_signal(symbol,side,close_time,a)
-            else: self.state.data["last_signal"][symbol] = close_time; self.state.save()
+            age_ms = max(0, now_ms-close_time)
+            candidates.append((symbol,side,close_time,a,age_ms))
+
+        if not candidates: return
+
+        # Any signal observed in this scan is consumed immediately, including stale and lower-priority signals.
+        for symbol,_,close_time,_,_ in candidates:
+            self.state.data["last_signal"][symbol] = close_time
+        self.state.save()
+
+        fresh = [x for x in candidates if x[4] <= SIGNAL_MAX_AGE_MS]
+        for symbol,side,close_time,a,age_ms in candidates:
+            LOG.info("SIGNAL %s %s close_time=%s atr=%s age_ms=%s fresh=%s",
+                     symbol,side,close_time,ds(a),age_ms,age_ms <= SIGNAL_MAX_AGE_MS)
+
+        if not fresh:
+            LOG.info("SKIP_STALE signals=%s max_age_ms=%s",
+                     ",".join(f"{x[0]}:{x[2]}" for x in candidates),SIGNAL_MAX_AGE_MS)
             return
+
+        # SYMBOLS order is the fixed live priority: BTC > ETH > SOL.
+        selected = fresh[0]
+        if len(fresh) > 1:
+            LOG.info("SIGNAL_PRIORITY selected=%s consumed=%s",
+                     selected[0],",".join(x[0] for x in fresh[1:]))
+
+        if LIVE:
+            symbol,side,close_time,a,_ = selected
+            self.open_signal(symbol,side,close_time,a)
 
     def run(self) -> None:
         self.bootstrap()
-        LOG.info("started live=%s symbols=%s 98x cross highfreq initial=1.25%% adds=1.25/1.875/2.5%% keep=50%% BB=1.8 CCI=210 add_atr=1.4/3.0/4.6 TP=activate50%% trail_giveback=5%%p structure=15m/96 atr_median=100 atr_expansion=1.8",LIVE,SYMBOLS)
+        profile_summary = "; ".join(
+            f"{s}:BB={ds(p.bb_std)},CCI={ds(p.cci_extreme)},initial={ds(p.initial_margin)},"
+            f"adds={'/'.join(ds(x) for x in p.add_margins)},add_atr={'/'.join(ds(x) for x in p.add_atrs)},"
+            f"keep={ds(p.keep_ratio)},atr_exp={ds(p.atr_expansion)}"
+            for s,p in PROFILES.items()
+        )
+        LOG.info("started live=%s symbols=%s priority=%s 98x cross max_one_position fresh_signal=%sms "
+                 "TP=activate50%% trail_giveback=5%%p structure=15m/96 atr_median=100 profiles=[%s]",
+                 LIVE,SYMBOLS,">".join(SYMBOLS),SIGNAL_MAX_AGE_MS,profile_summary)
         while not STOP:
             if LIVE and self.state.data.get("pending_order") and self.reconcile_pending():
                 raise BotError("FILLED pending order with incomplete local transition")
-            if LIVE and self.state.data.get("active_symbol"): self.manage()
-            else: self.scan()
+            if LIVE and self.state.data.get("active_symbol"):
+                # Consume every completed 15m bar while occupied before management can close the position.
+                self.consume_occupied_bar()
+                self.manage()
+            else:
+                self.scan()
             time.sleep(POLL)
 
 
