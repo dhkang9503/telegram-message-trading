@@ -1,7 +1,24 @@
-"""Binance USD-M BTC/ETH/SOL BB+CCI high-frequency reversion bot."""
+"""Binance USD-M BTC/ETH/SOL asymmetric snapback rotation bot.
+
+Strategy:
+- 15m completed-candle signals, fixed priority BTC > ETH > SOL, max one account-wide position.
+- BTC: short-only Bollinger exhaustion/re-entry.
+- ETH: long-only Bollinger exhaustion/re-entry.
+- SOL: two-way EMA/ATR (Keltner-style) exhaustion/re-entry.
+- No DCA, no rotation, no trailing. Each trade uses fixed ATR TP/SL plus a cycle loss cap
+  and a maximum holding time.
+"""
 from __future__ import annotations
 
-import hashlib, hmac, json, logging, os, secrets, signal, statistics, time
+import hashlib
+import hmac
+import json
+import logging
+import os
+import secrets
+import signal
+import statistics
+import time
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -15,49 +32,55 @@ D = lambda x, default="0": Decimal(default) if x is None or x == "" else Decimal
 
 @dataclass(frozen=True)
 class Profile:
-    bb_std: Decimal
-    cci_extreme: Decimal
-    initial_margin: Decimal
-    add_margins: tuple[Decimal, Decimal, Decimal]
-    add_atrs: tuple[Decimal, Decimal, Decimal]
-    keep_ratio: Decimal
-    atr_expansion: Decimal
+    notional_mult: Decimal
+    tp_atr: Decimal
+    sl_atr: Decimal
+    max_hold_minutes: int
+    hard_stop: Decimal
 
 
-# Per-symbol 15m profiles validated independently; tuple order is live signal priority.
+# Backtest-selected balanced profile. Exchange leverage remains 98x, while actual account
+# notional exposure is limited by notional_mult (BTC 5x / ETH 9x / SOL 3x).
 PROFILES = {
-    "BTCUSDT": Profile(
-        D("1.8"), D("210"), D("0.0125"),
-        (D("0.0125"), D("0.01875"), D("0.025")),
-        (D("1.4"), D("3.0"), D("4.6")),
-        D("0.50"), D("1.8"),
-    ),
-    "ETHUSDT": Profile(
-        D("1.9"), D("210"), D("0.005"),
-        (D("0.005"), D("0.0075"), D("0.010")),
-        (D("1.0"), D("2.0"), D("3.2")),
-        D("0.20"), D("1.5"),
-    ),
-    "SOLUSDT": Profile(
-        D("1.65"), D("210"), D("0.003"),
-        (D("0.003"), D("0.0045"), D("0.006")),
-        (D("1.0"), D("2.5"), D("4.0")),
-        D("0.80"), D("1.5"),
-    ),
+    "BTCUSDT": Profile(D("5"), D("8"), D("6"), 48 * 60, D("0.20")),
+    "ETHUSDT": Profile(D("9"), D("2"), D("3"), 24 * 60, D("0.20")),
+    "SOLUSDT": Profile(D("3"), D("5"), D("4"), 6 * 60, D("0.15")),
 }
-SYMBOLS = tuple(PROFILES)
+SYMBOLS = tuple(PROFILES)  # fixed priority: BTC > ETH > SOL
+
+STRATEGY_ID = "asymmetric_snapback_v1"
+STATE_VERSION = 2
+
 LEVERAGE = 98
 BB_PERIOD = 20
-CCI_PERIOD = 20
-ATR_PERIOD, ATR_FETCH_LIMIT = 14, 500
-TAKER_FEE = D("0.0004")
-BE_PRICE_RATIO = D(2) * TAKER_FEE / (D(1) - TAKER_FEE)
-TP_ACTIVATION_PRICE_RATIO = D("0.50") / D(LEVERAGE)
-TRAIL_ROI_GIVEBACK = D("0.05")
-TRAIL_PRICE_RATIO = TRAIL_ROI_GIVEBACK / D(LEVERAGE)
-HARD_STOP = D("0.08")
-STRUCTURE_LOOKBACK = 96  # 96 x 15m = 24h
+EMA_PERIOD = 20
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+ADX_PERIOD = 14
 ATR_MEDIAN_LOOKBACK = 100
+INDICATOR_FETCH_LIMIT = 500
+
+# Signal thresholds from the 2024-08-09 .. 2026-08-14 search.
+BTC_BB_Z = D("2.75")
+BTC_RSI_MIN = D("65")
+BTC_RSI_REVERSAL = D("12")
+BTC_ADX_MAX = D("35")
+BTC_ATR_RATIO_MAX = D("3.0")
+
+ETH_BB_Z = D("2.50")
+ETH_RSI_MAX = D("30")
+ETH_RSI_REVERSAL = D("11")
+ETH_ADX_MAX = D("70")
+ETH_ATR_RATIO_MAX = D("1.5")
+
+SOL_KELTNER_ATR = D("2.25")
+SOL_RSI_LONG_MAX = D("25")
+SOL_RSI_SHORT_MIN = D("75")
+SOL_RSI_REVERSAL = D("8")
+SOL_ADX_MAX = D("35")
+SOL_ATR_RATIO_MAX = D("3.0")
+
+TAKER_FEE = D("0.0004")
 SIGNAL_INTERVAL_MS = 15 * 60 * 1000
 SIGNAL_MAX_AGE_MS = int(float(os.getenv("SIGNAL_MAX_AGE_SECONDS", "60")) * 1000)
 BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
@@ -68,16 +91,20 @@ STATE_PATH = Path(os.getenv("REVERSION_STATE_PATH", str(Path(__file__).with_name
 RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW_MS", "5000"))
 TIMEOUT = float(os.getenv("BINANCE_HTTP_TIMEOUT_SECONDS", "10"))
 
-logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
-                    format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 LOG = logging.getLogger("reversion_live")
 STOP = False
 
 
-class BotError(RuntimeError): pass
+class BotError(RuntimeError):
+    pass
 
 
-class OrderBelowMinimum(BotError): pass
+class OrderBelowMinimum(BotError):
+    pass
 
 
 class BinanceError(BotError):
@@ -100,31 +127,50 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
 
 def blank_state() -> dict[str, Any]:
     return {
-        "version": 1, "active_symbol": None, "side": None,
-        "cycle_equity": None, "cycle_cash": None, "account_equity_at_start": None,
-        "round_anchor": None, "round_atr": None, "add_stage": 0,
-        "had_add": False, "rotations": 0, "last_add_candle": None,
-        "last_rotation_candle": None, "trail_active": False, "trail_extreme": None,
-        "trail_activation_candle": None, "last_signal": {}, "pending_order": None,
+        "version": STATE_VERSION,
+        "strategy": STRATEGY_ID,
+        "active_symbol": None,
+        "side": None,
+        "cycle_equity": None,
+        "account_equity_at_start": None,
+        "entry_atr": None,
+        "opened_at_ms": None,
+        "signal_close_time": None,
+        "last_signal": {},
+        "pending_order": None,
         "updated_at": int(time.time()),
     }
 
 
 class State:
     def __init__(self, path: Path):
-        self.path = path; self.data = blank_state()
+        self.path = path
+        self.data = blank_state()
+        self.legacy = False
         if path.exists():
             loaded = json.loads(path.read_text(encoding="utf-8"))
-            if loaded.get("version") != 1: raise BotError("unsupported state version")
-            self.data.update(loaded)
-        self.save()
+            version = int(loaded.get("version", 1))
+            if version == STATE_VERSION:
+                self.data.update(loaded)
+            elif version == 1:
+                # Do not silently take over a position opened by the old DCA/rotation strategy.
+                self.data = loaded
+                self.legacy = True
+            else:
+                raise BotError(f"unsupported state version={version}")
+        if not self.legacy:
+            self.save()
 
     def save(self) -> None:
-        self.data["updated_at"] = int(time.time()); save_json(self.path, self.data)
+        self.data["updated_at"] = int(time.time())
+        save_json(self.path, self.data)
 
     def reset_cycle(self) -> None:
-        last = dict(self.data.get("last_signal", {})); self.data = blank_state()
-        self.data["last_signal"] = last; self.save()
+        last = dict(self.data.get("last_signal", {}))
+        self.data = blank_state()
+        self.data["last_signal"] = last
+        self.legacy = False
+        self.save()
 
 
 @dataclass(frozen=True)
@@ -132,6 +178,7 @@ class Rules:
     step: Decimal
     min_qty: Decimal
     min_notional: Decimal
+
     def floor(self, qty: Decimal) -> Decimal:
         return (qty / self.step).to_integral_value(rounding=ROUND_DOWN) * self.step
 
@@ -145,425 +192,898 @@ class Position:
     mark: Decimal
     upnl: Decimal
     liq: Decimal
+
     @property
-    def open(self) -> bool: return self.amount != 0
+    def open(self) -> bool:
+        return self.amount != 0
+
     @property
-    def side(self) -> str: return "long" if self.amount > 0 else "short" if self.amount < 0 else "flat"
+    def side(self) -> str:
+        return "long" if self.amount > 0 else "short" if self.amount < 0 else "flat"
+
     @property
-    def qty(self) -> Decimal: return abs(self.amount)
+    def qty(self) -> Decimal:
+        return abs(self.amount)
+
+
+@dataclass(frozen=True)
+class Signal:
+    side: str
+    close_time: int
+    atr: Decimal
+    detail: str
 
 
 class Binance:
     def __init__(self):
-        self.key = os.getenv("BINANCE_API_KEY", ""); self.secret = os.getenv("BINANCE_API_SECRET", "")
-        self.offset = 0; self.last_sync = 0.0
+        self.key = os.getenv("BINANCE_API_KEY", "")
+        self.secret = os.getenv("BINANCE_API_SECRET", "")
+        self.offset = 0
+        self.last_sync = 0.0
         if LIVE and (not self.key or not self.secret):
             raise BotError("LIVE_TRADING=1 requires BINANCE_API_KEY and BINANCE_API_SECRET")
 
-    def req(self, method: str, path: str, params: dict[str, Any] | None = None, signed: bool = False) -> Any:
+    def req(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        signed: bool = False,
+    ) -> Any:
         p = dict(params or {})
         if signed:
-            if not self.key or not self.secret: raise BotError("signed call requires Binance credentials")
-            self.sync_time(); p.update({"timestamp": int(time.time()*1000)+self.offset, "recvWindow": RECV_WINDOW})
-        clean = {k: (ds(v) if isinstance(v, Decimal) else str(v).lower() if isinstance(v, bool) else v) for k,v in p.items()}
+            if not self.key or not self.secret:
+                raise BotError("signed call requires Binance credentials")
+            self.sync_time()
+            p.update(
+                {
+                    "timestamp": int(time.time() * 1000) + self.offset,
+                    "recvWindow": RECV_WINDOW,
+                }
+            )
+        clean = {
+            k: (
+                ds(v)
+                if isinstance(v, Decimal)
+                else str(v).lower()
+                if isinstance(v, bool)
+                else v
+            )
+            for k, v in p.items()
+        }
         q = urlencode(clean)
         if signed:
-            q += ("&" if q else "") + "signature=" + hmac.new(self.secret.encode(), q.encode(), hashlib.sha256).hexdigest()
+            q += ("&" if q else "") + "signature=" + hmac.new(
+                self.secret.encode(), q.encode(), hashlib.sha256
+            ).hexdigest()
         url = BASE_URL + path + (("?" + q) if q else "")
-        headers = {"Accept":"application/json", "User-Agent":"reversion-live/1.0"}
-        if self.key: headers["X-MBX-APIKEY"] = self.key
+        headers = {"Accept": "application/json", "User-Agent": "reversion-live/2.0"}
+        if self.key:
+            headers["X-MBX-APIKEY"] = self.key
         try:
             with urlopen(Request(url, method=method, headers=headers), timeout=TIMEOUT) as r:
-                body = r.read().decode(); return json.loads(body) if body else {}
+                body = r.read().decode()
+                return json.loads(body) if body else {}
         except HTTPError as e:
             raw = e.read().decode(errors="replace")
-            try: payload = json.loads(raw)
-            except json.JSONDecodeError: payload = {"msg": raw}
-            raise BinanceError(e.code, int(payload["code"]) if "code" in payload else None, str(payload.get("msg",raw))) from e
-        except URLError as e: raise BotError(f"Binance network error: {e}") from e
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = {"msg": raw}
+            raise BinanceError(
+                e.code,
+                int(payload["code"]) if "code" in payload else None,
+                str(payload.get("msg", raw)),
+            ) from e
+        except URLError as e:
+            raise BotError(f"Binance network error: {e}") from e
 
     def sync_time(self) -> None:
-        if time.monotonic()-self.last_sync < 300: return
+        if time.monotonic() - self.last_sync < 300:
+            return
         server = self.req("GET", "/fapi/v1/time")["serverTime"]
-        self.offset = int(server)-int(time.time()*1000); self.last_sync = time.monotonic()
+        self.offset = int(server) - int(time.time() * 1000)
+        self.last_sync = time.monotonic()
 
     def klines(self, symbol: str, interval: str, limit: int = 120) -> list[list[Any]]:
-        return self.req("GET", "/fapi/v1/klines", {"symbol":symbol,"interval":interval,"limit":limit})
-    def account(self) -> dict[str,Any]: return self.req("GET","/fapi/v3/account",signed=True)
-    def positions(self, symbol: str | None = None) -> list[dict[str,Any]]:
-        x = self.req("GET","/fapi/v3/positionRisk",{"symbol":symbol} if symbol else {},signed=True)
-        return x if isinstance(x,list) else [x]
-    def open_orders(self) -> list[dict[str,Any]]: return self.req("GET","/fapi/v1/openOrders",signed=True)
+        return self.req(
+            "GET", "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit}
+        )
+
+    def account(self) -> dict[str, Any]:
+        return self.req("GET", "/fapi/v3/account", signed=True)
+
+    def positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        x = self.req(
+            "GET",
+            "/fapi/v3/positionRisk",
+            {"symbol": symbol} if symbol else {},
+            signed=True,
+        )
+        return x if isinstance(x, list) else [x]
+
+    def open_orders(self) -> list[dict[str, Any]]:
+        return self.req("GET", "/fapi/v1/openOrders", signed=True)
+
     def position_mode(self) -> bool:
-        x = self.req("GET","/fapi/v1/positionSide/dual",signed=True)["dualSidePosition"]
-        return x if isinstance(x,bool) else str(x).lower()=="true"
-    def set_one_way(self) -> None: self.req("POST","/fapi/v1/positionSide/dual",{"dualSidePosition":"false"},True)
+        x = self.req("GET", "/fapi/v1/positionSide/dual", signed=True)["dualSidePosition"]
+        return x if isinstance(x, bool) else str(x).lower() == "true"
+
+    def set_one_way(self) -> None:
+        self.req(
+            "POST",
+            "/fapi/v1/positionSide/dual",
+            {"dualSidePosition": "false"},
+            True,
+        )
+
     def configure(self, symbol: str) -> None:
-        try: self.req("POST","/fapi/v1/marginType",{"symbol":symbol,"marginType":"CROSSED"},True)
+        try:
+            self.req(
+                "POST",
+                "/fapi/v1/marginType",
+                {"symbol": symbol, "marginType": "CROSSED"},
+                True,
+            )
         except BinanceError as e:
-            if e.code != -4046: raise
-        x = self.req("POST","/fapi/v1/leverage",{"symbol":symbol,"leverage":LEVERAGE},True)
-        if int(x.get("leverage",0)) != LEVERAGE: raise BotError(f"{symbol} did not accept {LEVERAGE}x")
-    def order(self, symbol: str, side: str, qty: Decimal, reduce: bool, cid: str) -> dict[str,Any]:
-        p: dict[str,Any] = {"symbol":symbol,"side":side,"type":"MARKET","quantity":qty,
-                           "newClientOrderId":cid,"newOrderRespType":"RESULT"}
-        if reduce: p["reduceOnly"] = "true"
-        return self.req("POST","/fapi/v1/order",p,True)
-    def get_order(self, symbol: str, cid: str) -> dict[str,Any]:
-        return self.req("GET","/fapi/v1/order",{"symbol":symbol,"origClientOrderId":cid},True)
+            if e.code != -4046:
+                raise
+        x = self.req(
+            "POST",
+            "/fapi/v1/leverage",
+            {"symbol": symbol, "leverage": LEVERAGE},
+            True,
+        )
+        if int(x.get("leverage", 0)) != LEVERAGE:
+            raise BotError(f"{symbol} did not accept {LEVERAGE}x")
+
+    def order(
+        self, symbol: str, side: str, qty: Decimal, reduce: bool, cid: str
+    ) -> dict[str, Any]:
+        p: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty,
+            "newClientOrderId": cid,
+            "newOrderRespType": "RESULT",
+        }
+        if reduce:
+            p["reduceOnly"] = "true"
+        return self.req("POST", "/fapi/v1/order", p, True)
+
+    def get_order(self, symbol: str, cid: str) -> dict[str, Any]:
+        return self.req(
+            "GET",
+            "/fapi/v1/order",
+            {"symbol": symbol, "origClientOrderId": cid},
+            True,
+        )
 
 
 def closed(rows: list[list[Any]]) -> list[list[Any]]:
-    now = int(time.time()*1000); return [r for r in rows if int(r[6]) < now]
+    now = int(time.time() * 1000)
+    return [r for r in rows if int(r[6]) < now]
 
 
-def atr_series(rows: list[list[Any]]) -> list[Decimal | None]:
-    """Match pandas ewm(alpha=1/14, adjust=False, min_periods=14)."""
-    if not rows: return []
-    tr: list[Decimal] = []
-    for i,r in enumerate(rows):
-        h,l = D(r[2]),D(r[3])
-        tr.append(h-l if i==0 else max(h-l,abs(h-D(rows[i-1][4])),abs(l-D(rows[i-1][4]))))
-    out: list[Decimal|None] = [None]*len(tr); a = tr[0]
-    for i,x in enumerate(tr):
-        if i: a = (a*D(ATR_PERIOD-1)+x)/D(ATR_PERIOD)
-        if i >= ATR_PERIOD-1: out[i] = a
+def ewm(values: list[Decimal], alpha: Decimal, min_periods: int) -> list[Decimal | None]:
+    if not values:
+        return []
+    out: list[Decimal | None] = [None] * len(values)
+    cur = values[0]
+    for i, x in enumerate(values):
+        if i:
+            cur = (D(1) - alpha) * cur + alpha * x
+        if i >= min_periods - 1:
+            out[i] = cur
     return out
 
 
-def bands(closes: list[Decimal], i: int, bb_std: Decimal) -> tuple[Decimal,Decimal]:
-    w = closes[i-BB_PERIOD+1:i+1]; m = sum(w,D("0"))/D(BB_PERIOD)
-    sd = (sum((x-m)**2 for x in w)/D(BB_PERIOD)).sqrt()
-    return m+bb_std*sd, m-bb_std*sd
+def atr_series(rows: list[list[Any]]) -> list[Decimal | None]:
+    if not rows:
+        return []
+    tr: list[Decimal] = []
+    for i, r in enumerate(rows):
+        h, l = D(r[2]), D(r[3])
+        if i == 0:
+            tr.append(h - l)
+        else:
+            prev_close = D(rows[i - 1][4])
+            tr.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
+    return ewm(tr, D(1) / D(ATR_PERIOD), ATR_PERIOD)
 
 
-def cci(rows: list[list[Any]], i: int) -> Decimal:
-    w = rows[i-CCI_PERIOD+1:i+1]; tp = [(D(r[2])+D(r[3])+D(r[4]))/D(3) for r in w]
-    m = sum(tp,D("0"))/D(CCI_PERIOD); dev = sum(abs(x-m) for x in tp)/D(CCI_PERIOD)
-    return D("0") if dev==0 else (tp[-1]-m)/(D("0.015")*dev)
+def ema_series(values: list[Decimal], period: int) -> list[Decimal]:
+    if not values:
+        return []
+    alpha = D(2) / D(period + 1)
+    cur = values[0]
+    out = [cur]
+    for x in values[1:]:
+        cur = (D(1) - alpha) * cur + alpha * x
+        out.append(cur)
+    return out
 
 
-def signal_for(api: Binance, symbol: str) -> tuple[str,int,Decimal] | None:
-    profile = PROFILES[symbol]
-    rows = closed(api.klines(symbol,"15m",ATR_FETCH_LIMIT))
-    if len(rows) < max(BB_PERIOD,CCI_PERIOD,ATR_PERIOD)+2: return None
-    closes = [D(r[4]) for r in rows]; p,c = len(rows)-2,len(rows)-1
-    pu,pl = bands(closes,p,profile.bb_std); cu,cl = bands(closes,c,profile.bb_std)
-    pc,cc = cci(rows,p),cci(rows,c); a = atr_series(rows)[c]
-    if a is None: return None
-    if closes[p] < pl and pc < -profile.cci_extreme and closes[c] > cl and cc > pc:
-        return "long",int(rows[c][6]),a
-    if closes[p] > pu and pc > profile.cci_extreme and closes[c] < cu and cc < pc:
-        return "short",int(rows[c][6]),a
-    return None
+def rsi_series(closes: list[Decimal]) -> list[Decimal | None]:
+    if len(closes) < 2:
+        return [None] * len(closes)
+    gains = [D(0)]
+    losses = [D(0)]
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(delta, D(0)))
+        losses.append(max(-delta, D(0)))
+    avg_gain = ewm(gains, D(1) / D(RSI_PERIOD), RSI_PERIOD)
+    avg_loss = ewm(losses, D(1) / D(RSI_PERIOD), RSI_PERIOD)
+    out: list[Decimal | None] = [None] * len(closes)
+    for i, (g, l) in enumerate(zip(avg_gain, avg_loss)):
+        if g is None or l is None:
+            continue
+        if l == 0:
+            out[i] = D(100) if g > 0 else D(50)
+        else:
+            rs = g / l
+            out[i] = D(100) - D(100) / (D(1) + rs)
+    return out
 
 
-def current_atr(api: Binance, symbol: str) -> Decimal:
-    a = atr_series(closed(api.klines(symbol,"15m",ATR_FETCH_LIMIT)))[-1]
-    if a is None or a <= 0: raise BotError(f"ATR unavailable for {symbol}")
-    return a
+def adx_series(rows: list[list[Any]]) -> list[Decimal | None]:
+    if not rows:
+        return []
+    tr = [D(0)]
+    plus_dm = [D(0)]
+    minus_dm = [D(0)]
+    for i in range(1, len(rows)):
+        h, l = D(rows[i][2]), D(rows[i][3])
+        ph, pl, pc = D(rows[i - 1][2]), D(rows[i - 1][3]), D(rows[i - 1][4])
+        up = h - ph
+        down = pl - l
+        plus_dm.append(up if up > down and up > 0 else D(0))
+        minus_dm.append(down if down > up and down > 0 else D(0))
+        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+    alpha = D(1) / D(ADX_PERIOD)
+    sm_tr = ewm(tr, alpha, ADX_PERIOD)
+    sm_plus = ewm(plus_dm, alpha, ADX_PERIOD)
+    sm_minus = ewm(minus_dm, alpha, ADX_PERIOD)
+    dx_values: list[Decimal] = []
+    dx_indexes: list[int] = []
+    for i in range(len(rows)):
+        if sm_tr[i] is None or sm_tr[i] == 0:
+            continue
+        pdi = D(100) * sm_plus[i] / sm_tr[i]
+        mdi = D(100) * sm_minus[i] / sm_tr[i]
+        denom = pdi + mdi
+        dx = D(0) if denom == 0 else D(100) * abs(pdi - mdi) / denom
+        dx_values.append(dx)
+        dx_indexes.append(i)
+
+    out: list[Decimal | None] = [None] * len(rows)
+    if not dx_values:
+        return out
+    adx_vals = ewm(dx_values, alpha, ADX_PERIOD)
+    for idx, value in zip(dx_indexes, adx_vals):
+        if value is not None:
+            out[idx] = value
+    return out
 
 
-def latest_trade(api: Binance, symbol: str) -> tuple[Decimal,int]:
-    rows = api.klines(symbol,"5m",2)
-    if not rows: raise BotError(f"trade price unavailable for {symbol}")
+def rolling_z(closes: list[Decimal], i: int, period: int = BB_PERIOD) -> Decimal | None:
+    if i < period - 1:
+        return None
+    w = closes[i - period + 1 : i + 1]
+    mean = sum(w, D(0)) / D(period)
+    var = sum((x - mean) ** 2 for x in w) / D(period)
+    sd = var.sqrt()
+    return D(0) if sd == 0 else (closes[i] - mean) / sd
+
+
+def atr_ratio(atrs: list[Decimal | None], i: int) -> Decimal | None:
+    cur = atrs[i]
+    if cur is None or cur <= 0:
+        return None
+    start = max(0, i - ATR_MEDIAN_LOOKBACK + 1)
+    hist = [x for x in atrs[start : i + 1] if x is not None and x > 0]
+    if len(hist) < ATR_MEDIAN_LOOKBACK:
+        return None
+    med = D(statistics.median(hist))
+    return None if med <= 0 else cur / med
+
+
+def signal_for(api: Binance, symbol: str) -> Signal | None:
+    rows = closed(api.klines(symbol, "15m", INDICATOR_FETCH_LIMIT))
+    needed = max(
+        BB_PERIOD,
+        RSI_PERIOD,
+        ATR_PERIOD,
+        ADX_PERIOD * 2,
+        ATR_MEDIAN_LOOKBACK + ATR_PERIOD,
+    ) + 2
+    if len(rows) < needed:
+        return None
+
+    closes = [D(r[4]) for r in rows]
+    atrs = atr_series(rows)
+    rsis = rsi_series(closes)
+    adxs = adx_series(rows)
+    emas = ema_series(closes, EMA_PERIOD)
+    p, c = len(rows) - 2, len(rows) - 1
+
+    pa, ca = atrs[p], atrs[c]
+    prsi, crsi = rsis[p], rsis[c]
+    cadx = adxs[c]
+    ratio = atr_ratio(atrs, c)
+    if None in (pa, ca, prsi, crsi, cadx, ratio):
+        return None
+    assert pa is not None and ca is not None
+    assert prsi is not None and crsi is not None
+    assert cadx is not None and ratio is not None
+
+    close_time = int(rows[c][6])
+
+    if symbol == "BTCUSDT":
+        pz = rolling_z(closes, p)
+        cz = rolling_z(closes, c)
+        if pz is None or cz is None:
+            return None
+        if (
+            pz > BTC_BB_Z
+            and prsi > BTC_RSI_MIN
+            and cz < BTC_BB_Z
+            and prsi - crsi >= BTC_RSI_REVERSAL
+            and cadx <= BTC_ADX_MAX
+            and ratio <= BTC_ATR_RATIO_MAX
+        ):
+            detail = (
+                f"z={ds(pz)}->{ds(cz)} rsi={ds(prsi)}->{ds(crsi)} "
+                f"adx={ds(cadx)} atr_ratio={ds(ratio)}"
+            )
+            return Signal("short", close_time, ca, detail)
+        return None
+
+    if symbol == "ETHUSDT":
+        pz = rolling_z(closes, p)
+        cz = rolling_z(closes, c)
+        if pz is None or cz is None:
+            return None
+        if (
+            pz < -ETH_BB_Z
+            and prsi < ETH_RSI_MAX
+            and cz > -ETH_BB_Z
+            and crsi - prsi >= ETH_RSI_REVERSAL
+            and cadx <= ETH_ADX_MAX
+            and ratio <= ETH_ATR_RATIO_MAX
+        ):
+            detail = (
+                f"z={ds(pz)}->{ds(cz)} rsi={ds(prsi)}->{ds(crsi)} "
+                f"adx={ds(cadx)} atr_ratio={ds(ratio)}"
+            )
+            return Signal("long", close_time, ca, detail)
+        return None
+
+    if symbol == "SOLUSDT":
+        upper_p = emas[p] + SOL_KELTNER_ATR * pa
+        lower_p = emas[p] - SOL_KELTNER_ATR * pa
+        upper_c = emas[c] + SOL_KELTNER_ATR * ca
+        lower_c = emas[c] - SOL_KELTNER_ATR * ca
+        common = cadx <= SOL_ADX_MAX and ratio <= SOL_ATR_RATIO_MAX
+        if (
+            common
+            and closes[p] < lower_p
+            and prsi < SOL_RSI_LONG_MAX
+            and closes[c] > lower_c
+            and crsi - prsi >= SOL_RSI_REVERSAL
+        ):
+            detail = (
+                f"lower={ds(lower_p)}->{ds(lower_c)} close={ds(closes[p])}->{ds(closes[c])} "
+                f"rsi={ds(prsi)}->{ds(crsi)} adx={ds(cadx)} atr_ratio={ds(ratio)}"
+            )
+            return Signal("long", close_time, ca, detail)
+        if (
+            common
+            and closes[p] > upper_p
+            and prsi > SOL_RSI_SHORT_MIN
+            and closes[c] < upper_c
+            and prsi - crsi >= SOL_RSI_REVERSAL
+        ):
+            detail = (
+                f"upper={ds(upper_p)}->{ds(upper_c)} close={ds(closes[p])}->{ds(closes[c])} "
+                f"rsi={ds(prsi)}->{ds(crsi)} adx={ds(cadx)} atr_ratio={ds(ratio)}"
+            )
+            return Signal("short", close_time, ca, detail)
+        return None
+
+    raise BotError(f"unsupported symbol {symbol}")
+
+
+def latest_trade(api: Binance, symbol: str) -> tuple[Decimal, int]:
+    rows = api.klines(symbol, "5m", 2)
+    if not rows:
+        raise BotError(f"trade price unavailable for {symbol}")
+    # Binance's current kline close updates with the latest trade while the candle is open.
     return D(rows[-1][4]), int(rows[-1][0])
 
 
 def latest_completed_15m_close_time(now_ms: int | None = None) -> int:
-    now_ms = int(time.time()*1000) if now_ms is None else now_ms
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     return (now_ms // SIGNAL_INTERVAL_MS) * SIGNAL_INTERVAL_MS - 1
 
 
-def parse_pos(x: dict[str,Any]) -> Position:
-    return Position(str(x["symbol"]),D(x.get("positionAmt")),D(x.get("entryPrice")),
-                    D(x.get("breakEvenPrice") or x.get("entryPrice")),D(x.get("markPrice")),
-                    D(x.get("unRealizedProfit")),D(x.get("liquidationPrice")))
+def parse_pos(x: dict[str, Any]) -> Position:
+    return Position(
+        str(x["symbol"]),
+        D(x.get("positionAmt")),
+        D(x.get("entryPrice")),
+        D(x.get("breakEvenPrice") or x.get("entryPrice")),
+        D(x.get("markPrice")),
+        D(x.get("unRealizedProfit")),
+        D(x.get("liquidationPrice")),
+    )
 
 
-def open_positions(api: Binance) -> list[Position]: return [p for p in map(parse_pos,api.positions()) if p.open]
+def open_positions(api: Binance) -> list[Position]:
+    return [p for p in map(parse_pos, api.positions()) if p.open]
 
 
 def one_position(api: Binance, symbol: str) -> Position:
-    rows = [parse_pos(x) for x in api.positions(symbol) if str(x.get("symbol"))==symbol]
+    rows = [
+        parse_pos(x)
+        for x in api.positions(symbol)
+        if str(x.get("symbol")) == symbol
+    ]
     opens = [p for p in rows if p.open]
-    if len(opens)>1: raise BotError(f"multiple live rows for {symbol}")
-    return opens[0] if opens else rows[0] if rows else Position(symbol,D(0),D(0),D(0),D(0),D(0),D(0))
+    if len(opens) > 1:
+        raise BotError(f"multiple live rows for {symbol}")
+    return (
+        opens[0]
+        if opens
+        else rows[0]
+        if rows
+        else Position(symbol, D(0), D(0), D(0), D(0), D(0), D(0))
+    )
 
 
-def load_rules(api: Binance) -> dict[str,Rules]:
-    info = api.req("GET","/fapi/v1/exchangeInfo"); out: dict[str,Rules] = {}
-    for s in info.get("symbols",[]):
-        if s.get("symbol") not in SYMBOLS: continue
-        fs = {f["filterType"]:f for f in s.get("filters",[])}; lot = fs.get("MARKET_LOT_SIZE") or fs["LOT_SIZE"]
-        if D(lot.get("stepSize")) <= 0: lot = fs["LOT_SIZE"]
+def load_rules(api: Binance) -> dict[str, Rules]:
+    info = api.req("GET", "/fapi/v1/exchangeInfo")
+    out: dict[str, Rules] = {}
+    for s in info.get("symbols", []):
+        if s.get("symbol") not in SYMBOLS:
+            continue
+        fs = {f["filterType"]: f for f in s.get("filters", [])}
+        lot = fs.get("MARKET_LOT_SIZE") or fs["LOT_SIZE"]
+        if D(lot.get("stepSize")) <= 0:
+            lot = fs["LOT_SIZE"]
         nf = fs.get("MIN_NOTIONAL") or fs.get("NOTIONAL") or {}
-        out[s["symbol"]] = Rules(D(lot["stepSize"]),D(lot["minQty"]),D(nf.get("notional") or nf.get("minNotional")))
-    if set(out) != set(SYMBOLS): raise BotError("missing symbol filters")
+        out[s["symbol"]] = Rules(
+            D(lot["stepSize"]),
+            D(lot["minQty"]),
+            D(nf.get("notional") or nf.get("minNotional")),
+        )
+    if set(out) != set(SYMBOLS):
+        raise BotError("missing symbol filters")
     return out
 
 
-def structure_break(api: Binance, p: Position) -> bool:
-    profile = PROFILES[p.symbol]
-    rows = closed(api.klines(p.symbol,"15m",ATR_FETCH_LIMIT))
-    if len(rows) < max(STRUCTURE_LOOKBACK+1,ATR_MEDIAN_LOOKBACK+ATR_PERIOD): return False
-    ats = atr_series(rows); cur = ats[-1]; hist = [x for x in ats[-ATR_MEDIAN_LOOKBACK:] if x is not None]
-    if cur is None or len(hist) < ATR_MEDIAN_LOOKBACK: return False
-    med = D(statistics.median(hist)); prev = rows[-(STRUCTURE_LOOKBACK+1):-1]
-    close = D(rows[-1][4]); low = min(D(r[3]) for r in prev); high = max(D(r[2]) for r in prev)
-    broken = close < low if p.side=="long" else close > high
-    return broken and med > 0 and cur >= profile.atr_expansion*med
-
-
 class Bot:
-    def __init__(self, api: Binance, state: State, rules: dict[str,Rules]):
-        self.api,self.state,self.rules = api,state,rules
-        self.last_signal_scan = 0.0; self.last_structure_scan = 0.0; self.structure_cached = False
+    def __init__(self, api: Binance, state: State, rules: dict[str, Rules]):
+        self.api, self.state, self.rules = api, state, rules
+        self.last_signal_scan = 0.0
 
     def qty(self, symbol: str, notional: Decimal, price: Decimal) -> Decimal:
-        r = self.rules[symbol]; q = r.floor(notional/price)
-        if q < r.min_qty or q <= 0 or (r.min_notional > 0 and q*price < r.min_notional):
-            raise OrderBelowMinimum(f"{symbol} order below exchange minimum; bot will not auto-upsize")
+        r = self.rules[symbol]
+        q = r.floor(notional / price)
+        if (
+            q < r.min_qty
+            or q <= 0
+            or (r.min_notional > 0 and q * price < r.min_notional)
+        ):
+            raise OrderBelowMinimum(
+                f"{symbol} order below exchange minimum; bot will not auto-upsize"
+            )
         return q
 
     def reconcile_pending(self) -> bool:
         x = self.state.data.get("pending_order")
-        if not x: return False
-        try: order = self.api.get_order(x["symbol"],x["cid"])
+        if not x:
+            return False
+        try:
+            order = self.api.get_order(x["symbol"], x["cid"])
         except BinanceError as e:
             if e.code == -2013:
-                self.state.data["pending_order"] = None; self.state.save(); return False
+                self.state.data["pending_order"] = None
+                self.state.save()
+                return False
             raise BotError(f"cannot reconcile pending order: {e}") from e
-        if order.get("status") != "FILLED": raise BotError(f"pending order status={order.get('status')}; manual review")
+        if order.get("status") != "FILLED":
+            raise BotError(f"pending order status={order.get('status')}; manual review")
         return True
 
-    def market(self, symbol: str, side: str, qty: Decimal, reduce: bool, action: str) -> None:
+    def market(
+        self, symbol: str, side: str, qty: Decimal, reduce: bool, action: str
+    ) -> None:
         if self.state.data.get("pending_order") and self.reconcile_pending():
             raise BotError("previous market order filled but local transition is incomplete")
-        cid = (f"rv{action}{int(time.time()*1000)%10**10}{secrets.token_hex(3)}")[:36]
-        self.state.data["pending_order"] = {"symbol":symbol,"cid":cid,"action":action,"qty":ds(qty)}; self.state.save()
-        try: order = self.api.order(symbol,side,qty,reduce,cid)
-        except (BinanceError,BotError) as e:
-            if self.reconcile_pending(): return
+        cid = (
+            f"rv{action}{int(time.time() * 1000) % 10**10}{secrets.token_hex(3)}"
+        )[:36]
+        self.state.data["pending_order"] = {
+            "symbol": symbol,
+            "cid": cid,
+            "action": action,
+            "qty": ds(qty),
+        }
+        self.state.save()
+        try:
+            order = self.api.order(symbol, side, qty, reduce, cid)
+        except (BinanceError, BotError) as e:
+            if self.reconcile_pending():
+                return
             raise BotError(f"market order not confirmed: {e}") from e
-        if order.get("status") not in (None,"FILLED"): raise BotError(f"unexpected market status={order.get('status')}")
+        if order.get("status") not in (None, "FILLED"):
+            raise BotError(f"unexpected market status={order.get('status')}")
 
-    def clear_pending(self) -> None: self.state.data["pending_order"] = None; self.state.save()
+    def clear_pending(self) -> None:
+        self.state.data["pending_order"] = None
+        self.state.save()
 
     def bootstrap(self) -> None:
-        if not LIVE: LOG.warning("LIVE_TRADING=0: signal-only mode"); return
-        if self.reconcile_pending(): raise BotError("recovered FILLED pending order; manual state reconciliation required")
+        if not LIVE:
+            LOG.warning("LIVE_TRADING=0: signal-only mode")
+            return
+
         pos = open_positions(self.api)
-        if len(pos)>1: raise BotError("more than one futures position is open")
+
+        if self.state.legacy:
+            if pos:
+                raise BotError(
+                    "legacy v1 DCA/rotation position/state detected. "
+                    "Do not let the new snapback strategy take it over; "
+                    "finish/close the legacy position with the old bot first."
+                )
+            LOG.warning("migrating flat legacy v1 state to %s", STRATEGY_ID)
+            self.state.reset_cycle()
+
+        if self.reconcile_pending():
+            raise BotError("recovered FILLED pending order; manual state reconciliation required")
+
+        if len(pos) > 1:
+            raise BotError("more than one futures position is open")
+
         if pos:
             p = pos[0]
-            if p.symbol not in SYMBOLS or self.state.data.get("active_symbol") != p.symbol or self.state.data.get("side") != p.side:
-                raise BotError(f"unknown live position: {p}")
-            if any(self.state.data.get(k) is None for k in ("cycle_equity","cycle_cash","round_anchor","round_atr")):
-                raise BotError("live position has incompatible state; manual reconciliation required")
+            required = (
+                "active_symbol",
+                "side",
+                "cycle_equity",
+                "entry_atr",
+                "opened_at_ms",
+            )
+            if (
+                self.state.data.get("strategy") != STRATEGY_ID
+                or p.symbol not in SYMBOLS
+                or self.state.data.get("active_symbol") != p.symbol
+                or self.state.data.get("side") != p.side
+                or any(self.state.data.get(k) is None for k in required)
+            ):
+                raise BotError(f"unknown/incompatible live position: {p}")
             return
-        if self.state.data.get("active_symbol"): self.state.reset_cycle()
-        if self.api.open_orders(): raise BotError("existing USD-M open orders block this bot")
-        if self.api.position_mode(): self.api.set_one_way()
 
-    def open_signal(self, symbol: str, side: str, close_time: int, atr: Decimal) -> None:
-        if open_positions(self.api) or self.api.open_orders(): return
-        if self.api.position_mode(): raise BotError("one-way mode required")
-        profile = PROFILES[symbol]
-        self.api.configure(symbol); account = self.api.account()
-        actual = D(account.get("totalMarginBalance") or account.get("totalWalletBalance"))
-        if actual <= 0: raise BotError("invalid futures equity")
-        equity = min(actual,SIZING_CAP) if SIZING_CAP > 0 else actual
-        trade,candle = latest_trade(self.api,symbol)
-        try:
-            q = self.qty(symbol,equity*profile.initial_margin*D(LEVERAGE),trade)
-        except OrderBelowMinimum as e:
-            self.state.data["last_signal"][symbol] = close_time
-            self.state.save()
-            LOG.warning("SKIP_ENTRY %s %s close_time=%s trade=%s sizing_equity=%s reason=%s",
-                        symbol,side,close_time,ds(trade),ds(equity),e)
+        if self.state.data.get("active_symbol"):
+            self.state.reset_cycle()
+
+        if self.api.open_orders():
+            raise BotError("existing USD-M open orders block this bot")
+        if self.api.position_mode():
+            self.api.set_one_way()
+
+    def open_signal(self, symbol: str, s: Signal) -> None:
+        if open_positions(self.api) or self.api.open_orders():
             return
-        LOG.warning("OPEN %s %s qty=%s trade=%s sizing_equity=%s",symbol,side,ds(q),ds(trade),ds(equity))
-        self.market(symbol,"BUY" if side=="long" else "SELL",q,False,"open"); time.sleep(.4); p = one_position(self.api,symbol)
-        if not p.open or p.side != side: raise BotError("entry reconciliation failed")
-        cycle_cash = equity - p.qty*p.entry*TAKER_FEE
-        self.state.data.update({"active_symbol":symbol,"side":side,"cycle_equity":ds(equity),"cycle_cash":ds(cycle_cash),
-                                "account_equity_at_start":ds(actual),"round_anchor":ds(p.entry),"round_atr":ds(atr),
-                                "add_stage":0,"had_add":False,"rotations":0,"last_add_candle":None,"last_rotation_candle":None,
-                                "trail_active":False,"trail_extreme":None,"trail_activation_candle":None})
-        self.state.data["last_signal"][symbol] = close_time; self.state.save(); self.clear_pending()
-        LOG.info("ENTRY_STATE %s candle=%s cycle_cash=%s",symbol,candle,ds(cycle_cash))
+        if self.api.position_mode():
+            raise BotError("one-way mode required")
+
+        profile = PROFILES[symbol]
+        self.api.configure(symbol)
+        account = self.api.account()
+        actual = D(account.get("totalMarginBalance") or account.get("totalWalletBalance"))
+        if actual <= 0:
+            raise BotError("invalid futures equity")
+        equity = min(actual, SIZING_CAP) if SIZING_CAP > 0 else actual
+
+        trade, candle = latest_trade(self.api, symbol)
+        notional = equity * profile.notional_mult
+        try:
+            q = self.qty(symbol, notional, trade)
+        except OrderBelowMinimum as e:
+            self.state.data["last_signal"][symbol] = s.close_time
+            self.state.save()
+            LOG.warning(
+                "SKIP_ENTRY %s %s close_time=%s trade=%s sizing_equity=%s "
+                "notional_mult=%s reason=%s",
+                symbol,
+                s.side,
+                s.close_time,
+                ds(trade),
+                ds(equity),
+                ds(profile.notional_mult),
+                e,
+            )
+            return
+
+        LOG.warning(
+            "OPEN %s %s qty=%s trade=%s sizing_equity=%s notional_mult=%s "
+            "signal_atr=%s detail=[%s]",
+            symbol,
+            s.side,
+            ds(q),
+            ds(trade),
+            ds(equity),
+            ds(profile.notional_mult),
+            ds(s.atr),
+            s.detail,
+        )
+        self.market(symbol, "BUY" if s.side == "long" else "SELL", q, False, "open")
+        time.sleep(0.4)
+        p = one_position(self.api, symbol)
+        if not p.open or p.side != s.side:
+            raise BotError("entry reconciliation failed")
+
+        self.state.data.update(
+            {
+                "version": STATE_VERSION,
+                "strategy": STRATEGY_ID,
+                "active_symbol": symbol,
+                "side": s.side,
+                "cycle_equity": ds(equity),
+                "account_equity_at_start": ds(actual),
+                "entry_atr": ds(s.atr),
+                "opened_at_ms": int(time.time() * 1000),
+                "signal_close_time": s.close_time,
+            }
+        )
+        self.state.data["last_signal"][symbol] = s.close_time
+        self.state.save()
+        self.clear_pending()
+
+        tp, sl, cap = self.exit_prices(p)
+        LOG.info(
+            "ENTRY_STATE %s candle=%s entry=%s atr=%s tp=%s atr_sl=%s hard_cap=%s",
+            symbol,
+            candle,
+            ds(p.entry),
+            ds(s.atr),
+            ds(tp),
+            ds(sl),
+            ds(cap),
+        )
 
     def close_all(self, p: Position, reason: str, trade: Decimal | None = None) -> None:
         q = self.rules[p.symbol].floor(p.qty)
-        LOG.warning("CLOSE_ALL reason=%s %s qty=%s entry=%s trade=%s mark=%s upnl=%s",reason,p.symbol,ds(q),ds(p.entry),
-                    ds(trade) if trade is not None else "n/a",ds(p.mark),ds(p.upnl))
-        self.market(p.symbol,"SELL" if p.side=="long" else "BUY",q,True,"close"); time.sleep(.4)
-        after = one_position(self.api,p.symbol); self.clear_pending()
-        if after.open: raise BotError(f"residual position after close: {after.qty}")
-        self.state.reset_cycle(); self.structure_cached = False
+        LOG.warning(
+            "CLOSE_ALL reason=%s %s qty=%s entry=%s trade=%s mark=%s upnl=%s",
+            reason,
+            p.symbol,
+            ds(q),
+            ds(p.entry),
+            ds(trade) if trade is not None else "n/a",
+            ds(p.mark),
+            ds(p.upnl),
+        )
+        self.market(
+            p.symbol,
+            "SELL" if p.side == "long" else "BUY",
+            q,
+            True,
+            "close",
+        )
+        time.sleep(0.4)
+        after = one_position(self.api, p.symbol)
+        self.clear_pending()
+        if after.open:
+            raise BotError(f"residual position after close: {after.qty}")
+        self.state.reset_cycle()
 
     def hard_stop_price(self, p: Position) -> Decimal:
-        equity = D(self.state.data["cycle_equity"]); cash = D(self.state.data["cycle_cash"])
-        target = equity*(D(1)-HARD_STOP); delta = (target-cash)/p.qty
-        return p.entry+delta if p.side=="long" else p.entry-delta
+        profile = PROFILES[p.symbol]
+        equity = D(self.state.data["cycle_equity"])
+        # Solve net PnL including one entry taker fee and one expected exit taker fee.
+        if p.side == "long":
+            return (
+                p.entry * (D(1) + TAKER_FEE)
+                - equity * profile.hard_stop / p.qty
+            ) / (D(1) - TAKER_FEE)
+        return (
+            p.entry * (D(1) - TAKER_FEE)
+            + equity * profile.hard_stop / p.qty
+        ) / (D(1) + TAKER_FEE)
 
-    def manage_trail(self, p: Position, trade: Decimal, candle: int) -> bool:
-        extreme = D(self.state.data.get("trail_extreme"))
-        activation_candle = int(self.state.data["trail_activation_candle"])
-        distance = p.entry * TRAIL_PRICE_RATIO
-
-        # Match the backtest ordering: evaluate the previously established stop first.
-        stop = extreme-distance if p.side=="long" else extreme+distance
-        hit = trade <= stop if p.side=="long" else trade >= stop
-        if candle != activation_candle and hit:
-            LOG.warning("TRAIL_EXIT %s side=%s trade=%s extreme=%s stop=%s giveback_roi=%s",
-                        p.symbol,p.side,ds(trade),ds(extreme),ds(stop),ds(TRAIL_ROI_GIVEBACK))
-            self.close_all(p,"tp_trail_5pct_roi_giveback",trade)
-            return True
-
-        # The activation candle may establish a better extreme, but cannot trail-exit.
-        better = trade > extreme if p.side=="long" else trade < extreme
-        if better:
-            self.state.data["trail_extreme"] = ds(trade); self.state.save()
-        return True
+    def exit_prices(self, p: Position) -> tuple[Decimal, Decimal, Decimal]:
+        profile = PROFILES[p.symbol]
+        a = D(self.state.data["entry_atr"])
+        if a <= 0:
+            raise BotError("invalid entry ATR in state")
+        if p.side == "long":
+            tp = p.entry + profile.tp_atr * a
+            atr_sl = p.entry - profile.sl_atr * a
+        else:
+            tp = p.entry - profile.tp_atr * a
+            atr_sl = p.entry + profile.sl_atr * a
+        return tp, atr_sl, self.hard_stop_price(p)
 
     def manage(self) -> None:
-        symbol = self.state.data["active_symbol"]; profile = PROFILES[symbol]
+        symbol = self.state.data["active_symbol"]
+        profile = PROFILES[symbol]
         live_positions = open_positions(self.api)
-        if len(live_positions)!=1 or live_positions[0].symbol != symbol:
-            if not live_positions: self.state.reset_cycle(); return
+        if len(live_positions) != 1 or live_positions[0].symbol != symbol:
+            if not live_positions:
+                self.state.reset_cycle()
+                return
             raise BotError(f"max-one-position invariant broken: {live_positions}")
-        p = live_positions[0]; equity = D(self.state.data["cycle_equity"]); trade,candle = latest_trade(self.api,symbol)
 
-        # Validated order: completed-15m structure -> hard stop -> ADD(s) -> rotation -> TP/trail.
-        if time.monotonic()-self.last_structure_scan >= 15:
-            self.structure_cached = structure_break(self.api,p); self.last_structure_scan = time.monotonic()
-        if self.structure_cached: self.close_all(p,"15m_structure_break_atr_expansion",trade); return
+        p = live_positions[0]
+        trade, _ = latest_trade(self.api, symbol)
+        tp, atr_sl, hard_cap = self.exit_prices(p)
 
-        risk = self.hard_stop_price(p)
-        if (trade <= risk if p.side=="long" else trade >= risk):
-            LOG.warning("HARD_STOP %s trade=%s risk_price=%s cycle_cash=%s",symbol,ds(trade),ds(risk),self.state.data["cycle_cash"])
-            self.close_all(p,"cycle_-8pct",trade); return
+        # Use the tighter adverse stop; the hard cap is an account-loss safety ceiling.
+        if p.side == "long":
+            effective_sl = max(atr_sl, hard_cap)
+            if trade <= effective_sl:
+                reason = "cycle_loss_cap" if hard_cap >= atr_sl else "atr_stop"
+                LOG.warning(
+                    "STOP %s side=%s reason=%s trade=%s atr_sl=%s hard_cap=%s",
+                    symbol,
+                    p.side,
+                    reason,
+                    ds(trade),
+                    ds(atr_sl),
+                    ds(hard_cap),
+                )
+                self.close_all(p, reason, trade)
+                return
+            if trade >= tp:
+                LOG.warning(
+                    "TAKE_PROFIT %s side=%s trade=%s target=%s tp_atr=%s",
+                    symbol,
+                    p.side,
+                    ds(trade),
+                    ds(tp),
+                    ds(profile.tp_atr),
+                )
+                self.close_all(p, "atr_take_profit", trade)
+                return
+        else:
+            effective_sl = min(atr_sl, hard_cap)
+            if trade >= effective_sl:
+                reason = "cycle_loss_cap" if hard_cap <= atr_sl else "atr_stop"
+                LOG.warning(
+                    "STOP %s side=%s reason=%s trade=%s atr_sl=%s hard_cap=%s",
+                    symbol,
+                    p.side,
+                    reason,
+                    ds(trade),
+                    ds(atr_sl),
+                    ds(hard_cap),
+                )
+                self.close_all(p, reason, trade)
+                return
+            if trade <= tp:
+                LOG.warning(
+                    "TAKE_PROFIT %s side=%s trade=%s target=%s tp_atr=%s",
+                    symbol,
+                    p.side,
+                    ds(trade),
+                    ds(tp),
+                    ds(profile.tp_atr),
+                )
+                self.close_all(p, "atr_take_profit", trade)
+                return
 
-        # Once +50% ROI activates the runner, freeze ADD/rotation and manage only the trail.
-        if self.state.data.get("trail_active"):
-            self.manage_trail(p,trade,candle); return
-
-        last_rotation = self.state.data.get("last_rotation_candle")
-        can_add = last_rotation is None or int(last_rotation) != candle
-        did_add = False
-        if can_add:
-            while int(self.state.data["add_stage"]) < 3:
-                stage = int(self.state.data["add_stage"]); anchor = D(self.state.data["round_anchor"]); a = D(self.state.data["round_atr"])
-                trigger = anchor-profile.add_atrs[stage]*a if p.side=="long" else anchor+profile.add_atrs[stage]*a
-                if not (trade <= trigger if p.side=="long" else trade >= trigger): break
-                before = p; q = self.qty(symbol,equity*profile.add_margins[stage]*D(LEVERAGE),trade)
-                LOG.warning("ADD%d %s qty=%s trigger=%s trade=%s",stage+1,symbol,ds(q),ds(trigger),ds(trade))
-                self.market(symbol,"BUY" if p.side=="long" else "SELL",q,False,f"add{stage+1}"); time.sleep(.4); p = one_position(self.api,symbol)
-                if not p.open or p.side != before.side or p.qty <= before.qty: raise BotError("add reconciliation failed")
-                added_qty = p.qty-before.qty; fill = (p.entry*p.qty-before.entry*before.qty)/added_qty
-                cash = D(self.state.data["cycle_cash"]) - added_qty*fill*TAKER_FEE
-                self.state.data.update({"cycle_cash":ds(cash),"add_stage":stage+1,"had_add":True,"last_add_candle":candle})
-                self.state.save(); self.clear_pending(); did_add = True; trade,candle = latest_trade(self.api,symbol)
-
-        # Recovery/TP activation is forbidden on a 5m candle that added.
-        last_add = self.state.data.get("last_add_candle")
-        if did_add or (last_add is not None and int(last_add)==candle): return
-
-        if self.state.data["had_add"]:
-            before = p; rotation = p.entry*(D(1)+BE_PRICE_RATIO) if p.side=="long" else p.entry*(D(1)-BE_PRICE_RATIO)
-            if (trade >= rotation if p.side=="long" else trade <= rotation):
-                q = self.rules[symbol].floor(p.qty*(D(1)-profile.keep_ratio))
-                if q <= 0: raise BotError("rotation quantity rounds to zero")
-                LOG.warning("ROTATE %s close=%s total=%s target=%s trade=%s keep=%s",
-                            symbol,ds(q),ds(p.qty),ds(rotation),ds(trade),ds(profile.keep_ratio))
-                self.market(symbol,"SELL" if p.side=="long" else "BUY",q,True,"rotate"); time.sleep(.4); p = one_position(self.api,symbol)
-                if not p.open: self.clear_pending(); self.state.reset_cycle(); return
-                sign = D(1) if before.side=="long" else D(-1); cash = D(self.state.data["cycle_cash"])
-                cash += sign*q*(rotation-before.entry) - q*rotation*TAKER_FEE
-                self.state.data.update({"cycle_cash":ds(cash),"round_anchor":ds(before.entry),"round_atr":ds(current_atr(self.api,symbol)),
-                                        "add_stage":0,"had_add":False,"rotations":self.state.data["rotations"]+1,"last_rotation_candle":candle})
-                self.state.save(); self.clear_pending(); trade,candle = latest_trade(self.api,symbol)
-
-        # +50% ROI no longer closes immediately; it activates a 5%p ROI giveback trail.
-        p = one_position(self.api,symbol)
-        activation = p.entry*(D(1)+TP_ACTIVATION_PRICE_RATIO) if p.side=="long" else p.entry*(D(1)-TP_ACTIVATION_PRICE_RATIO)
-        if (trade >= activation if p.side=="long" else trade <= activation):
-            self.state.data.update({"trail_active":True,"trail_extreme":ds(trade),"trail_activation_candle":candle})
-            self.state.save()
-            LOG.warning("TRAIL_ACTIVATE %s side=%s entry=%s trade=%s activation=%s giveback_roi=%s candle=%s",
-                        symbol,p.side,ds(p.entry),ds(trade),ds(activation),ds(TRAIL_ROI_GIVEBACK),candle)
+        opened = int(self.state.data["opened_at_ms"])
+        held_ms = int(time.time() * 1000) - opened
+        if held_ms >= profile.max_hold_minutes * 60 * 1000:
+            LOG.warning(
+                "TIME_EXIT %s side=%s held_minutes=%.1f max_minutes=%s trade=%s",
+                symbol,
+                p.side,
+                held_ms / 60000,
+                profile.max_hold_minutes,
+                ds(trade),
+            )
+            self.close_all(p, "max_hold_time", trade)
 
     def consume_occupied_bar(self) -> None:
-        """Prevent a signal that occurred while occupied from being entered after the position closes."""
+        """Do not enter a signal later if it happened while another symbol was occupied."""
         close_time = latest_completed_15m_close_time()
         changed = False
         for symbol in SYMBOLS:
-            previous = int(self.state.data["last_signal"].get(symbol,0))
+            previous = int(self.state.data["last_signal"].get(symbol, 0))
             if close_time > previous:
                 self.state.data["last_signal"][symbol] = close_time
                 changed = True
-        if changed: self.state.save()
+        if changed:
+            self.state.save()
 
     def scan(self) -> None:
-        if time.monotonic()-self.last_signal_scan < 15: return
+        if time.monotonic() - self.last_signal_scan < 15:
+            return
         self.last_signal_scan = time.monotonic()
-        now_ms = int(time.time()*1000)
-        candidates: list[tuple[str,str,int,Decimal,int]] = []
+        now_ms = int(time.time() * 1000)
+        candidates: list[tuple[str, Signal, int]] = []
 
-        # Evaluate every symbol before selecting one so simultaneous lower-priority signals are consumed too.
+        # Evaluate all symbols first; lower-priority simultaneous signals are consumed too.
         for symbol in SYMBOLS:
-            s = signal_for(self.api,symbol)
-            if not s: continue
-            side,close_time,a = s
-            if close_time <= int(self.state.data["last_signal"].get(symbol,0)): continue
-            age_ms = max(0, now_ms-close_time)
-            candidates.append((symbol,side,close_time,a,age_ms))
+            s = signal_for(self.api, symbol)
+            if not s:
+                continue
+            if s.close_time <= int(self.state.data["last_signal"].get(symbol, 0)):
+                continue
+            age_ms = max(0, now_ms - s.close_time)
+            candidates.append((symbol, s, age_ms))
 
-        if not candidates: return
-
-        # Any signal observed in this scan is consumed immediately, including stale and lower-priority signals.
-        for symbol,_,close_time,_,_ in candidates:
-            self.state.data["last_signal"][symbol] = close_time
-        self.state.save()
-
-        fresh = [x for x in candidates if x[4] <= SIGNAL_MAX_AGE_MS]
-        for symbol,side,close_time,a,age_ms in candidates:
-            LOG.info("SIGNAL %s %s close_time=%s atr=%s age_ms=%s fresh=%s",
-                     symbol,side,close_time,ds(a),age_ms,age_ms <= SIGNAL_MAX_AGE_MS)
-
-        if not fresh:
-            LOG.info("SKIP_STALE signals=%s max_age_ms=%s",
-                     ",".join(f"{x[0]}:{x[2]}" for x in candidates),SIGNAL_MAX_AGE_MS)
+        if not candidates:
             return
 
-        # SYMBOLS order is the fixed live priority: BTC > ETH > SOL.
+        for symbol, s, _ in candidates:
+            self.state.data["last_signal"][symbol] = s.close_time
+        self.state.save()
+
+        fresh = [x for x in candidates if x[2] <= SIGNAL_MAX_AGE_MS]
+        for symbol, s, age_ms in candidates:
+            LOG.info(
+                "SIGNAL %s %s close_time=%s atr=%s age_ms=%s fresh=%s detail=[%s]",
+                symbol,
+                s.side,
+                s.close_time,
+                ds(s.atr),
+                age_ms,
+                age_ms <= SIGNAL_MAX_AGE_MS,
+                s.detail,
+            )
+
+        if not fresh:
+            LOG.info(
+                "SKIP_STALE signals=%s max_age_ms=%s",
+                ",".join(f"{symbol}:{s.close_time}" for symbol, s, _ in candidates),
+                SIGNAL_MAX_AGE_MS,
+            )
+            return
+
         selected = fresh[0]
         if len(fresh) > 1:
-            LOG.info("SIGNAL_PRIORITY selected=%s consumed=%s",
-                     selected[0],",".join(x[0] for x in fresh[1:]))
+            LOG.info(
+                "SIGNAL_PRIORITY selected=%s consumed=%s",
+                selected[0],
+                ",".join(x[0] for x in fresh[1:]),
+            )
 
         if LIVE:
-            symbol,side,close_time,a,_ = selected
-            self.open_signal(symbol,side,close_time,a)
+            symbol, s, _ = selected
+            self.open_signal(symbol, s)
 
     def run(self) -> None:
         self.bootstrap()
         profile_summary = "; ".join(
-            f"{s}:BB={ds(p.bb_std)},CCI={ds(p.cci_extreme)},initial={ds(p.initial_margin)},"
-            f"adds={'/'.join(ds(x) for x in p.add_margins)},add_atr={'/'.join(ds(x) for x in p.add_atrs)},"
-            f"keep={ds(p.keep_ratio)},atr_exp={ds(p.atr_expansion)}"
-            for s,p in PROFILES.items()
+            f"{s}:notional={ds(p.notional_mult)}x,tp={ds(p.tp_atr)}ATR,"
+            f"sl={ds(p.sl_atr)}ATR,max_hold={p.max_hold_minutes}m,"
+            f"hard_cap={ds(p.hard_stop * D(100))}%"
+            for s, p in PROFILES.items()
         )
-        LOG.info("started live=%s symbols=%s priority=%s 98x cross max_one_position fresh_signal=%sms "
-                 "TP=activate50%% trail_giveback=5%%p structure=15m/96 atr_median=100 profiles=[%s]",
-                 LIVE,SYMBOLS,">".join(SYMBOLS),SIGNAL_MAX_AGE_MS,profile_summary)
+        LOG.info(
+            "started strategy=%s live=%s symbols=%s priority=%s leverage=%sx cross "
+            "max_one_position no_dca fresh_signal=%sms profiles=[%s]",
+            STRATEGY_ID,
+            LIVE,
+            SYMBOLS,
+            ">".join(SYMBOLS),
+            LEVERAGE,
+            SIGNAL_MAX_AGE_MS,
+            profile_summary,
+        )
         while not STOP:
             if LIVE and self.state.data.get("pending_order") and self.reconcile_pending():
                 raise BotError("FILLED pending order with incomplete local transition")
             if LIVE and self.state.data.get("active_symbol"):
-                # Consume every completed 15m bar while occupied before management can close the position.
                 self.consume_occupied_bar()
                 self.manage()
             else:
@@ -572,15 +1092,22 @@ class Bot:
 
 
 def stop_handler(*_: Any) -> None:
-    global STOP; STOP = True
+    global STOP
+    STOP = True
 
 
 def main() -> None:
-    signal.signal(signal.SIGINT,stop_handler); signal.signal(signal.SIGTERM,stop_handler)
-    api = Binance(); state = State(STATE_PATH); rules = load_rules(api); Bot(api,state,rules).run()
+    signal.signal(signal.SIGINT, stop_handler)
+    signal.signal(signal.SIGTERM, stop_handler)
+    api = Binance()
+    state = State(STATE_PATH)
+    rules = load_rules(api)
+    Bot(api, state, rules).run()
 
 
 if __name__ == "__main__":
-    try: main()
+    try:
+        main()
     except Exception as e:
-        LOG.exception("bot stopped: %s",e); raise SystemExit(1)
+        LOG.exception("bot stopped: %s", e)
+        raise SystemExit(1)
