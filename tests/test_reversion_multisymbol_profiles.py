@@ -36,29 +36,44 @@ class FakeState:
 
 def test_profiles_match_validated_parameters():
     assert rv.SYMBOLS == ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+    assert rv.STRATEGY_ID == "asymmetric_snapback_v1"
 
     btc = rv.PROFILES["BTCUSDT"]
-    assert btc.bb_std == Decimal("1.8")
-    assert btc.initial_margin == Decimal("0.0125")
-    assert btc.add_atrs == (Decimal("1.4"), Decimal("3.0"), Decimal("4.6"))
-    assert btc.keep_ratio == Decimal("0.50")
-    assert btc.atr_expansion == Decimal("1.8")
+    assert btc.notional_mult == Decimal("5")
+    assert btc.tp_atr == Decimal("8")
+    assert btc.sl_atr == Decimal("6")
+    assert btc.max_hold_minutes == 48 * 60
+    assert btc.hard_stop == Decimal("0.20")
+    assert rv.BTC_BB_Z == Decimal("2.75")
+    assert rv.BTC_RSI_MIN == Decimal("65")
+    assert rv.BTC_RSI_REVERSAL == Decimal("12")
+    assert rv.BTC_ADX_MAX == Decimal("35")
+    assert rv.BTC_ATR_RATIO_MAX == Decimal("3.0")
 
     eth = rv.PROFILES["ETHUSDT"]
-    assert eth.bb_std == Decimal("1.9")
-    assert eth.initial_margin == Decimal("0.005")
-    assert eth.add_margins == (Decimal("0.005"), Decimal("0.0075"), Decimal("0.010"))
-    assert eth.add_atrs == (Decimal("1.0"), Decimal("2.0"), Decimal("3.2"))
-    assert eth.keep_ratio == Decimal("0.20")
-    assert eth.atr_expansion == Decimal("1.5")
+    assert eth.notional_mult == Decimal("9")
+    assert eth.tp_atr == Decimal("2")
+    assert eth.sl_atr == Decimal("3")
+    assert eth.max_hold_minutes == 24 * 60
+    assert eth.hard_stop == Decimal("0.20")
+    assert rv.ETH_BB_Z == Decimal("2.50")
+    assert rv.ETH_RSI_MAX == Decimal("30")
+    assert rv.ETH_RSI_REVERSAL == Decimal("11")
+    assert rv.ETH_ADX_MAX == Decimal("70")
+    assert rv.ETH_ATR_RATIO_MAX == Decimal("1.5")
 
     sol = rv.PROFILES["SOLUSDT"]
-    assert sol.bb_std == Decimal("1.65")
-    assert sol.initial_margin == Decimal("0.003")
-    assert sol.add_margins == (Decimal("0.003"), Decimal("0.0045"), Decimal("0.006"))
-    assert sol.add_atrs == (Decimal("1.0"), Decimal("2.5"), Decimal("4.0"))
-    assert sol.keep_ratio == Decimal("0.80")
-    assert sol.atr_expansion == Decimal("1.5")
+    assert sol.notional_mult == Decimal("3")
+    assert sol.tp_atr == Decimal("5")
+    assert sol.sl_atr == Decimal("4")
+    assert sol.max_hold_minutes == 6 * 60
+    assert sol.hard_stop == Decimal("0.15")
+    assert rv.SOL_KELTNER_ATR == Decimal("2.25")
+    assert rv.SOL_RSI_LONG_MAX == Decimal("25")
+    assert rv.SOL_RSI_SHORT_MIN == Decimal("75")
+    assert rv.SOL_RSI_REVERSAL == Decimal("8")
+    assert rv.SOL_ADX_MAX == Decimal("35")
+    assert rv.SOL_ATR_RATIO_MAX == Decimal("3.0")
 
 
 def test_scan_consumes_simultaneous_signals_and_uses_priority(monkeypatch):
@@ -68,9 +83,11 @@ def test_scan_consumes_simultaneous_signals_and_uses_priority(monkeypatch):
     now_ms = 1_800_000_000_000
     close_time = now_ms - 1_000
 
+    btc_signal = rv.Signal("short", close_time, Decimal("10"), "btc")
+    eth_signal = rv.Signal("long", close_time, Decimal("5"), "eth")
     signals = {
-        "BTCUSDT": ("long", close_time, Decimal("10")),
-        "ETHUSDT": ("short", close_time, Decimal("5")),
+        "BTCUSDT": btc_signal,
+        "ETHUSDT": eth_signal,
         "SOLUSDT": None,
     }
     monkeypatch.setattr(rv, "LIVE", True)
@@ -80,7 +97,7 @@ def test_scan_consumes_simultaneous_signals_and_uses_priority(monkeypatch):
 
     bot.scan()
 
-    assert opened == [("BTCUSDT", "long", close_time, Decimal("10"))]
+    assert opened == [("BTCUSDT", btc_signal)]
     assert state.data["last_signal"]["BTCUSDT"] == close_time
     assert state.data["last_signal"]["ETHUSDT"] == close_time
 
@@ -94,7 +111,7 @@ def test_scan_consumes_stale_signal_without_opening(monkeypatch):
 
     signals = {
         "BTCUSDT": None,
-        "ETHUSDT": ("long", close_time, Decimal("5")),
+        "ETHUSDT": rv.Signal("long", close_time, Decimal("5"), "eth"),
         "SOLUSDT": None,
     }
     monkeypatch.setattr(rv, "LIVE", True)
