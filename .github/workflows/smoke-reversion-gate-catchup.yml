@@ -1,0 +1,42 @@
+name: Smoke reversion gate catchup
+
+on:
+  push:
+    branches:
+      - fix/reversion-gate-catchup
+
+permissions:
+  contents: write
+
+jobs:
+  smoke:
+    if: ${{ !contains(github.event.head_commit.message, '[gate-smoke]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/reversion-gate-catchup
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Reconstruct current gate from public Binance history
+        env:
+          LIVE_TRADING: '0'
+          RUN_ONCE: '1'
+          REVERSION_STATE_PATH: /tmp/reversion-gate-smoke-state.json
+          BOT_INSTANCE_LOCK_PATH: /tmp/reversion-gate-smoke.lock
+          LOG_LEVEL: INFO
+        run: |
+          set -euo pipefail
+          python reversion_live/main.py > /tmp/gate-smoke.log 2>&1
+          cat /tmp/gate-smoke.log
+          cp /tmp/gate-smoke.log reversion_live/gate_smoke.txt
+      - name: Commit smoke output
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reversion_live/gate_smoke.txt
+          git commit -m "chore: record gate catchup smoke [gate-smoke]"
+          git push origin HEAD:fix/reversion-gate-catchup
