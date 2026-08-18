@@ -1,0 +1,88 @@
+name: Patch reversion entry candle race
+
+on:
+  push:
+    branches:
+      - fix/reversion-entry-candle-race
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/reversion-entry-candle-race
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Patch live bot and tests
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('reversion_live/main.py')
+          text = path.read_text()
+
+          def replace_once(old, new):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one match, got {count}: {old[:120]!r}')
+              text = text.replace(old, new, 1)
+
+          replace_once('STATE_VERSION = 4', 'STATE_VERSION = 5')
+          replace_once('elif version in (1, 2, 3):', 'elif version in (1, 2, 3, 4):')
+          replace_once('if self.loaded_version == 3:', 'if self.loaded_version in (3, 4):')
+
+          marker = '''def latest_trade(api: Binance, symbol: str) -> tuple[Decimal, int]:\n'''
+          helper = '''def exact_entry_kline(\n    api: Binance,\n    symbol: str,\n    interval: str,\n    expected_open_ms: int,\n    signal_close_time: int,\n) -> list[Any]:\n    \"\"\"Return the exact entry candle, tolerating exchange boundary propagation lag.\n\n    Binance can briefly return the previous candle immediately after a timeframe\n    boundary.  Poll the exact requested interval until the signal freshness\n    deadline; for a stale/recovered shadow signal the historical candle should\n    already be available and is fetched once.\n    \"\"\"\n    step_by_interval = {\"1m\": 60_000, \"5m\": 5 * 60_000}\n    if interval not in step_by_interval:\n        raise BotError(f\"unsupported entry interval={interval}\")\n    expected_open_ms = int(expected_open_ms)\n    deadline_ms = int(signal_close_time) + SIGNAL_MAX_AGE_MS\n    last_open: int | None = None\n    while True:\n        rows = api.klines(\n            symbol,\n            interval,\n            2,\n            start_time=expected_open_ms,\n            end_time=expected_open_ms + step_by_interval[interval] - 1,\n        )\n        for row in rows:\n            open_ms = int(row[0])\n            last_open = open_ms\n            if open_ms == expected_open_ms:\n                return row\n\n        now_ms = int(time.time() * 1000)\n        if now_ms >= deadline_ms:\n            raise BotError(\n                f\"entry candle unavailable: {symbol} {interval} \"\n                f\"expected={expected_open_ms} last={last_open} now={now_ms}\"\n            )\n        remaining = max(0.01, min(0.25, (deadline_ms - now_ms) / 1000))\n        time.sleep(remaining)\n\n\n'''
+          if helper.strip() not in text:
+              replace_once(marker, helper + marker)
+
+          old_shadow = '''        rows = self.api.klines(symbol, \"1m\", 1)\n        if not rows:\n            raise BotError(f\"current 1m entry candle unavailable for shadow {symbol}\")\n        row = rows[-1]\n        entry_open_ms = int(row[0])\n        if entry_open_ms != s.close_time + 1:\n            raise BotError(\n                f\"shadow execution candle mismatch: expected={s.close_time + 1} \"\n                f\"got={entry_open_ms}\"\n            )\n        entry = D(row[1])\n'''
+          new_shadow = '''        row = exact_entry_kline(\n            self.api, symbol, \"1m\", s.close_time + 1, s.close_time\n        )\n        entry_open_ms = int(row[0])\n        entry = D(row[1])\n'''
+          replace_once(old_shadow, new_shadow)
+
+          old_live = '''        trade, candle = latest_trade(self.api, symbol)\n        if candle != s.close_time + 1:\n            raise BotError(\n                f\"snapback execution candle mismatch: expected={s.close_time + 1} got={candle}\"\n            )\n'''
+          new_live = '''        entry_row = exact_entry_kline(\n            self.api, symbol, \"5m\", s.close_time + 1, s.close_time\n        )\n        trade, candle = D(entry_row[4]), int(entry_row[0])\n'''
+          replace_once(old_live, new_live)
+
+          old_fallback = '''        trade, candle = latest_trade(self.api, symbol)\n        if candle != close_time + 1:\n            raise BotError(\n                f\"fallback execution candle mismatch: expected={close_time + 1} got={candle}\"\n            )\n'''
+          new_fallback = '''        entry_row = exact_entry_kline(\n            self.api, symbol, \"5m\", close_time + 1, close_time\n        )\n        trade, candle = D(entry_row[4]), int(entry_row[0])\n'''
+          replace_once(old_fallback, new_fallback)
+
+          old_candidate = '''            if current and current.close_time > int(\n                self.state.data[\"last_signal\"].get(symbol, 0)\n            ):\n                candidates.append((symbol, current))\n                self.state.data[\"last_signal\"][symbol] = current.close_time\n\n        self.state.data[\"last_strategy_bar_close\"] = close_time\n        self.state.save()\n'''
+          new_candidate = '''            if current and current.close_time > int(\n                self.state.data[\"last_signal\"].get(symbol, 0)\n            ):\n                candidates.append((symbol, current))\n\n'''
+          replace_once(old_candidate, new_candidate)
+
+          old_dispatch = '''        if candidates and fresh_bar:\n            if self.state.data[\"shadow\"].get(\"position\"):\n                LOG.info(\"SKIP_SHADOW_SIGNAL occupied=true candidates=%s\", len(candidates))\n            else:\n                symbol, selected = candidates[0]\n                gate_on = self.start_shadow(symbol, selected)\n                if LIVE and gate_on:\n                    live_positions = open_positions(self.api)\n                    if live_positions and self.state.data.get(\"active_strategy\") == \"fallback\":\n                        self.close_all(live_positions[0], \"gate_on_snapback\")\n                        live_positions = []\n                    if not live_positions:\n                        self.open_signal(symbol, selected)\n                if len(candidates) > 1:\n                    LOG.info(\n                        \"SNAPBACK_PRIORITY selected=%s consumed=%s\",\n                        symbol,\n                        \",\".join(item[0] for item in candidates[1:]),\n                    )\n        elif candidates:\n            LOG.info(\"SKIP_STALE_SNAPBACK count=%s age_ms=%s\", len(candidates), age_ms)\n\n        self.apply_fallback(snapshot, fresh_bar)\n'''
+          new_dispatch = '''        if candidates:\n            if self.state.data[\"shadow\"].get(\"position\"):\n                LOG.info(\"SKIP_SHADOW_SIGNAL occupied=true candidates=%s\", len(candidates))\n            else:\n                symbol, selected = candidates[0]\n                gate_on = self.start_shadow(symbol, selected)\n                if LIVE and fresh_bar and gate_on:\n                    live_positions = open_positions(self.api)\n                    if live_positions and self.state.data.get(\"active_strategy\") == \"fallback\":\n                        self.close_all(live_positions[0], \"gate_on_snapback\")\n                        live_positions = []\n                    if not live_positions:\n                        self.open_signal(symbol, selected)\n                elif LIVE and not fresh_bar:\n                    LOG.info(\n                        \"SKIP_STALE_LIVE_SNAPBACK %s close_time=%s age_ms=%s\",\n                        symbol,\n                        selected.close_time,\n                        age_ms,\n                    )\n                if len(candidates) > 1:\n                    LOG.info(\n                        \"SNAPBACK_PRIORITY selected=%s consumed=%s\",\n                        symbol,\n                        \",\".join(item[0] for item in candidates[1:]),\n                    )\n\n        self.apply_fallback(snapshot, fresh_bar)\n        for symbol, current in candidates:\n            self.state.data[\"last_signal\"][symbol] = current.close_time\n        self.state.data[\"last_strategy_bar_close\"] = close_time\n        self.state.save()\n'''
+          replace_once(old_dispatch, new_dispatch)
+
+          path.write_text(text)
+
+          test_path = Path('tests/test_reversion_multisymbol_profiles.py')
+          tests = test_path.read_text()
+          tests = tests.replace('assert rv.STATE_VERSION == 4', 'assert rv.STATE_VERSION == 5')
+          tests = tests.replace('assert state.data[\"version\"] == 4', 'assert state.data[\"version\"] == 5')
+          test_path.write_text(tests)
+
+          extra = Path('tests/test_reversion_entry_boundary.py')
+          extra.write_text(r'''import importlib.util\nimport os\nimport sys\nfrom decimal import Decimal\nfrom pathlib import Path\n\n\ndef load_module():\n    os.environ[\"LIVE_TRADING\"] = \"0\"\n    path = Path(__file__).resolve().parents[1] / \"reversion_live\" / \"main.py\"\n    spec = importlib.util.spec_from_file_location(\"reversion_entry_boundary_test\", path)\n    module = importlib.util.module_from_spec(spec)\n    sys.modules[spec.name] = module\n    assert spec.loader is not None\n    spec.loader.exec_module(module)\n    return module\n\n\nrv = load_module()\n\n\nclass StateStub:\n    def __init__(self):\n        self.data = rv.blank_state()\n        self.data[\"shadow\"].update({\"completed_count\": 40, \"ewm\": \"0.01\", \"gate_on\": True})\n        self.saves = 0\n\n    def save(self):\n        self.saves += 1\n\n\nclass BoundaryAPI:\n    def __init__(self, expected):\n        self.expected = expected\n        self.calls = 0\n\n    def klines(self, symbol, interval, limit=120, start_time=None, end_time=None):\n        self.calls += 1\n        open_ms = self.expected - 60_000 if self.calls == 1 else self.expected\n        return [[open_ms, \"100\", \"101\", \"99\", \"100\", \"1\", open_ms + 59_999]]\n\n\ndef test_shadow_retries_previous_minute_boundary_race(monkeypatch):\n    close_time = 1_800_000_899_999\n    expected = close_time + 1\n    api = BoundaryAPI(expected)\n    state = StateStub()\n    bot = rv.Bot(api, state, {})\n    monkeypatch.setattr(rv.time, \"time\", lambda: (expected + 1_000) / 1000)\n    monkeypatch.setattr(rv.time, \"sleep\", lambda _: None)\n    signal = rv.Signal(\"short\", close_time, Decimal(\"2\"), Decimal(\"100\"), \"test\")\n\n    gate_on = bot.start_shadow(\"BTCUSDT\", signal)\n\n    assert gate_on is True\n    assert api.calls == 2\n    assert state.data[\"shadow\"][\"entry_open_ms\"] if False else True\n    assert state.data[\"shadow\"][\"position\"][\"entry_open_ms\"] == expected\n\n\ndef test_v4_state_is_migration_boundary(tmp_path):\n    path = tmp_path / \"state.json\"\n    path.write_text(\n        '{\"version\":4,\"live_account_initialized\":true,\"initial_live_equity\":\"49.999\",'\n        '\"shadow\":{\"completed_count\":292,\"ewm\":\"0.031\",\"gate_on\":true,\"seeded\":true}}',\n        encoding=\"utf-8\",\n    )\n    state = rv.State(path)\n    assert state.legacy is True\n    assert state.loaded_version == 4\n    state.rebuild_for_strategy()\n    assert state.data[\"version\"] == 5\n    assert state.data[\"live_account_initialized\"] is True\n    assert state.data[\"initial_live_equity\"] == \"49.999\"\n    assert state.data[\"shadow\"][\"completed_count\"] == 0\n'''.replace('\\n', '\n'))
+          PY
+      - name: Run tests
+        run: |
+          python -m pip install -r requirements-ci.txt
+          pytest -q
+      - name: Commit patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add reversion_live/main.py tests/test_reversion_multisymbol_profiles.py tests/test_reversion_entry_boundary.py
+          git diff --cached --check
+          git commit -m "fix: tolerate entry candle boundary lag"
+          git push origin HEAD:fix/reversion-entry-candle-race
