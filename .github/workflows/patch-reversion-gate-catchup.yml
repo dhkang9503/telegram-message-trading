@@ -1,0 +1,44 @@
+name: Patch reversion gate catchup
+
+on:
+  push:
+    branches:
+      - fix/reversion-gate-catchup
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: ${{ !contains(github.event.head_commit.message, '[gate-catchup-applied]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/reversion-gate-catchup
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Apply patch
+        run: python scripts/apply_reversion_gate_catchup.py
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-ci.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Check diff
+        run: git diff --check
+
+      - name: Commit patch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reversion_live/main.py tests/test_reversion_multisymbol_profiles.py
+          git commit -m "fix: reconstruct snapback gate history [gate-catchup-applied]"
+          git push origin HEAD:fix/reversion-gate-catchup
