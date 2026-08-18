@@ -22,7 +22,7 @@ rv = load_module()
 def test_profiles_match_full_period_ensemble_contract():
     assert rv.SYMBOLS == ("BTCUSDT", "ETHUSDT", "SOLUSDT")
     assert rv.STRATEGY_ID == "full_period_regime_ensemble_v1"
-    assert rv.STATE_VERSION == 4
+    assert rv.STATE_VERSION == 5
     assert rv.GATE_SPAN == 40
     assert rv.GATE_THRESHOLD == Decimal("0.0025")
     assert rv.FALLBACK_FAST == 32
@@ -51,7 +51,7 @@ def test_v3_flat_state_rebuild_discards_stale_gate_but_preserves_account_guard(t
     assert state.legacy is True
     assert state.loaded_version == 3
     state.rebuild_for_strategy()
-    assert state.data["version"] == 4
+    assert state.data["version"] == 5
     assert state.data["live_account_initialized"] is True
     assert state.data["initial_live_equity"] == "49.999"
     assert state.data["shadow"]["completed_count"] == 0

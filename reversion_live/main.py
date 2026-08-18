@@ -67,7 +67,7 @@ SNAPBACK_LIVE_PROFILES = {
 }
 
 STRATEGY_ID = "full_period_regime_ensemble_v1"
-STATE_VERSION = 4
+STATE_VERSION = 5
 
 # Exchange leverage controls reserved margin, not strategy exposure.  Twenty
 # times is above the largest validated notional multiplier (14.4x) while
@@ -295,7 +295,7 @@ class State:
             self.loaded_version = version
             if version == STATE_VERSION:
                 self.data.update(loaded)
-            elif version in (1, 2, 3):
+            elif version in (1, 2, 3, 4):
                 # Never silently take over a position opened by an older strategy.
                 # v3 is rebuilt from the audited gate seed because its embedded seed
                 # could skip history between the seed timestamp and process startup.
@@ -317,7 +317,7 @@ class State:
         initialized = bool(self.data.get("live_account_initialized", False))
         initial_equity = self.data.get("initial_live_equity")
         self.data = blank_state()
-        if self.loaded_version == 3:
+        if self.loaded_version in (3, 4):
             self.data["live_account_initialized"] = initialized
             self.data["initial_live_equity"] = initial_equity
         self.loaded_version = STATE_VERSION
@@ -810,6 +810,49 @@ def signal_for(
         return None
 
     raise BotError(f"unsupported symbol {symbol}")
+
+
+def exact_entry_kline(
+    api: Binance,
+    symbol: str,
+    interval: str,
+    expected_open_ms: int,
+    signal_close_time: int,
+) -> list[Any]:
+    """Fetch the exact entry candle, tolerating exchange boundary propagation lag.
+
+    Binance can briefly expose the previous kline immediately after a timeframe
+    boundary. Poll the exact requested candle until the signal freshness deadline.
+    A stale/recovered shadow signal is allowed to fetch its historical entry candle
+    once so shadow accounting remains continuous without opening a stale live trade.
+    """
+    step_by_interval = {"1m": 60_000, "5m": 5 * 60_000}
+    if interval not in step_by_interval:
+        raise BotError(f"unsupported entry interval={interval}")
+    expected_open_ms = int(expected_open_ms)
+    deadline_ms = int(signal_close_time) + SIGNAL_MAX_AGE_MS
+    last_open: int | None = None
+    while True:
+        rows = api.klines(
+            symbol,
+            interval,
+            2,
+            start_time=expected_open_ms,
+            end_time=expected_open_ms + step_by_interval[interval] - 1,
+        )
+        for row in rows:
+            open_ms = int(row[0])
+            last_open = open_ms
+            if open_ms == expected_open_ms:
+                return row
+
+        now_ms = int(time.time() * 1000)
+        if now_ms >= deadline_ms:
+            raise BotError(
+                f"entry candle unavailable: {symbol} {interval} "
+                f"expected={expected_open_ms} last={last_open} now={now_ms}"
+            )
+        time.sleep(max(0.01, min(0.25, (deadline_ms - now_ms) / 1000)))
 
 
 def latest_trade(api: Binance, symbol: str) -> tuple[Decimal, int]:
@@ -1596,11 +1639,10 @@ class Bot:
             raise BotError("invalid futures equity")
         equity = min(actual, SIZING_CAP) if SIZING_CAP > 0 else actual
 
-        trade, candle = latest_trade(self.api, symbol)
-        if candle != s.close_time + 1:
-            raise BotError(
-                f"snapback execution candle mismatch: expected={s.close_time + 1} got={candle}"
-            )
+        entry_row = exact_entry_kline(
+            self.api, symbol, "5m", s.close_time + 1, s.close_time
+        )
+        trade, candle = D(entry_row[4]), int(entry_row[0])
         notional = equity * profile.notional_mult
         if max_notional > 0 and notional > max_notional:
             raise BotError(
@@ -1695,11 +1737,10 @@ class Bot:
         if actual <= 0:
             raise BotError("invalid futures equity")
         equity = min(actual, SIZING_CAP) if SIZING_CAP > 0 else actual
-        trade, candle = latest_trade(self.api, symbol)
-        if candle != close_time + 1:
-            raise BotError(
-                f"fallback execution candle mismatch: expected={close_time + 1} got={candle}"
-            )
+        entry_row = exact_entry_kline(
+            self.api, symbol, "5m", close_time + 1, close_time
+        )
+        trade, candle = D(entry_row[4]), int(entry_row[0])
         notional = equity * leverage
         if max_notional > 0 and notional > max_notional:
             raise BotError(
@@ -1925,16 +1966,10 @@ class Bot:
         gate_on = count >= GATE_SPAN and current is not None and current > GATE_THRESHOLD
         shadow["gate_on"] = gate_on
 
-        rows = self.api.klines(symbol, "1m", 1)
-        if not rows:
-            raise BotError(f"current 1m entry candle unavailable for shadow {symbol}")
-        row = rows[-1]
+        row = exact_entry_kline(
+            self.api, symbol, "1m", s.close_time + 1, s.close_time
+        )
         entry_open_ms = int(row[0])
-        if entry_open_ms != s.close_time + 1:
-            raise BotError(
-                f"shadow execution candle mismatch: expected={s.close_time + 1} "
-                f"got={entry_open_ms}"
-            )
         entry = D(row[1])
         profile = PROFILES[symbol]
         side_sign = D(1) if s.side == "long" else D(-1)
@@ -2143,10 +2178,7 @@ class Bot:
                 self.state.data["last_signal"].get(symbol, 0)
             ):
                 candidates.append((symbol, current))
-                self.state.data["last_signal"][symbol] = current.close_time
 
-        self.state.data["last_strategy_bar_close"] = close_time
-        self.state.save()
         LOG.info(
             "FALLBACK_SIGNAL close_time=%s desired=%s held=%s score=%s vol=%s "
             "leverage=%s gate_on=%s age_ms=%s fresh=%s",
@@ -2173,29 +2205,38 @@ class Bot:
                 current.detail,
             )
 
-        if candidates and fresh_bar:
+        if candidates:
             if self.state.data["shadow"].get("position"):
                 LOG.info("SKIP_SHADOW_SIGNAL occupied=true candidates=%s", len(candidates))
             else:
                 symbol, selected = candidates[0]
                 gate_on = self.start_shadow(symbol, selected)
-                if LIVE and gate_on:
+                if LIVE and fresh_bar and gate_on:
                     live_positions = open_positions(self.api)
                     if live_positions and self.state.data.get("active_strategy") == "fallback":
                         self.close_all(live_positions[0], "gate_on_snapback")
                         live_positions = []
                     if not live_positions:
                         self.open_signal(symbol, selected)
+                elif LIVE and not fresh_bar:
+                    LOG.info(
+                        "SKIP_STALE_LIVE_SNAPBACK %s close_time=%s age_ms=%s",
+                        symbol,
+                        selected.close_time,
+                        age_ms,
+                    )
                 if len(candidates) > 1:
                     LOG.info(
                         "SNAPBACK_PRIORITY selected=%s consumed=%s",
                         symbol,
                         ",".join(item[0] for item in candidates[1:]),
                     )
-        elif candidates:
-            LOG.info("SKIP_STALE_SNAPBACK count=%s age_ms=%s", len(candidates), age_ms)
 
         self.apply_fallback(snapshot, fresh_bar)
+        for symbol, current in candidates:
+            self.state.data["last_signal"][symbol] = current.close_time
+        self.state.data["last_strategy_bar_close"] = close_time
+        self.state.save()
 
     def run(self) -> None:
         self.bootstrap()
