@@ -35,3 +35,4 @@
 {"source":{"message":"63초반까지 물 태워보고 63깨지면 순환매로 바꿔버릴게요!"},"label":{"status":"labeled","correct_actions":[]}}
 {"source":{"message":"저 610물타기 910손절 걸엇어요 !"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":610},{"type":"SET_STOP","price":910}]}}
 {"source":{"message":"재진입 한번만 더 볼게요!"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_REENTRY","price":null,"side":null}]}}
+{"source":{"message":"짜르고 재진입 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL"},{"type":"OPEN_REENTRY","side":null}]}}
