@@ -320,7 +320,7 @@ def test_market_open_uses_equity_ratio_and_correct_direction(
     engine, api, state, config = rig
     result = execute(engine, action)
     expected = config.floor_size(
-        Decimal("400") * Decimal("0.0125") * live.LEVERAGE / api.mark_price
+        Decimal("400") * Decimal("0.01") * live.LEVERAGE / api.mark_price
     )
     placed = mutations(api)[0]
     assert (placed["side"], placed["order_type"], placed["size"]) == (
@@ -341,7 +341,7 @@ def test_limit_open_uses_resolved_price_and_stays_pending(rig, action, side):
     engine, api, state, config = rig
     result = execute(engine, action, 63000)
     expected = config.floor_size(
-        Decimal("400") * Decimal("0.0125") * live.LEVERAGE / Decimal("63000")
+        Decimal("400") * Decimal("0.01") * live.LEVERAGE / Decimal("63000")
     )
     placed = mutations(api)[0]
     assert (placed["side"], placed["price"], placed["size"]) == (
