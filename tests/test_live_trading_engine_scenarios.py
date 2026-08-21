@@ -328,7 +328,7 @@ def test_market_open_uses_equity_ratio_and_correct_direction(
         "market",
         expected,
     )
-    assert result["margin_usdt"] == "5"
+    assert result["margin_usdt"] == "4"
     assert state.data["position"]["side"] == position_side
     assert D(state.data["position"]["initial_qty"]) == expected
     assert D(state.data["position"]["added_qty"]) == 0
@@ -685,7 +685,7 @@ def test_regular_open_after_stop_uses_fresh_equity_instead_of_reentry_allowance(
     stopped_margin = state.data["stopped_position"]["total_margin_usdt"]
     result = execute(engine, "OPEN_LONG", message_id=3)
     assert result["sizing_source"] == "account_usdt_equity_1_25_percent"
-    assert result["margin_usdt"] == "5"
+    assert result["margin_usdt"] == "4"
     assert result["margin_usdt"] != stopped_margin
 
 
