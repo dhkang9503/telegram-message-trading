@@ -296,7 +296,6 @@ def test_duplicate_close_all_is_ignored_while_trailing(rig):
 @pytest.mark.parametrize(
     "action_type",
     [
-        "OPEN_REENTRY",
         "ADD",
         "SET_STOP",
         "SET_TP",
@@ -317,6 +316,22 @@ def test_non_directional_actions_are_ignored_while_trailing(rig, action_type):
     assert result["action_type"] == action_type
     assert mutations(api, start) == []
     assert api.position_row is not None
+
+
+def test_open_reentry_is_explicitly_rejected_during_profitable_trailing(rig):
+    engine, api, _ = rig
+    arm_trailing(engine, api)
+    start = len(api.calls)
+
+    result = execute(engine, "OPEN_REENTRY", message_id=3)
+
+    assert result["skipped"] == "trailing_reentry_requires_verified_stop"
+    assert mutations(api, start) == []
+    assert api.position_row is not None
+    assert any(
+        event["event"] == "OPEN_REENTRY_REJECTED_DURING_TRAILING"
+        for event in engine.events
+    )
 
 
 @pytest.mark.parametrize(

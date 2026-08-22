@@ -1941,6 +1941,19 @@ class TradingEngine:
                 return await self.replace_trailing_with_open(
                     kind, price, message_id, index
                 )
+            # OPEN_REENTRY is deliberately not a directional replacement. It
+            # may reuse margin only after an independently verified stop-loss
+            # execution, never after a profitable CLOSE_ALL transition.
+            if kind == "OPEN_REENTRY":
+                self.log(
+                    "OPEN_REENTRY_REJECTED_DURING_TRAILING",
+                    trailing_order_id=str(trailing.get("order_id")),
+                )
+                return {
+                    "skipped": "trailing_reentry_requires_verified_stop",
+                    "action_type": kind,
+                    "trailing_order_id": str(trailing.get("order_id")),
+                }
             event = (
                 "DUPLICATE_CLOSE_ALL_IGNORED_DURING_TRAILING"
                 if kind == "CLOSE_ALL"
