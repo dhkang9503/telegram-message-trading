@@ -109,6 +109,39 @@ def prioritize_cancel_actions(
     )
 
 
+def trailing_replacement_side(
+    actions: list[dict[str, Any]], trailing_active: bool
+) -> Optional[str]:
+    if not trailing_active:
+        return None
+    replacements = [
+        str(action.get("type"))
+        for action in actions
+        if action.get("type") in {"OPEN_LONG", "OPEN_SHORT"}
+    ]
+    if len(replacements) != 1:
+        return None
+    return "long" if replacements[0] == "OPEN_LONG" else "short"
+
+
+def prioritize_trailing_replacement_open(
+    actions: list[dict[str, Any]], trailing_active: bool
+) -> list[dict[str, Any]]:
+    """Move a unique replacement open ahead of plans meant for its new side."""
+    if trailing_replacement_side(actions, trailing_active) is None:
+        return list(actions)
+    open_index = next(
+        index
+        for index, action in enumerate(actions)
+        if action.get("type") in {"OPEN_LONG", "OPEN_SHORT"}
+    )
+    before = actions[:open_index]
+    deferred_types = {"ADD", "SET_STOP", "SET_TP"}
+    prefix = [a for a in before if a.get("type") not in deferred_types]
+    deferred = [a for a in before if a.get("type") in deferred_types]
+    return [*prefix, actions[open_index], *deferred, *actions[open_index + 1 :]]
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -905,11 +938,17 @@ def preflight_and_correct_add_stop_prices(
     reference: Decimal,
     position: dict[str, Any],
     config: ContractConfig,
+    *,
+    allow_pair_correction: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     normalized = [dict(action) for action in actions]
     corrections: list[dict[str, Any]] = []
-    pair = _paired_add_stop_typo_correction(
-        normalized, reference, position, config
+    pair = (
+        _paired_add_stop_typo_correction(
+            normalized, reference, position, config
+        )
+        if allow_pair_correction
+        else None
     )
     if pair is not None:
         normalized, corrections = pair
@@ -2042,6 +2081,12 @@ async def run_bot() -> None:
                             source_text, list(parsed["actions"])
                         )
                         record["model_actions"] = [dict(action) for action in actions]
+                        trailing_active = bool(
+                            state.data["pending"].get("trailing_order")
+                        )
+                        replacement_side = trailing_replacement_side(
+                            actions, trailing_active
+                        )
 
                         if (
                             D(state.data["position"].get("total_qty")) > 0
@@ -2058,7 +2103,11 @@ async def run_bot() -> None:
                                 price_corrections,
                                 price_rejections,
                             ) = preflight_and_correct_add_stop_prices(
-                                actions, reference, position, config
+                                actions,
+                                reference,
+                                position,
+                                config,
+                                allow_pair_correction=replacement_side is None,
                             )
                             if price_corrections:
                                 record["price_corrections"] = price_corrections
@@ -2112,7 +2161,9 @@ async def run_bot() -> None:
                             for action in actions
                         ):
                             reference = await engine.reference_price()
-                            position_side = str(engine.require_position()["side"])
+                            position_side = replacement_side or str(
+                                engine.require_position()["side"]
+                            )
                             (
                                 actions,
                                 rejected_actions,
@@ -2127,6 +2178,9 @@ async def run_bot() -> None:
                             if deduplicated_actions:
                                 record["deduplicated_actions"] = deduplicated_actions
 
+                        actions = prioritize_trailing_replacement_open(
+                            actions, trailing_active
+                        )
                         actions = prioritize_cancel_actions(actions)
                         record["actions"] = actions
 

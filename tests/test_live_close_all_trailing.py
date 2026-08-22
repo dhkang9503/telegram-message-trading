@@ -328,6 +328,45 @@ def test_directional_open_closes_trailing_position_then_opens_new_one(
     assert state.data["pending"]["trailing_order"] is None
 
 
+@pytest.mark.parametrize(
+    ("initial_action", "replacement_action", "stop_price", "expected_side"),
+    [
+        ("OPEN_LONG", "OPEN_SHORT", 64500, "short"),
+        ("OPEN_SHORT", "OPEN_LONG", 63300, "long"),
+    ],
+)
+def test_replacement_batch_validates_and_sets_stop_for_new_position_side(
+    rig, initial_action, replacement_action, stop_price, expected_side
+):
+    engine, api, state = rig
+    execute(engine, initial_action)
+    set_roe(api, "20")
+    execute(engine, "CLOSE_ALL", message_id=2)
+    actions = [
+        {"type": "SET_STOP", "price": stop_price},
+        {"type": replacement_action, "price": None},
+    ]
+
+    replacement_side = live.trailing_replacement_side(actions, True)
+    validated, rejected, _ = live.validate_and_deduplicate_stop_actions(
+        actions, api.mark_price, replacement_side, engine.config
+    )
+    ordered = live.prioritize_cancel_actions(
+        live.prioritize_trailing_replacement_open(validated, True)
+    )
+    for index, action in enumerate(ordered):
+        run(engine.execute(action, 3, index, "replacement with stop"))
+
+    assert rejected == []
+    assert [action["type"] for action in ordered] == [
+        replacement_action,
+        "SET_STOP",
+    ]
+    assert state.data["position"]["side"] == expected_side
+    assert state.data["pending"]["stop_order"]["price"] == str(stop_price)
+    assert state.data["pending"]["trailing_order"] is None
+
+
 def test_missing_exchange_trailing_plan_forces_market_close(rig):
     engine, api, state = rig
     arm_trailing(engine, api)
