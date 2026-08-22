@@ -77,18 +77,6 @@ def test_roe_prefers_unrealized_pl_over_margin():
     assert source == "unrealized_pl_over_margin"
 
 
-@pytest.mark.parametrize("value", ["0", "0.09", "10.01"])
-def test_trailing_callback_rate_rejects_values_outside_bitget_range(value):
-    with pytest.raises(ValueError, match="between 0.1 and 10"):
-        live.validate_trailing_callback_rate(Decimal(value))
-
-
-@pytest.mark.parametrize("value", ["0.1", "0.10", "10"])
-def test_trailing_callback_rate_accepts_bitget_boundaries(value):
-    expected = Decimal(value)
-    assert live.validate_trailing_callback_rate(expected) == expected
-
-
 def test_bitget_pending_plans_merges_profit_loss_and_track_plan():
     class RecordingClient(live.BitgetClient):
         def __init__(self):

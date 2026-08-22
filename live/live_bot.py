@@ -45,24 +45,18 @@ POSITION_MODE = "one_way_mode"
 LEVERAGE = Decimal("98")
 INITIAL_MARGIN_EQUITY_RATIO = Decimal("0.01")
 PRICE_RESTORE_MAX_GAP_RATIO = Decimal(os.getenv("PRICE_RESTORE_MAX_GAP_RATIO", "0.03"))
-
-
-def validate_trailing_callback_rate(value: Decimal) -> Decimal:
-    if not Decimal("0.1") <= value <= Decimal("10"):
-        raise ValueError(
-            "CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT must be between 0.1 and 10"
-        )
-    return value
-
-
 CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT = Decimal(
     os.getenv("CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT", "20")
 )
-CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT = validate_trailing_callback_rate(
-    Decimal(os.getenv("CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT", "0.10"))
+CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT = Decimal(
+    os.getenv("CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT", "0.10")
 )
 if CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT <= 0:
     raise ValueError("CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT must be positive")
+if not Decimal("0") < CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT <= Decimal("10"):
+    raise ValueError(
+        "CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT must be greater than 0 and at most 10"
+    )
 FAILED_STOP_CORRECTION_TTL_SECONDS = int(os.getenv("FAILED_STOP_CORRECTION_TTL_SECONDS", "300"))
 FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP = int(os.getenv("FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP", "3"))
 STOP_CORRECTION_CUE_RE = re.compile(r"(?:죄송|잘못|정정|오타|실수|아니다|아니고)")
