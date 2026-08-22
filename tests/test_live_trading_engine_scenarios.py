@@ -264,6 +264,7 @@ class FakeBitgetClient:
             size=size,
             range_rate=range_rate,
             client_oid=client_oid,
+            existing_plan_types=[row.get("planType") for row in self.plan_rows],
         )
         if self.fail_next_place_trailing:
             error = self.fail_next_place_trailing

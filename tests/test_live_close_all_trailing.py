@@ -197,10 +197,12 @@ def test_close_all_cancels_stop_and_tp_before_arming_trailing(rig):
     execute(engine, "CLOSE_ALL", message_id=4)
 
     assert [call["method"] for call in mutations(api, start)] == [
-        "cancel_plan",
-        "cancel_plan",
         "place_trailing_plan",
+        "cancel_plan",
+        "cancel_plan",
     ]
+    placed = mutations(api, start)[0]
+    assert set(placed["existing_plan_types"]) == {"pos_loss", "pos_profit"}
     assert len(api.plan_rows) == 1
     assert api.plan_rows[0]["planType"] == "moving_plan"
     assert state.data["pending"]["stop_order"] is None
@@ -226,6 +228,29 @@ def test_trailing_registration_failure_falls_back_to_market_close(rig):
         event["event"] == "CLOSE_ALL_TRAILING_FAILED_MARKET_FALLBACK"
         for event in engine.events
     )
+
+
+def test_trailing_failure_keeps_existing_protection_until_market_fallback(rig):
+    engine, api, _ = rig
+    execute(engine, "OPEN_LONG")
+    execute(engine, "SET_STOP", 63000, message_id=2)
+    execute(engine, "SET_TP", None, message_id=3)
+    set_roe(api, "30")
+    api.fail_next_place_trailing = BotError("injected trailing failure")
+    start = len(api.calls)
+
+    execute(engine, "CLOSE_ALL", message_id=4)
+
+    calls = mutations(api, start)
+    assert [call["method"] for call in calls] == [
+        "place_trailing_plan",
+        "cancel_plan",
+        "cancel_plan",
+        "flash_close",
+    ]
+    assert set(calls[0]["existing_plan_types"]) == {"pos_loss", "pos_profit"}
+    assert api.position_row is None
+    assert api.plan_rows == []
 
 
 def test_unconfirmed_trailing_is_cancelled_before_market_fallback(rig):

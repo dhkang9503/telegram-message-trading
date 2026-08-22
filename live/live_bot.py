@@ -1695,9 +1695,6 @@ class TradingEngine:
         message_id: int,
         index: int,
     ) -> dict[str, Any]:
-        for slot in ("stop_order", "tp_order"):
-            await self.cancel_plan_slot(slot)
-
         qty = D(actual.get("total"))
         if qty <= 0:
             raise BotError("Cannot arm a trailing plan without a positive position size")
@@ -1743,6 +1740,11 @@ class TradingEngine:
         self.state.data["pending"]["trailing_order"] = record
         self.state.save()
         await self.wait_for_trailing_plan(order_id)
+        # Keep the existing stop/TP protection until Bitget confirms the new
+        # trailing plan. A crash or timeout before this point therefore leaves
+        # the leveraged position protected rather than in a plan-less gap.
+        for slot in ("stop_order", "tp_order"):
+            await self.cancel_plan_slot(slot)
         self.log("CLOSE_ALL_TRAILING_ARMED", trailing_order=record.copy())
         return {
             "trailing": True,
