@@ -83,7 +83,9 @@ class FakeBitgetClient:
         self.account_calls = 0
         self.next_id = 1
         self.fail_next_place_order: Exception | None = None
+        self.fail_next_place_trailing: Exception | None = None
         self.fail_cancel_order_ids: set[str] = set()
+        self.fail_cancel_plan_ids: set[str] = set()
 
     def new_id(self, prefix: str) -> str:
         value = f"{prefix}-{self.next_id}"
@@ -106,7 +108,19 @@ class FakeBitgetClient:
         return {"markPrice": live.ds(self.mark_price), "lastPr": live.ds(self.mark_price)}
 
     async def position(self):
-        return copy.deepcopy(self.position_row)
+        row = copy.deepcopy(self.position_row)
+        if row is None:
+            return None
+        row.setdefault("markPrice", live.ds(self.mark_price))
+        row.setdefault("leverage", live.ds(live.LEVERAGE))
+        if "unrealizedPL" not in row:
+            direction = Decimal("1") if row["holdSide"] == "long" else Decimal("-1")
+            row["unrealizedPL"] = live.ds(
+                (self.mark_price - D(row["openPriceAvg"]))
+                * D(row["total"])
+                * direction
+            )
+        return row
 
     async def pending_orders(self):
         return copy.deepcopy(self.order_rows)
@@ -234,8 +248,45 @@ class FakeBitgetClient:
         )
         return {"orderId": order_id}
 
+    async def place_trailing_plan(
+        self,
+        *,
+        hold_side,
+        trigger_price,
+        size,
+        range_rate,
+        client_oid,
+    ):
+        self.record(
+            "place_trailing_plan",
+            hold_side=hold_side,
+            trigger_price=trigger_price,
+            size=size,
+            range_rate=range_rate,
+            client_oid=client_oid,
+        )
+        if self.fail_next_place_trailing:
+            error = self.fail_next_place_trailing
+            self.fail_next_place_trailing = None
+            raise error
+        order_id = self.new_id("trailing")
+        self.plan_rows.append(
+            {
+                "orderId": order_id,
+                "clientOid": client_oid,
+                "triggerPrice": live.ds(trigger_price),
+                "planType": "moving_plan",
+                "holdSide": hold_side,
+                "size": live.ds(size),
+                "rangeRate": live.ds(range_rate),
+            }
+        )
+        return {"orderId": order_id}
+
     async def cancel_plan(self, order_id: str, plan_type: str):
         self.record("cancel_plan", order_id=order_id, plan_type=plan_type)
+        if order_id in self.fail_cancel_plan_ids:
+            raise BotError(f"Injected plan cancel failure: {order_id}")
         self.plan_rows = [
             row for row in self.plan_rows if str(row["orderId"]) != str(order_id)
         ]
@@ -270,6 +321,10 @@ class ScenarioEngine(live.TradingEngine):
 
     async def wait_change(self, before: Decimal, increase: bool):
         return None
+
+    async def wait_until_flat(self):
+        if await self.api.position() is not None:
+            raise BotError("Fake exchange position did not become flat")
 
 
 @pytest.fixture
@@ -306,7 +361,14 @@ def execute(engine, action_type, price=None, message_id=1, index=0, source="test
 
 
 def mutations(api, start=0):
-    names = {"place_order", "cancel_order", "place_plan", "cancel_plan", "flash_close"}
+    names = {
+        "place_order",
+        "cancel_order",
+        "place_plan",
+        "place_trailing_plan",
+        "cancel_plan",
+        "flash_close",
+    }
     return [call for call in api.calls[start:] if call["method"] in names]
 
 

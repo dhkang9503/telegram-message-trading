@@ -159,6 +159,7 @@ def test_partial_initial_limit_fill_can_be_closed_without_leaving_remainder():
     assert partial_qty >= config.min_trade_num
 
     set_partial_long_position(api, partial_qty, Decimal("63000"))
+    api.mark_price = Decimal("63000")
     run(engine.reconcile())
 
     assert D(state.data["position"]["total_qty"]) == partial_qty

@@ -45,6 +45,18 @@ POSITION_MODE = "one_way_mode"
 LEVERAGE = Decimal("98")
 INITIAL_MARGIN_EQUITY_RATIO = Decimal("0.01")
 PRICE_RESTORE_MAX_GAP_RATIO = Decimal(os.getenv("PRICE_RESTORE_MAX_GAP_RATIO", "0.03"))
+CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT = Decimal(
+    os.getenv("CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT", "20")
+)
+CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT = Decimal(
+    os.getenv("CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT", "0.10")
+)
+if CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT <= 0:
+    raise ValueError("CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT must be positive")
+if not Decimal("0") < CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT <= Decimal("10"):
+    raise ValueError(
+        "CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT must be greater than 0 and at most 10"
+    )
 FAILED_STOP_CORRECTION_TTL_SECONDS = int(os.getenv("FAILED_STOP_CORRECTION_TTL_SECONDS", "300"))
 FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP = int(os.getenv("FAILED_STOP_CORRECTION_MAX_MESSAGE_GAP", "3"))
 STOP_CORRECTION_CUE_RE = re.compile(r"(?:죄송|잘못|정정|오타|실수|아니다|아니고)")
@@ -129,6 +141,37 @@ def initial_margin_from_account(
     return equity, equity * INITIAL_MARGIN_EQUITY_RATIO
 
 
+def position_roe_percent(
+    position: dict[str, Any], reference_price: Optional[Decimal] = None
+) -> tuple[Decimal, str]:
+    """Return gross position ROE percent without subtracting fees or funding."""
+    raw_unrealized = position.get("unrealizedPL")
+    raw_margin = position.get("marginSize")
+    if raw_unrealized not in {None, ""} and raw_margin not in {None, ""}:
+        try:
+            margin = D(raw_margin)
+            if margin > 0:
+                return D(raw_unrealized) / margin * Decimal("100"), "unrealized_pl_over_margin"
+        except (ArithmeticError, TypeError, ValueError):
+            pass
+
+    try:
+        entry = D(position.get("openPriceAvg"))
+        mark = D(position.get("markPrice"))
+        if mark <= 0 and reference_price is not None:
+            mark = reference_price
+        leverage = D(position.get("leverage"), ds(LEVERAGE))
+        side = str(position.get("holdSide"))
+        if entry <= 0 or mark <= 0 or leverage <= 0 or side not in {"long", "short"}:
+            raise ValueError("invalid price-based ROE inputs")
+        price_return = (mark - entry) / entry
+        if side == "short":
+            price_return = -price_return
+        return price_return * leverage * Decimal("100"), "price_return_times_leverage"
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise BotError("Cannot calculate current position ROE") from exc
+
+
 def ds(value: Decimal) -> str:
     return format(value.normalize(), "f")
 
@@ -173,6 +216,7 @@ def default_state() -> dict[str, Any]:
             "add_orders": [],
             "stop_order": None,
             "tp_order": None,
+            "trailing_order": None,
             "failed_stop": None,
         },
         "stopped_position": None,
@@ -205,6 +249,7 @@ class StateStore:
         pending.setdefault("add_orders", [])
         pending.setdefault("stop_order", None)
         pending.setdefault("tp_order", None)
+        pending.setdefault("trailing_order", None)
         pending.setdefault("failed_stop", None)
         self.data.setdefault("processed_message_ids", [])
         self.data.setdefault("last_telegram_message_id", None)
@@ -441,6 +486,32 @@ class BitgetClient:
                 "triggerType": "mark_price",
                 "executePrice": "0",
                 "holdSide": hold_side,
+                "clientOid": client_oid,
+            },
+        )
+
+    async def place_trailing_plan(
+        self,
+        *,
+        hold_side: str,
+        trigger_price: Decimal,
+        size: Decimal,
+        range_rate: Decimal,
+        client_oid: str,
+    ) -> dict[str, Any]:
+        return await self.request(
+            "POST",
+            "/api/v2/mix/order/place-tpsl-order",
+            body={
+                "marginCoin": MARGIN_COIN,
+                "productType": PRODUCT_TYPE,
+                "symbol": SYMBOL,
+                "planType": "moving_plan",
+                "triggerPrice": ds(trigger_price),
+                "triggerType": "mark_price",
+                "holdSide": hold_side,
+                "size": ds(size),
+                "rangeRate": ds(range_rate),
                 "clientOid": client_oid,
             },
         )
@@ -948,7 +1019,30 @@ class TradingEngine:
         previous_position = self.state.data["position"].copy()
         previous_stop = self.state.data["pending"].get("stop_order")
         previous_stop = previous_stop.copy() if previous_stop else None
+        previous_trailing = self.state.data["pending"].get("trailing_order")
+        previous_trailing = previous_trailing.copy() if previous_trailing else None
         became_flat = actual is None and D(previous_position.get("total_qty")) > 0
+
+        live_trailing_ids = {
+            str(row.get("orderId"))
+            for row in plans
+            if str(row.get("planType")) == "moving_plan"
+        }
+        if (
+            previous_trailing
+            and actual is not None
+            and str(previous_trailing.get("order_id")) not in live_trailing_ids
+        ):
+            self.log(
+                "TRAILING_STATE_MISSING_MARKET_CLOSED",
+                trailing_order=previous_trailing,
+            )
+            await self.api.flash_close()
+            await self.wait_until_flat()
+            actual = await self.api.position()
+            orders = await self.api.pending_orders()
+            plans = await self.api.pending_plans()
+            became_flat = actual is None and D(previous_position.get("total_qty")) > 0
 
         # If a stop/TP/manual close flattened the position, cancel all bot opening
         # orders before they can unexpectedly reopen it.
@@ -1091,11 +1185,15 @@ class TradingEngine:
     def _reconcile_plans(self, rows: list[dict[str, Any]]) -> None:
         stops = [r for r in rows if str(r.get("planType")) in {"loss_plan", "pos_loss"}]
         tps = [r for r in rows if str(r.get("planType")) in {"profit_plan", "pos_profit"}]
-        if len(stops) > 1 or len(tps) > 1:
-            raise BotError("Multiple BTC stop-loss or take-profit plans exist")
+        trailings = [r for r in rows if str(r.get("planType")) == "moving_plan"]
+        if len(stops) > 1 or len(tps) > 1 or len(trailings) > 1:
+            raise BotError("Multiple BTC stop-loss, take-profit, or trailing plans exist")
         pending = self.state.data["pending"]
         pending["stop_order"] = self._plan_record(stops[0]) if stops else None
         pending["tp_order"] = self._plan_record(tps[0]) if tps else None
+        pending["trailing_order"] = (
+            self._plan_record(trailings[0]) if trailings else None
+        )
 
     @staticmethod
     def _plan_record(row: dict[str, Any]) -> dict[str, Any]:
@@ -1104,6 +1202,10 @@ class TradingEngine:
             "client_oid": str(row.get("clientOid", "")),
             "price": str(row.get("triggerPrice", "")),
             "plan_type": str(row.get("planType")),
+            "qty": str(row.get("size", "")),
+            "callback_rate_pct": str(
+                row.get("rangeRate") or row.get("callbackRatio") or ""
+            ),
             "created_at": now_iso(),
         }
 
@@ -1118,6 +1220,7 @@ class TradingEngine:
             self.state.data["position"] = empty_position()
             self.state.data["pending"]["stop_order"] = None
             self.state.data["pending"]["tp_order"] = None
+            self.state.data["pending"]["trailing_order"] = None
             self.state.data["pending"]["failed_stop"] = None
             return
         total = D(actual.get("total"))
@@ -1271,6 +1374,28 @@ class TradingEngine:
             if (increase and total > before) or ((not increase) and total < before):
                 return
 
+    async def wait_until_flat(self) -> None:
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            pos = await self.api.position()
+            if pos is None or D(pos.get("total")) <= 0:
+                return
+            await asyncio.sleep(0.25)
+        raise BotError("Timed out waiting for the position to become flat")
+
+    async def wait_for_trailing_plan(self, order_id: str) -> dict[str, Any]:
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            rows = await self.api.pending_plans()
+            for row in rows:
+                if (
+                    str(row.get("orderId")) == order_id
+                    and str(row.get("planType")) == "moving_plan"
+                ):
+                    return row
+            await asyncio.sleep(0.25)
+        raise BotError(f"Trailing plan {order_id} was not confirmed on Bitget")
+
     async def cancel_adds(self) -> list[str]:
         cancelled = []
         for item in list(self.state.data["pending"]["add_orders"]):
@@ -1293,7 +1418,12 @@ class TradingEngine:
         item = self.state.data["pending"][slot]
         if not item:
             return None
-        plan_type = str(item.get("plan_type") or ("pos_loss" if slot == "stop_order" else "pos_profit"))
+        fallback_types = {
+            "stop_order": "pos_loss",
+            "tp_order": "pos_profit",
+            "trailing_order": "moving_plan",
+        }
+        plan_type = str(item.get("plan_type") or fallback_types[slot])
         await self.api.cancel_plan(str(item["order_id"]), plan_type)
         self.state.data["pending"][slot] = None
         self.state.save()
@@ -1481,6 +1611,91 @@ class TradingEngine:
         self.log("POSITION_REDUCED", reason=reason, qty=ds(qty), order_id=str(result.get("orderId")), client_oid=coid)
         return {"order_id": str(result.get("orderId")), "qty": ds(qty)}
 
+    async def _market_close_all(self, reason: str) -> dict[str, Any]:
+        for slot in ("stop_order", "tp_order", "trailing_order"):
+            try:
+                await self.cancel_plan_slot(slot)
+            except Exception as exc:
+                self.log(
+                    "PLAN_CANCEL_BEFORE_CLOSE_FAILED",
+                    slot=slot,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+        result = await self.api.flash_close()
+        await self.wait_until_flat()
+        await self.reconcile()
+        if D(self.state.data["position"]["total_qty"]) > 0:
+            raise BotError("Market close returned but a position still remains")
+        self.log("POSITION_CLOSED_ALL", reason=reason, result=result)
+        return {"result": result}
+
+    async def _arm_close_all_trailing(
+        self,
+        *,
+        actual: dict[str, Any],
+        roe: Decimal,
+        roe_source: str,
+        message_id: int,
+        index: int,
+    ) -> dict[str, Any]:
+        for slot in ("stop_order", "tp_order"):
+            await self.cancel_plan_slot(slot)
+
+        qty = D(actual.get("total"))
+        if qty <= 0:
+            raise BotError("Cannot arm a trailing plan without a positive position size")
+        raw_mark = D(actual.get("markPrice"))
+        if raw_mark <= 0:
+            raw_mark = await self.reference_price()
+        side = str(actual.get("holdSide"))
+        if side not in {"long", "short"}:
+            raise BotError(f"Cannot arm a trailing plan for position side {side!r}")
+        trigger = self.config.floor_price(raw_mark)
+        # A long trailing close activates at/above its trigger, while a short
+        # trailing close activates at/below it. Round toward the already-met
+        # side so both directions start immediately at the current mark.
+        if side == "short" and trigger < raw_mark:
+            trigger += self.config.price_step
+
+        coid = client_oid(message_id, index, "trail")
+        result = await self.api.place_trailing_plan(
+            hold_side="buy" if side == "long" else "sell",
+            trigger_price=trigger,
+            size=qty,
+            range_rate=CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT,
+            client_oid=coid,
+        )
+        order_id = str(result.get("orderId") or "")
+        if not order_id:
+            raise BotError("Bitget did not return an orderId for the trailing plan")
+
+        record = {
+            "order_id": order_id,
+            "client_oid": coid,
+            "price": ds(trigger),
+            "plan_type": "moving_plan",
+            "qty": ds(qty),
+            "callback_rate_pct": ds(CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT),
+            "armed_roe_pct": ds(roe),
+            "roe_source": roe_source,
+            "side": side,
+            "created_at": now_iso(),
+        }
+        # Persist the ID before confirmation so the fallback path can cancel a
+        # plan that Bitget accepted but did not immediately expose in its query.
+        self.state.data["pending"]["trailing_order"] = record
+        self.state.save()
+        await self.wait_for_trailing_plan(order_id)
+        self.log("CLOSE_ALL_TRAILING_ARMED", trailing_order=record.copy())
+        return {
+            "trailing": True,
+            "order_id": order_id,
+            "trigger_price": ds(trigger),
+            "callback_rate_pct": ds(CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT),
+            "roe_pct": ds(roe),
+            "roe_source": roe_source,
+        }
+
     async def close_all(self, message_id: int, index: int, reason: str = "CLOSE_ALL") -> dict[str, Any]:
         has_position = D(self.state.data["position"]["total_qty"]) > 0
         pending_entry = self.state.data["pending"]["entry_order"] is not None
@@ -1492,17 +1707,99 @@ class TradingEngine:
                 self.log("OPENING_ORDERS_CANCELLED_WHILE_FLAT", reason=reason)
                 return {"flat": True, "opening_orders_cancelled": True}
             raise BotError("CLOSE_ALL rejected: no position or pending opening order")
-        for slot in ("stop_order", "tp_order"):
+
+        actual = await self.api.position()
+        if actual is None or D(actual.get("total")) <= 0:
+            await self.reconcile()
+            return {"flat": True, "opening_orders_cancelled": pending_entry or pending_add}
+        if reason != "CLOSE_ALL":
+            return await self._market_close_all(reason)
+
+        try:
             try:
-                await self.cancel_plan_slot(slot)
-            except BitgetAPIError as exc:
-                self.log("PLAN_CANCEL_BEFORE_CLOSE_FAILED", slot=slot, error=str(exc))
-        before = D(self.state.data["position"]["total_qty"])
-        result = await self.api.flash_close()
-        await self.wait_change(before, False)
-        await self.reconcile()
-        self.log("POSITION_CLOSED_ALL", reason=reason, result=result)
-        return {"result": result}
+                roe, roe_source = position_roe_percent(actual)
+            except BotError:
+                roe, roe_source = position_roe_percent(
+                    actual, await self.reference_price()
+                )
+        except Exception as exc:
+            self.log(
+                "CLOSE_ALL_ROE_UNAVAILABLE_MARKET_FALLBACK",
+                reason=reason,
+                error=str(exc),
+            )
+            return await self._market_close_all(reason)
+
+        self.log(
+            "CLOSE_ALL_ROE_EVALUATED",
+            reason=reason,
+            roe_pct=ds(roe),
+            roe_source=roe_source,
+            threshold_pct=ds(CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT),
+        )
+        if roe < CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT:
+            self.log(
+                "CLOSE_ALL_BELOW_THRESHOLD_MARKET_CLOSE",
+                roe_pct=ds(roe),
+                threshold_pct=ds(CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT),
+            )
+            return await self._market_close_all(reason)
+
+        try:
+            return await self._arm_close_all_trailing(
+                actual=actual,
+                roe=roe,
+                roe_source=roe_source,
+                message_id=message_id,
+                index=index,
+            )
+        except Exception as exc:
+            self.log(
+                "CLOSE_ALL_TRAILING_FAILED_MARKET_FALLBACK",
+                reason=reason,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return await self._market_close_all(
+                f"{reason}_TRAILING_FAILED_FALLBACK"
+            )
+
+    async def replace_trailing_with_open(
+        self,
+        action_type: str,
+        raw_price: Any,
+        message_id: int,
+        index: int,
+    ) -> dict[str, Any]:
+        trailing = self.state.data["pending"]["trailing_order"]
+        self.log(
+            "TRAILING_REPLACED_BY_OPEN_STARTED",
+            action_type=action_type,
+            trailing_order=trailing.copy() if trailing else None,
+        )
+        closed = await self._market_close_all(
+            f"TRAILING_REPLACED_BY_{action_type}"
+        )
+        remaining_exit_plans = [
+            row
+            for row in await self.api.pending_plans()
+            if str(row.get("planType"))
+            in {"loss_plan", "pos_loss", "profit_plan", "pos_profit", "moving_plan"}
+        ]
+        if remaining_exit_plans:
+            raise BotError(
+                "Old exit plans remain after closing the trailing position; new open aborted"
+            )
+        opened = await self.open(action_type, raw_price, message_id, index)
+        self.log(
+            "TRAILING_REPLACED_BY_OPEN_COMPLETED",
+            action_type=action_type,
+            open_result=opened,
+        )
+        return {
+            "transition": "trailing_replaced_by_open",
+            "close": closed,
+            "open": opened,
+        }
 
     async def set_plan(self, stop: bool, raw_price: Any, message_id: int, index: int) -> dict[str, Any]:
         pos = self.require_position()
@@ -1569,6 +1866,27 @@ class TradingEngine:
     ) -> dict[str, Any]:
         await self.reconcile()
         kind, price = action["type"], action["price"]
+        trailing = self.state.data["pending"].get("trailing_order")
+        if trailing:
+            if kind in {"OPEN_LONG", "OPEN_SHORT"}:
+                return await self.replace_trailing_with_open(
+                    kind, price, message_id, index
+                )
+            event = (
+                "DUPLICATE_CLOSE_ALL_IGNORED_DURING_TRAILING"
+                if kind == "CLOSE_ALL"
+                else "ACTION_IGNORED_DURING_TRAILING"
+            )
+            self.log(
+                event,
+                action_type=kind,
+                trailing_order_id=str(trailing.get("order_id")),
+            )
+            return {
+                "skipped": "trailing_close_active",
+                "action_type": kind,
+                "trailing_order_id": str(trailing.get("order_id")),
+            }
         if kind in {"OPEN_LONG", "OPEN_SHORT", "OPEN_REENTRY"}:
             return await self.open(kind, price, message_id, index, action.get("side"))
         if kind == "ADD":
