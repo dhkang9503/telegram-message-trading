@@ -77,6 +77,31 @@ def test_roe_prefers_unrealized_pl_over_margin():
     assert source == "unrealized_pl_over_margin"
 
 
+def test_bitget_pending_plans_merges_profit_loss_and_track_plan():
+    class RecordingClient(live.BitgetClient):
+        def __init__(self):
+            self.calls = []
+
+        async def request(self, method, path, *, params=None, body=None, private=True):
+            self.calls.append({"method": method, "path": path, "params": params})
+            plan_type = params["planType"]
+            row = {
+                "orderId": f"{plan_type}-1",
+                "planType": "moving_plan" if plan_type == "track_plan" else "pos_loss",
+            }
+            return {"entrustedList": [row]}
+
+    client = RecordingClient()
+
+    rows = run(client.pending_plans())
+
+    assert {call["params"]["planType"] for call in client.calls} == {
+        "profit_loss",
+        "track_plan",
+    }
+    assert {row["planType"] for row in rows} == {"pos_loss", "moving_plan"}
+
+
 @pytest.mark.parametrize(
     ("side", "mark", "expected"),
     [("long", "102", "196"), ("short", "98", "196")],
@@ -295,6 +320,7 @@ def test_directional_open_closes_trailing_position_then_opens_new_one(
         "place_order",
     ]
     assert calls[0]["order_id"] == trailing_id
+    assert calls[0]["plan_type"] == "track_plan"
     assert calls[2]["reduce_only"] is False
     assert result["transition"] == "trailing_replaced_by_open"
     assert api.position_row["holdSide"] == expected_side

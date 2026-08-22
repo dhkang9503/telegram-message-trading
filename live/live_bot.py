@@ -398,11 +398,23 @@ class BitgetClient:
         return list(((data or {}).get("entrustedList") or []))
 
     async def pending_plans(self) -> list[dict[str, Any]]:
-        data = await self.request(
-            "GET", "/api/v2/mix/order/orders-plan-pending",
-            params={"symbol": SYMBOL, "planType": "profit_loss", "productType": PRODUCT_TYPE, "limit": "100"},
+        async def fetch(plan_type: str) -> list[dict[str, Any]]:
+            data = await self.request(
+                "GET",
+                "/api/v2/mix/order/orders-plan-pending",
+                params={
+                    "symbol": SYMBOL,
+                    "planType": plan_type,
+                    "productType": PRODUCT_TYPE,
+                    "limit": "100",
+                },
+            )
+            return list(((data or {}).get("entrustedList") or []))
+
+        profit_loss, track = await asyncio.gather(
+            fetch("profit_loss"), fetch("track_plan")
         )
-        return list(((data or {}).get("entrustedList") or []))
+        return [*profit_loss, *track]
 
     async def plan_history(self, order_id: str) -> list[dict[str, Any]]:
         data = await self.request(
@@ -1421,10 +1433,15 @@ class TradingEngine:
         fallback_types = {
             "stop_order": "pos_loss",
             "tp_order": "pos_profit",
-            "trailing_order": "moving_plan",
+            "trailing_order": "track_plan",
         }
-        plan_type = str(item.get("plan_type") or fallback_types[slot])
-        await self.api.cancel_plan(str(item["order_id"]), plan_type)
+        stored_plan_type = str(item.get("plan_type") or fallback_types[slot])
+        cancel_category = (
+            "track_plan"
+            if slot == "trailing_order" or stored_plan_type == "moving_plan"
+            else stored_plan_type
+        )
+        await self.api.cancel_plan(str(item["order_id"]), cancel_category)
         self.state.data["pending"][slot] = None
         self.state.save()
         return str(item["order_id"])

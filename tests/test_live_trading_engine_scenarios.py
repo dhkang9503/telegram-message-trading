@@ -287,6 +287,22 @@ class FakeBitgetClient:
         self.record("cancel_plan", order_id=order_id, plan_type=plan_type)
         if order_id in self.fail_cancel_plan_ids:
             raise BotError(f"Injected plan cancel failure: {order_id}")
+        target = next(
+            (
+                row
+                for row in self.plan_rows
+                if str(row["orderId"]) == str(order_id)
+            ),
+            None,
+        )
+        if (
+            target is not None
+            and target.get("planType") == "moving_plan"
+            and plan_type != "track_plan"
+        ):
+            raise BotError(
+                f"Moving plan cancellation requires track_plan, got {plan_type}"
+            )
         self.plan_rows = [
             row for row in self.plan_rows if str(row["orderId"]) != str(order_id)
         ]
