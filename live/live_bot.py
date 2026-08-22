@@ -563,7 +563,7 @@ class BitgetClient:
         )
 
     async def cancel_plan(self, order_id: str, plan_type: str) -> Any:
-        return await self.request(
+        result = await self.request(
             "POST", "/api/v2/mix/order/cancel-plan-order",
             body={
                 "orderIdList": [{"orderId": order_id, "clientOid": ""}],
@@ -573,6 +573,22 @@ class BitgetClient:
                 "planType": plan_type,
             },
         )
+        success_ids = {
+            str(row.get("orderId"))
+            for row in (result or {}).get("successList", [])
+        }
+        if order_id not in success_ids:
+            failure = next(
+                (
+                    row
+                    for row in (result or {}).get("failureList", [])
+                    if str(row.get("orderId")) == order_id
+                ),
+                None,
+            )
+            detail = str((failure or {}).get("errorMsg") or "missing success confirmation")
+            raise BotError(f"Bitget did not cancel plan {order_id}: {detail}")
+        return result
 
 
 def normalize_message(message: Any) -> str:
@@ -1473,15 +1489,10 @@ class TradingEngine:
         fallback_types = {
             "stop_order": "pos_loss",
             "tp_order": "pos_profit",
-            "trailing_order": "track_plan",
+            "trailing_order": "moving_plan",
         }
         stored_plan_type = str(item.get("plan_type") or fallback_types[slot])
-        cancel_category = (
-            "track_plan"
-            if slot == "trailing_order" or stored_plan_type == "moving_plan"
-            else stored_plan_type
-        )
-        await self.api.cancel_plan(str(item["order_id"]), cancel_category)
+        await self.api.cancel_plan(str(item["order_id"]), stored_plan_type)
         self.state.data["pending"][slot] = None
         self.state.save()
         return str(item["order_id"])
@@ -1698,18 +1709,19 @@ class TradingEngine:
         qty = D(actual.get("total"))
         if qty <= 0:
             raise BotError("Cannot arm a trailing plan without a positive position size")
-        raw_mark = D(actual.get("markPrice"))
-        if raw_mark <= 0:
-            raw_mark = await self.reference_price()
         side = str(actual.get("holdSide"))
         if side not in {"long", "short"}:
             raise BotError(f"Cannot arm a trailing plan for position side {side!r}")
-        trigger = self.config.floor_price(raw_mark)
-        # A long trailing close activates at/above its trigger, while a short
-        # trailing close activates at/below it. Round toward the already-met
-        # side so both directions start immediately at the current mark.
-        if side == "short" and trigger < raw_mark:
-            trigger += self.config.price_step
+        fresh_mark = await self.reference_price()
+        # Put the activation price one tick beyond the current mark in the
+        # already-crossed direction. This avoids relying on a stale position
+        # snapshot while the request is in flight.
+        if side == "long":
+            trigger = self.config.floor_price(fresh_mark) - self.config.price_step
+            if trigger <= 0:
+                raise BotError(f"Cannot derive a positive trailing trigger from {fresh_mark}")
+        else:
+            trigger = self.config.floor_price(fresh_mark) + self.config.price_step
 
         coid = client_oid(message_id, index, "trail")
         result = await self.api.place_trailing_plan(
@@ -1740,6 +1752,17 @@ class TradingEngine:
         self.state.data["pending"]["trailing_order"] = record
         self.state.save()
         await self.wait_for_trailing_plan(order_id)
+        confirmation_mark = await self.reference_price()
+        activation_crossed = (
+            confirmation_mark >= trigger
+            if side == "long"
+            else confirmation_mark <= trigger
+        )
+        if not activation_crossed:
+            raise BotError(
+                "Trailing plan was registered but immediate activation could not be "
+                f"verified: side={side}, trigger={trigger}, mark={confirmation_mark}"
+            )
         # Keep the existing stop/TP protection until Bitget confirms the new
         # trailing plan. A crash or timeout before this point therefore leaves
         # the leveraged position protected rather than in a plan-less gap.

@@ -102,6 +102,55 @@ def test_bitget_pending_plans_merges_profit_loss_and_track_plan():
     assert {row["planType"] for row in rows} == {"pos_loss", "moving_plan"}
 
 
+def test_bitget_cancel_plan_uses_moving_plan_and_requires_success_confirmation():
+    class RecordingClient(live.BitgetClient):
+        def __init__(self):
+            self.calls = []
+
+        async def request(self, method, path, *, params=None, body=None, private=True):
+            self.calls.append({"method": method, "path": path, "body": body})
+            return {
+                "successList": [{"orderId": "trailing-1", "clientOid": ""}],
+                "failureList": [],
+            }
+
+    client = RecordingClient()
+
+    result = run(client.cancel_plan("trailing-1", "moving_plan"))
+
+    assert result["successList"][0]["orderId"] == "trailing-1"
+    assert client.calls == [
+        {
+            "method": "POST",
+            "path": "/api/v2/mix/order/cancel-plan-order",
+            "body": {
+                "orderIdList": [{"orderId": "trailing-1", "clientOid": ""}],
+                "symbol": live.SYMBOL,
+                "productType": live.PRODUCT_TYPE,
+                "marginCoin": live.MARGIN_COIN,
+                "planType": "moving_plan",
+            },
+        }
+    ]
+
+
+def test_bitget_cancel_plan_rejects_failure_list_response():
+    class FailingClient(live.BitgetClient):
+        def __init__(self):
+            pass
+
+        async def request(self, method, path, *, params=None, body=None, private=True):
+            return {
+                "successList": [],
+                "failureList": [
+                    {"orderId": "trailing-1", "errorMsg": "plan type mismatch"}
+                ],
+            }
+
+    with pytest.raises(BotError, match="plan type mismatch"):
+        run(FailingClient().cancel_plan("trailing-1", "moving_plan"))
+
+
 @pytest.mark.parametrize(
     ("side", "mark", "expected"),
     [("long", "102", "196"), ("short", "98", "196")],
@@ -164,7 +213,7 @@ def test_close_all_at_threshold_arms_full_size_trailing(rig):
     calls = mutations(api, start)
     assert [call["method"] for call in calls] == ["place_trailing_plan"]
     assert calls[0]["size"] == expected_qty
-    assert calls[0]["trigger_price"] == api.mark_price
+    assert calls[0]["trigger_price"] == api.mark_price - engine.config.price_step
     assert calls[0]["range_rate"] == Decimal("0.10")
     assert result["trailing"] is True
     assert result["roe_pct"] == "20"
@@ -186,7 +235,7 @@ def test_short_trailing_activation_rounds_up_to_start_immediately(rig):
     assert placed["trigger_price"] == Decimal("63900.1")
 
 
-def test_close_all_cancels_stop_and_tp_before_arming_trailing(rig):
+def test_close_all_cancels_stop_and_tp_after_confirming_trailing(rig):
     engine, api, state = rig
     execute(engine, "OPEN_LONG")
     execute(engine, "SET_STOP", 63000, message_id=2)
@@ -207,6 +256,49 @@ def test_close_all_cancels_stop_and_tp_before_arming_trailing(rig):
     assert api.plan_rows[0]["planType"] == "moving_plan"
     assert state.data["pending"]["stop_order"] is None
     assert state.data["pending"]["tp_order"] is None
+
+
+def test_adverse_move_before_activation_market_closes_with_old_protection_intact():
+    class AdverseMoveClient(FakeBitgetClient):
+        async def place_trailing_plan(self, **kwargs):
+            result = await super().place_trailing_plan(**kwargs)
+            self.mark_price -= Decimal("0.2")
+            return result
+
+    config = live.ContractConfig(
+        min_trade_num=Decimal("0.0001"),
+        min_trade_usdt=Decimal("5"),
+        size_step=Decimal("0.0001"),
+        price_step=Decimal("0.1"),
+        max_leverage=Decimal("125"),
+    )
+    api = AdverseMoveClient()
+    state = MemoryState()
+    engine = ScenarioEngine(api, state, config)
+    execute(engine, "OPEN_LONG")
+    execute(engine, "SET_STOP", 63000, message_id=2)
+    execute(engine, "SET_TP", None, message_id=3)
+    set_roe(api, "25")
+    start = len(api.calls)
+
+    result = execute(engine, "CLOSE_ALL", message_id=4)
+
+    calls = mutations(api, start)
+    assert result == {"result": {"closed": True}}
+    assert [call["method"] for call in calls] == [
+        "place_trailing_plan",
+        "cancel_plan",
+        "cancel_plan",
+        "cancel_plan",
+        "flash_close",
+    ]
+    assert set(calls[0]["existing_plan_types"]) == {"pos_loss", "pos_profit"}
+    assert api.position_row is None
+    assert api.plan_rows == []
+    assert any(
+        event["event"] == "CLOSE_ALL_TRAILING_FAILED_MARKET_FALLBACK"
+        for event in engine.events
+    )
 
 
 def test_trailing_registration_failure_falls_back_to_market_close(rig):
@@ -360,7 +452,7 @@ def test_directional_open_closes_trailing_position_then_opens_new_one(
         "place_order",
     ]
     assert calls[0]["order_id"] == trailing_id
-    assert calls[0]["plan_type"] == "track_plan"
+    assert calls[0]["plan_type"] == "moving_plan"
     assert calls[2]["reduce_only"] is False
     assert result["transition"] == "trailing_replaced_by_open"
     assert api.position_row["holdSide"] == expected_side

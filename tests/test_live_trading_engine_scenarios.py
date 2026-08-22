@@ -299,10 +299,10 @@ class FakeBitgetClient:
         if (
             target is not None
             and target.get("planType") == "moving_plan"
-            and plan_type != "track_plan"
+            and plan_type != "moving_plan"
         ):
             raise BotError(
-                f"Moving plan cancellation requires track_plan, got {plan_type}"
+                f"Moving plan cancellation requires moving_plan, got {plan_type}"
             )
         self.plan_rows = [
             row for row in self.plan_rows if str(row["orderId"]) != str(order_id)
