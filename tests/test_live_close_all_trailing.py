@@ -367,6 +367,26 @@ def test_replacement_batch_validates_and_sets_stop_for_new_position_side(
     assert state.data["pending"]["trailing_order"] is None
 
 
+def test_priced_replacement_is_rejected_before_touching_active_trailing(rig):
+    engine, api, state = rig
+    arm_trailing(engine, api)
+    trailing_id = state.data["pending"]["trailing_order"]["order_id"]
+    actions = [
+        {"type": "SET_STOP", "price": 64500},
+        {"type": "OPEN_SHORT", "price": 63800},
+    ]
+    start = len(api.calls)
+
+    assert live.trailing_replacement_side(actions, True) is None
+    assert live.prioritize_trailing_replacement_open(actions, True) == actions
+    with pytest.raises(BotError, match="Priced OPEN is not supported"):
+        run(engine.execute(actions[1], 3, 1, "priced replacement"))
+
+    assert mutations(api, start) == []
+    assert api.position_row is not None
+    assert state.data["pending"]["trailing_order"]["order_id"] == trailing_id
+
+
 def test_missing_exchange_trailing_plan_forces_market_close(rig):
     engine, api, state = rig
     arm_trailing(engine, api)

@@ -118,6 +118,7 @@ def trailing_replacement_side(
         str(action.get("type"))
         for action in actions
         if action.get("type") in {"OPEN_LONG", "OPEN_SHORT"}
+        and action.get("price") is None
     ]
     if len(replacements) != 1:
         return None
@@ -1827,6 +1828,16 @@ class TradingEngine:
         index: int,
     ) -> dict[str, Any]:
         trailing = self.state.data["pending"]["trailing_order"]
+        if raw_price is not None:
+            self.log(
+                "TRAILING_PRICED_REPLACEMENT_REJECTED",
+                action_type=action_type,
+                raw_price=raw_price,
+                trailing_order=trailing.copy() if trailing else None,
+            )
+            raise BotError(
+                "Priced OPEN is not supported while a trailing close is active"
+            )
         self.log(
             "TRAILING_REPLACED_BY_OPEN_STARTED",
             action_type=action_type,
