@@ -862,6 +862,209 @@ def _leading_digit_price_candidate(
     return text[0], candidate
 
 
+def _paired_price_candidates(
+    raw_price: Any,
+    reference: Decimal,
+    config: ContractConfig,
+) -> list[Decimal]:
+    """Return nearby BTC prices represented by a full or abbreviated token."""
+    raw = D(raw_price)
+    if raw >= 10000:
+        try:
+            return [restore_btc_price(raw_price, reference, config)]
+        except BotError:
+            return []
+
+    if isinstance(raw_price, str):
+        raw_text = raw_price.strip().replace(",", "")
+        parts = raw_text.split(".")
+        if (
+            len(parts) > 2
+            or not parts[0].isdigit()
+            or (len(parts) == 2 and not parts[1].isdigit())
+        ):
+            return []
+        integer_text = parts[0]
+    else:
+        integer_text = str(abs(int(raw)))
+
+    zero_fragment = (
+        isinstance(raw_price, str)
+        and raw == 0
+        and len(integer_text) > 1
+        and set(integer_text) == {"0"}
+    )
+    if raw < 0 or (raw == 0 and not zero_fragment):
+        return []
+
+    modulus = Decimal(10) ** len(integer_text)
+    base = (reference // modulus) * modulus
+    candidates = {
+        config.floor_price(price)
+        for price in (
+            base + raw - modulus,
+            base + raw,
+            base + raw + modulus,
+        )
+        if price > 0
+        and abs(price - reference) / reference <= PRICE_RESTORE_MAX_GAP_RATIO
+    }
+    return sorted(candidates)
+
+
+def _paired_abbreviated_add_stop_correction(
+    actions: list[dict[str, Any]],
+    reference: Decimal,
+    position: dict[str, Any],
+    config: ContractConfig,
+) -> Optional[tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
+    priced_adds = [
+        (index, action)
+        for index, action in enumerate(actions)
+        if action.get("type") == "ADD" and action.get("price") is not None
+    ]
+    priced_stops = [
+        (index, action)
+        for index, action in enumerate(actions)
+        if action.get("type") == "SET_STOP" and action.get("price") is not None
+    ]
+    if len(priced_adds) != 1 or len(priced_stops) != 1:
+        return None
+
+    add_index, add_action = priced_adds[0]
+    stop_index, stop_action = priced_stops[0]
+    if all(
+        D(action["price"]) >= 10000
+        for action in (add_action, stop_action)
+    ):
+        return None
+
+    add_candidates = _paired_price_candidates(
+        add_action["price"], reference, config
+    )
+    stop_candidates = _paired_price_candidates(
+        stop_action["price"], reference, config
+    )
+    if not add_candidates or not stop_candidates:
+        return None
+
+    side = str(position.get("side"))
+    entry = D(position.get("entry_price"))
+    if entry <= 0:
+        return None
+
+    valid_pairs: list[tuple[Decimal, Decimal]] = []
+    for add_candidate in add_candidates:
+        if abs(add_candidate - entry) / entry > PRICE_RESTORE_MAX_GAP_RATIO:
+            continue
+        for stop_candidate in stop_candidates:
+            if side == "long" and stop_candidate < add_candidate < entry:
+                valid_pairs.append((add_candidate, stop_candidate))
+            elif side == "short" and stop_candidate > add_candidate > entry:
+                valid_pairs.append((add_candidate, stop_candidate))
+    if not valid_pairs:
+        return None
+
+    def pair_score(pair: tuple[Decimal, Decimal]) -> tuple[Decimal, Decimal]:
+        distances = (
+            abs(pair[0] - reference),
+            abs(pair[1] - reference),
+        )
+        return sum(distances), max(distances)
+
+    ranked = sorted(valid_pairs, key=pair_score)
+    best_pair = ranked[0]
+    if len(ranked) > 1 and pair_score(ranked[1]) == pair_score(best_pair):
+        return None
+
+    try:
+        independently_restored = (
+            restore_btc_price(add_action["price"], reference, config),
+            restore_btc_price(stop_action["price"], reference, config),
+        )
+    except BotError:
+        independently_restored = None
+    if independently_restored == best_pair:
+        return None
+
+    corrected = [dict(action) for action in actions]
+    corrected[add_index]["price"] = _json_price(best_pair[0])
+    corrected[stop_index]["price"] = _json_price(best_pair[1])
+    corrections = [
+        {
+            "action_index": add_index,
+            "type": "ADD",
+            "original_price": add_action["price"],
+            "corrected_price": corrected[add_index]["price"],
+        },
+        {
+            "action_index": stop_index,
+            "type": "SET_STOP",
+            "original_price": stop_action["price"],
+            "corrected_price": corrected[stop_index]["price"],
+        },
+    ]
+    return corrected, corrections
+
+
+def _standalone_abbreviated_action_price(
+    action: dict[str, Any],
+    reference: Decimal,
+    position: dict[str, Any],
+    config: ContractConfig,
+) -> Decimal:
+    action_type = str(action.get("type"))
+    if action_type not in {"ADD", "SET_STOP"}:
+        raise BotError(f"Unsupported standalone price restoration: {action_type}")
+
+    raw_price = action.get("price")
+    candidates = _paired_price_candidates(raw_price, reference, config)
+    side = str(position.get("side"))
+    if side not in {"long", "short"}:
+        raise BotError(f"Invalid position side for price restoration: {side}")
+
+    if action_type == "ADD":
+        entry = D(position.get("entry_price"))
+        if entry <= 0:
+            raise BotError("ADD price restoration requires a positive entry price")
+        candidates = [
+            candidate
+            for candidate in candidates
+            if abs(candidate - entry) / entry <= PRICE_RESTORE_MAX_GAP_RATIO
+            and (
+                candidate < reference and candidate < entry
+                if side == "long"
+                else candidate > reference and candidate > entry
+            )
+        ]
+    else:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate < reference
+                if side == "long"
+                else candidate > reference
+            )
+        ]
+
+    if not candidates:
+        raise BotError(
+            "No position-valid price restoration candidate: "
+            f"action={action!r}, side={side}, reference={reference}"
+        )
+    ranked = sorted(candidates, key=lambda candidate: abs(candidate - reference))
+    if (
+        len(ranked) > 1
+        and abs(ranked[0] - reference) == abs(ranked[1] - reference)
+    ):
+        raise BotError(
+            "Ambiguous position-valid price restoration: "
+            f"action={action!r}, side={side}, reference={reference}, candidates={ranked!r}"
+        )
+    return ranked[0]
+
+
 def _paired_add_stop_typo_correction(
     actions: list[dict[str, Any]],
     reference: Decimal,
@@ -960,21 +1163,66 @@ def preflight_and_correct_add_stop_prices(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     normalized = [dict(action) for action in actions]
     corrections: list[dict[str, Any]] = []
-    pair = (
-        _paired_add_stop_typo_correction(
+    rejected: list[dict[str, Any]] = []
+    has_priced_pair = (
+        sum(
+            action.get("type") == "ADD" and action.get("price") is not None
+            for action in normalized
+        )
+        == 1
+        and sum(
+            action.get("type") == "SET_STOP"
+            and action.get("price") is not None
+            for action in normalized
+        )
+        == 1
+    )
+    pair = None
+    if allow_pair_correction:
+        pair = _paired_abbreviated_add_stop_correction(
             normalized, reference, position, config
         )
-        if allow_pair_correction
-        else None
-    )
+        if pair is None:
+            pair = _paired_add_stop_typo_correction(
+                normalized, reference, position, config
+            )
     if pair is not None:
         normalized, corrections = pair
+    elif allow_pair_correction and not has_priced_pair:
+        standalone_normalized: list[dict[str, Any]] = []
+        for index, action in enumerate(normalized):
+            raw_price = action.get("price")
+            if (
+                action.get("type") not in {"ADD", "SET_STOP"}
+                or raw_price is None
+                or D(raw_price) >= 10000
+            ):
+                standalone_normalized.append(action)
+                continue
+            try:
+                restored = _standalone_abbreviated_action_price(
+                    action, reference, position, config
+                )
+            except BotError as exc:
+                rejected.append({"action": action, "reason": str(exc)})
+                continue
+            corrected_action = dict(action)
+            corrected_action["price"] = _json_price(restored)
+            standalone_normalized.append(corrected_action)
+            corrections.append(
+                {
+                    "action_index": index,
+                    "type": str(action["type"]),
+                    "original_price": raw_price,
+                    "corrected_price": corrected_action["price"],
+                }
+            )
+        normalized = standalone_normalized
 
     # ADD used to fail only inside execute(), which prevented a later valid
-    # SET_STOP in the same message from running. Reject an impossible priced
-    # ADD here instead; SET_STOP keeps its existing dedicated validation.
+    # SET_STOP in the same message from running. Reject any remaining impossible
+    # priced ADD here; SET_STOP keeps its existing dedicated validation.
     accepted: list[dict[str, Any]] = []
-    rejected: list[dict[str, Any]] = []
     for action in normalized:
         if action.get("type") != "ADD" or action.get("price") is None:
             accepted.append(action)

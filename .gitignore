@@ -36,3 +36,4 @@ data/feedback/*.tmp
 
 # Keep repository placeholders
 !artifacts/README.md
+postmoterm/

@@ -841,6 +841,299 @@ def test_price_typo_pair_corrects_93860_93590_and_executes_both(rig):
     assert calls[1]["trigger_price"] == Decimal("63590")
 
 
+@pytest.mark.parametrize(
+    (
+        "open_action",
+        "entry_price",
+        "mark_price",
+        "source",
+        "model_actions",
+        "expected_add",
+        "expected_stop",
+    ),
+    [
+        pytest.param(
+            "OPEN_LONG",
+            "72865.7",
+            "72730.6",
+            "450물타기 140손절까지 걸게요!",
+            [
+                {"type": "ADD", "price": 450},
+                {"type": "SET_STOP", "price": 140},
+            ],
+            Decimal("72450"),
+            Decimal("72140"),
+            id="telegram-12448-long-add-450-stop-140",
+        ),
+        pytest.param(
+            "OPEN_SHORT",
+            "69292.4",
+            "69469.1",
+            "700물타기 110손절걸겠습니다!",
+            [
+                {"type": "ADD", "price": 700},
+                {"type": "SET_STOP", "price": 110},
+            ],
+            Decimal("69700"),
+            Decimal("70110"),
+            id="telegram-12124-short-add-700-stop-110",
+        ),
+        pytest.param(
+            "OPEN_SHORT",
+            "71136",
+            "71046",
+            "저 136이구 500물타기 걸어둿어요 손절 810",
+            [
+                {"type": "ADD", "price": 500},
+                {"type": "SET_STOP", "price": 810},
+            ],
+            Decimal("71500"),
+            Decimal("71810"),
+            id="telegram-14804-short-add-500-stop-810",
+        ),
+        pytest.param(
+            "OPEN_LONG",
+            "69765.8",
+            "69453",
+            "400물타기 090 손절 걸게요!",
+            [
+                {"type": "ADD", "price": 400},
+                {"type": "SET_STOP", "price": 90},
+            ],
+            Decimal("69400"),
+            Decimal("69090"),
+            id="telegram-12468-long-add-400-stop-090-control",
+        ),
+    ],
+)
+def test_abbreviated_add_and_stop_restore_using_position_direction(
+    rig,
+    open_action,
+    entry_price,
+    mark_price,
+    source,
+    model_actions,
+    expected_add,
+    expected_stop,
+):
+    engine, api, state, config = rig
+    api.mark_price = Decimal(entry_price)
+    execute(engine, open_action)
+    assert D(state.data["position"]["entry_price"]) == Decimal(entry_price)
+
+    api.mark_price = Decimal(mark_price)
+    actions = live.align_action_prices_to_source(source, model_actions)
+    actions, _, add_rejected = live.preflight_and_correct_add_stop_prices(
+        actions,
+        api.mark_price,
+        state.data["position"],
+        config,
+    )
+    actions, stop_rejected, deduplicated = (
+        live.validate_and_deduplicate_stop_actions(
+            actions,
+            api.mark_price,
+            state.data["position"]["side"],
+            config,
+        )
+    )
+
+    assert add_rejected == []
+    assert stop_rejected == []
+    assert deduplicated == []
+
+    start = len(api.calls)
+    for index, action in enumerate(actions):
+        run(engine.execute(action, 20000, index, source))
+
+    calls = mutations(api, start)
+    assert [call["method"] for call in calls] == ["place_order", "place_plan"]
+    assert calls[0]["price"] == expected_add
+    assert calls[1]["trigger_price"] == expected_stop
+
+
+@pytest.mark.parametrize(
+    (
+        "open_action",
+        "entry_price",
+        "mark_price",
+        "action_type",
+        "raw_price",
+        "source",
+        "expected_price",
+    ),
+    [
+        pytest.param(
+            "OPEN_LONG",
+            "72865.7",
+            "72730.6",
+            "ADD",
+            450,
+            "450물타기",
+            Decimal("72450"),
+            id="telegram-12448-long-standalone-add-450",
+        ),
+        pytest.param(
+            "OPEN_LONG",
+            "72865.7",
+            "72730.6",
+            "SET_STOP",
+            140,
+            "140손절까지 걸게요!",
+            Decimal("72140"),
+            id="telegram-12448-long-standalone-stop-140",
+        ),
+        pytest.param(
+            "OPEN_SHORT",
+            "69292.4",
+            "69469.1",
+            "ADD",
+            700,
+            "700물타기",
+            Decimal("69700"),
+            id="telegram-12124-short-standalone-add-700",
+        ),
+        pytest.param(
+            "OPEN_SHORT",
+            "69292.4",
+            "69469.1",
+            "SET_STOP",
+            110,
+            "110손절걸겠습니다!",
+            Decimal("70110"),
+            id="telegram-12124-short-standalone-stop-110",
+        ),
+        pytest.param(
+            "OPEN_SHORT",
+            "71136",
+            "71046",
+            "ADD",
+            500,
+            "500물타기 걸어둿어요",
+            Decimal("71500"),
+            id="telegram-14804-short-standalone-add-500",
+        ),
+        pytest.param(
+            "OPEN_SHORT",
+            "71136",
+            "71046",
+            "SET_STOP",
+            810,
+            "손절 810",
+            Decimal("71810"),
+            id="telegram-14804-short-standalone-stop-810",
+        ),
+        pytest.param(
+            "OPEN_LONG",
+            "69765.8",
+            "69453",
+            "ADD",
+            400,
+            "400물타기",
+            Decimal("69400"),
+            id="telegram-12468-long-standalone-add-400-control",
+        ),
+        pytest.param(
+            "OPEN_LONG",
+            "69765.8",
+            "69453",
+            "SET_STOP",
+            90,
+            "090 손절 걸게요!",
+            Decimal("69090"),
+            id="telegram-12468-long-standalone-stop-090-control",
+        ),
+        pytest.param(
+            "OPEN_LONG",
+            "74000",
+            "73200",
+            "ADD",
+            450,
+            "450물타기",
+            Decimal("72450"),
+            id="long-add-rejects-nearest-candidate-above-mark",
+        ),
+        pytest.param(
+            "OPEN_SHORT",
+            "68000",
+            "69000",
+            "ADD",
+            700,
+            "700물타기",
+            Decimal("69700"),
+            id="short-add-rejects-nearest-candidate-below-mark",
+        ),
+        pytest.param(
+            "OPEN_LONG",
+            "69000",
+            "70100",
+            "SET_STOP",
+            500,
+            "500손절",
+            Decimal("69500"),
+            id="long-profitable-stop-may-be-above-entry",
+        ),
+        pytest.param(
+            "OPEN_SHORT",
+            "71000",
+            "69900",
+            "SET_STOP",
+            500,
+            "500손절",
+            Decimal("70500"),
+            id="short-profitable-stop-may-be-below-entry",
+        ),
+    ],
+)
+def test_standalone_abbreviated_price_uses_position_direction(
+    rig,
+    open_action,
+    entry_price,
+    mark_price,
+    action_type,
+    raw_price,
+    source,
+    expected_price,
+):
+    engine, api, state, config = rig
+    api.mark_price = Decimal(entry_price)
+    execute(engine, open_action)
+    assert D(state.data["position"]["entry_price"]) == Decimal(entry_price)
+
+    api.mark_price = Decimal(mark_price)
+    actions = live.align_action_prices_to_source(
+        source, [{"type": action_type, "price": raw_price}]
+    )
+    actions, _, price_rejected = live.preflight_and_correct_add_stop_prices(
+        actions,
+        api.mark_price,
+        state.data["position"],
+        config,
+    )
+    actions, stop_rejected, deduplicated = (
+        live.validate_and_deduplicate_stop_actions(
+            actions,
+            api.mark_price,
+            state.data["position"]["side"],
+            config,
+        )
+    )
+
+    assert price_rejected == []
+    assert stop_rejected == []
+    assert deduplicated == []
+
+    start = len(api.calls)
+    for index, action in enumerate(actions):
+        run(engine.execute(action, 20001, index, source))
+
+    calls = mutations(api, start)
+    expected_method = "place_order" if action_type == "ADD" else "place_plan"
+    assert [call["method"] for call in calls] == [expected_method]
+    price_key = "price" if action_type == "ADD" else "trigger_price"
+    assert calls[0][price_key] == expected_price
+
+
 def test_single_bad_add_is_rejected_instead_of_guessed(rig):
     engine, api, state, config = rig
     api.mark_price = Decimal("64000")
