@@ -17,8 +17,17 @@ def source_nodes(*names: str) -> tuple[str, list[ast.AST], ast.AsyncFunctionDef]
     nodes = [
         node
         for node in module.body
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef))
-        and node.name in wanted
+        if (
+            isinstance(node, (ast.ClassDef, ast.FunctionDef))
+            and node.name in wanted
+        )
+        or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in wanted
+                for target in node.targets
+            )
+        )
     ]
     trading_engine = next(
         node
@@ -37,11 +46,11 @@ def load_initial_sizing():
     source, nodes, _ = source_nodes(
         "BotError",
         "D",
+        "INITIAL_MARGIN_EQUITY_RATIO",
         "initial_margin_from_account",
     )
     namespace = {
         "Decimal": Decimal,
-        "INITIAL_MARGIN_EQUITY_RATIO": Decimal("0.0125"),
     }
     exec(
         "from __future__ import annotations\n"
@@ -56,6 +65,7 @@ def load_open_flow():
     source, nodes, open_method = source_nodes(
         "BotError",
         "D",
+        "INITIAL_MARGIN_EQUITY_RATIO",
         "initial_margin_from_account",
         "ds",
         "restore_btc_price",
@@ -63,7 +73,6 @@ def load_open_flow():
     namespace = {
         "Decimal": Decimal,
         "ROUND_DOWN": ROUND_DOWN,
-        "INITIAL_MARGIN_EQUITY_RATIO": Decimal("0.0125"),
         "LEVERAGE": Decimal("98"),
         "PRICE_RESTORE_MAX_GAP_RATIO": Decimal("0.03"),
     }
@@ -80,6 +89,7 @@ def load_open_flow():
 
 initial_ns = load_initial_sizing()
 BotError = initial_ns["BotError"]
+INITIAL_MARGIN_EQUITY_RATIO = initial_ns["INITIAL_MARGIN_EQUITY_RATIO"]
 initial_margin_from_account = initial_ns["initial_margin_from_account"]
 open_entry = load_open_flow()["open"]
 
@@ -137,18 +147,18 @@ def make_engine(reference: Decimal = Decimal("63900")):
     return engine, api, config, captured
 
 
-def test_uses_one_point_two_five_percent_of_account_equity():
+def test_uses_one_point_one_percent_of_account_equity():
     equity, margin = initial_margin_from_account({"usdtEquity": "400"})
 
     assert equity == Decimal("400")
-    assert margin == Decimal("5")
+    assert margin == Decimal("4.4")
 
 
 def test_preserves_fractional_equity_without_early_rounding():
     equity, margin = initial_margin_from_account({"usdtEquity": "400.3"})
 
     assert equity == Decimal("400.3")
-    assert margin == Decimal("5.00375")
+    assert margin == Decimal("4.4033")
 
 
 @pytest.mark.parametrize(
@@ -165,7 +175,7 @@ def test_open_fetches_equity_but_reentry_keeps_previous_margin():
 
     assert "account_equity, margin = initial_margin_from_account(" in source
     assert "await self.api.account()" in source
-    assert 'sizing_source = "account_usdt_equity_1_25_percent"' in source
+    assert 'sizing_source = "account_usdt_equity_ratio"' in source
     assert 'margin = D(stopped.get("total_margin_usdt"))' in source
     assert 'sizing_source = "previous_sl_margin_usdt"' in source
 
@@ -175,7 +185,7 @@ def test_limit_entry_quantity_uses_resolved_limit_price():
 
     asyncio.run(open_entry(engine, "OPEN_LONG", 63000, 101, 0))
 
-    notional = Decimal("400") * Decimal("0.0125") * Decimal("98")
+    notional = Decimal("400") * INITIAL_MARGIN_EQUITY_RATIO * Decimal("98")
     expected = config.floor_size(notional / Decimal("63000"))
     mark_based = config.floor_size(notional / Decimal("63900"))
 
@@ -184,7 +194,7 @@ def test_limit_entry_quantity_uses_resolved_limit_price():
     assert captured["qty"] == expected
     assert captured["raw_price"] == 63000
     assert captured["resolved_price"] == Decimal("63000")
-    assert captured["entry_sizing"]["margin_usdt"] == "5"
+    assert captured["entry_sizing"]["margin_usdt"] == "4.4"
     assert captured["entry_sizing"]["sizing_price"] == "63000"
 
 
@@ -193,7 +203,7 @@ def test_market_entry_quantity_uses_current_reference_price():
 
     asyncio.run(open_entry(engine, "OPEN_SHORT", None, 102, 0))
 
-    notional = Decimal("400") * Decimal("0.0125") * Decimal("98")
+    notional = Decimal("400") * INITIAL_MARGIN_EQUITY_RATIO * Decimal("98")
     expected = config.floor_size(notional / Decimal("63900"))
 
     assert captured["qty"] == expected

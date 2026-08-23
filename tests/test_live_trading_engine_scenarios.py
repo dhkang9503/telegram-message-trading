@@ -399,7 +399,10 @@ def test_market_open_uses_equity_ratio_and_correct_direction(
     engine, api, state, config = rig
     result = execute(engine, action)
     expected = config.floor_size(
-        Decimal("400") * Decimal("0.01") * live.LEVERAGE / api.mark_price
+        Decimal("400")
+        * live.INITIAL_MARGIN_EQUITY_RATIO
+        * live.LEVERAGE
+        / api.mark_price
     )
     placed = mutations(api)[0]
     assert (placed["side"], placed["order_type"], placed["size"]) == (
@@ -407,7 +410,7 @@ def test_market_open_uses_equity_ratio_and_correct_direction(
         "market",
         expected,
     )
-    assert result["margin_usdt"] == "4"
+    assert result["margin_usdt"] == "4.4"
     assert state.data["position"]["side"] == position_side
     assert D(state.data["position"]["initial_qty"]) == expected
     assert D(state.data["position"]["added_qty"]) == 0
@@ -420,7 +423,10 @@ def test_limit_open_uses_resolved_price_and_stays_pending(rig, action, side):
     engine, api, state, config = rig
     result = execute(engine, action, 63000)
     expected = config.floor_size(
-        Decimal("400") * Decimal("0.01") * live.LEVERAGE / Decimal("63000")
+        Decimal("400")
+        * live.INITIAL_MARGIN_EQUITY_RATIO
+        * live.LEVERAGE
+        / Decimal("63000")
     )
     placed = mutations(api)[0]
     assert (placed["side"], placed["price"], placed["size"]) == (
@@ -763,8 +769,8 @@ def test_regular_open_after_stop_uses_fresh_equity_instead_of_reentry_allowance(
     engine, _, state, _ = prepare_stopped_position(rig)
     stopped_margin = state.data["stopped_position"]["total_margin_usdt"]
     result = execute(engine, "OPEN_LONG", message_id=3)
-    assert result["sizing_source"] == "account_usdt_equity_1_25_percent"
-    assert result["margin_usdt"] == "4"
+    assert result["sizing_source"] == "account_usdt_equity_ratio"
+    assert result["margin_usdt"] == "4.4"
     assert result["margin_usdt"] != stopped_margin
 
 
