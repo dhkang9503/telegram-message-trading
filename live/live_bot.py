@@ -43,7 +43,7 @@ MARGIN_COIN = "USDT"
 MARGIN_MODE = "crossed"
 POSITION_MODE = "one_way_mode"
 LEVERAGE = Decimal("98")
-INITIAL_MARGIN_EQUITY_RATIO = Decimal("0.01")
+INITIAL_MARGIN_EQUITY_RATIO = Decimal("0.011")
 PRICE_RESTORE_MAX_GAP_RATIO = Decimal(os.getenv("PRICE_RESTORE_MAX_GAP_RATIO", "0.03"))
 CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT = Decimal(
     os.getenv("CLOSE_ALL_TRAILING_ROE_THRESHOLD_PCT", "20")
@@ -1904,7 +1904,7 @@ class TradingEngine:
             account_equity, margin = initial_margin_from_account(
                 await self.api.account()
             )
-            sizing_source = "account_usdt_equity_1_25_percent"
+            sizing_source = "account_usdt_equity_ratio"
 
         reference = await self.reference_price()
         entry_price: Optional[Decimal] = None
