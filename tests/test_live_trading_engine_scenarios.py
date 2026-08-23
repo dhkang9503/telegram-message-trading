@@ -957,6 +957,87 @@ def test_abbreviated_add_and_stop_restore_using_position_direction(
         "open_action",
         "entry_price",
         "mark_price",
+        "model_actions",
+        "expected_stop",
+        "rejection_text",
+    ),
+    [
+        pytest.param(
+            "OPEN_LONG",
+            "61500",
+            "60000.3",
+            [
+                {"type": "ADD", "price": 500},
+                {"type": "SET_STOP", "price": 510},
+            ],
+            Decimal("59510"),
+            "must be below mark price",
+            id="review-long-pair-does-not-place-marketable-add",
+        ),
+        pytest.param(
+            "OPEN_SHORT",
+            "58500",
+            "59999.7",
+            [
+                {"type": "ADD", "price": 500},
+                {"type": "SET_STOP", "price": 60490},
+            ],
+            Decimal("60490"),
+            "must be above mark price",
+            id="mirrored-short-pair-does-not-place-marketable-add",
+        ),
+    ],
+)
+def test_paired_prices_reject_marketable_add_but_keep_valid_stop(
+    rig,
+    open_action,
+    entry_price,
+    mark_price,
+    model_actions,
+    expected_stop,
+    rejection_text,
+):
+    engine, api, state, config = rig
+    api.mark_price = Decimal(entry_price)
+    execute(engine, open_action)
+
+    api.mark_price = Decimal(mark_price)
+    actions, corrections, rejected = live.preflight_and_correct_add_stop_prices(
+        model_actions,
+        api.mark_price,
+        state.data["position"],
+        config,
+    )
+
+    assert corrections == []
+    assert actions == [model_actions[1]]
+    assert len(rejected) == 1
+    assert rejected[0]["action"] == model_actions[0]
+    assert rejection_text in rejected[0]["reason"]
+
+    actions, stop_rejected, deduplicated = (
+        live.validate_and_deduplicate_stop_actions(
+            actions,
+            api.mark_price,
+            state.data["position"]["side"],
+            config,
+        )
+    )
+    assert stop_rejected == []
+    assert deduplicated == []
+
+    start = len(api.calls)
+    run(engine.execute(actions[0], 20002, 0, "review regression"))
+    calls = mutations(api, start)
+    assert [call["method"] for call in calls] == ["place_plan"]
+    assert calls[0]["trigger_price"] == expected_stop
+
+
+@pytest.mark.parametrize(
+    (
+        "open_action",
+        "entry_price",
+        "mark_price",
         "action_type",
         "raw_price",
         "source",

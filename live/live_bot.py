@@ -958,9 +958,17 @@ def _paired_abbreviated_add_stop_correction(
         if abs(add_candidate - entry) / entry > PRICE_RESTORE_MAX_GAP_RATIO:
             continue
         for stop_candidate in stop_candidates:
-            if side == "long" and stop_candidate < add_candidate < entry:
+            if (
+                side == "long"
+                and stop_candidate < add_candidate < entry
+                and add_candidate < reference
+            ):
                 valid_pairs.append((add_candidate, stop_candidate))
-            elif side == "short" and stop_candidate > add_candidate > entry:
+            elif (
+                side == "short"
+                and stop_candidate > add_candidate > entry
+                and add_candidate > reference
+            ):
                 valid_pairs.append((add_candidate, stop_candidate))
     if not valid_pairs:
         return None
@@ -1228,9 +1236,43 @@ def preflight_and_correct_add_stop_prices(
             accepted.append(action)
             continue
         try:
-            restore_btc_price(action["price"], reference, config)
+            restored = restore_btc_price(action["price"], reference, config)
         except BotError as exc:
             rejected.append({"action": action, "reason": str(exc)})
+            continue
+
+        side = str(position.get("side"))
+        entry = D(position.get("entry_price"))
+        if entry <= 0:
+            rejected.append({
+                "action": action,
+                "reason": "ADD price validation requires a positive entry price",
+            })
+        elif side == "long" and restored >= reference:
+            rejected.append({
+                "action": action,
+                "reason": f"Long ADD {restored} must be below mark price {reference}",
+            })
+        elif side == "long" and restored >= entry:
+            rejected.append({
+                "action": action,
+                "reason": f"Long ADD {restored} must be below entry price {entry}",
+            })
+        elif side == "short" and restored <= reference:
+            rejected.append({
+                "action": action,
+                "reason": f"Short ADD {restored} must be above mark price {reference}",
+            })
+        elif side == "short" and restored <= entry:
+            rejected.append({
+                "action": action,
+                "reason": f"Short ADD {restored} must be above entry price {entry}",
+            })
+        elif side not in {"long", "short"}:
+            rejected.append({
+                "action": action,
+                "reason": f"Invalid position side for ADD validation: {side}",
+            })
         else:
             accepted.append(action)
     return accepted, corrections, rejected
