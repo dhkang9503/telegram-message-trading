@@ -257,6 +257,10 @@ class FakeBitgetClient:
         range_rate,
         client_oid,
     ):
+        if hold_side == "buy" and trigger_price < self.mark_price:
+            raise BotError("Long trailing trigger must be at or above market")
+        if hold_side == "sell" and trigger_price > self.mark_price:
+            raise BotError("Short trailing trigger must be at or below market")
         self.record(
             "place_trailing_plan",
             hold_side=hold_side,

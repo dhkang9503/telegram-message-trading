@@ -322,6 +322,10 @@ class ContractConfig:
         units = (value / self.price_step).to_integral_value(rounding=ROUND_DOWN)
         return units * self.price_step
 
+    def ceil_price(self, value: Decimal) -> Decimal:
+        floored = self.floor_price(value)
+        return floored if floored == value else floored + self.price_step
+
 
 class BitgetClient:
     def __init__(self):
@@ -1410,11 +1414,40 @@ class TradingEngine:
                     await self.api.cancel_order(str(row["orderId"]))
             orders = await self.api.pending_orders()
 
-            executed_stop = await self._find_executed_stop(previous_stop)
-            if executed_stop:
-                self._remember_stopped_position(previous_position, previous_stop, executed_stop)
+            # A CLOSE_ALL trailing position intentionally has both an initial
+            # guard stop and a moving plan. Whichever one closes the position,
+            # remove the other exchange-side plan instead of merely forgetting
+            # it when local position state is cleared below.
+            for row in plans:
+                if (
+                    str(row.get("clientOid", "")).startswith("tg")
+                    and str(row.get("planType"))
+                    in {
+                        "loss_plan",
+                        "pos_loss",
+                        "profit_plan",
+                        "pos_profit",
+                        "moving_plan",
+                    }
+                ):
+                    await self.api.cancel_plan(
+                        str(row["orderId"]), str(row["planType"])
+                    )
+            plans = await self.api.pending_plans()
+
+            if (
+                previous_stop
+                and previous_stop.get("source") == "close_all_trailing_guard"
+            ):
+                self._clear_reentry("close_all_trailing_guard_flattened_position")
             else:
-                self._clear_reentry("position_flattened_without_executed_stop")
+                executed_stop = await self._find_executed_stop(previous_stop)
+                if executed_stop:
+                    self._remember_stopped_position(
+                        previous_position, previous_stop, executed_stop
+                    )
+                else:
+                    self._clear_reentry("position_flattened_without_executed_stop")
 
         self._reconcile_orders(orders)
         self._reconcile_plans(plans)
@@ -1555,9 +1588,10 @@ class TradingEngine:
 
     @staticmethod
     def _plan_record(row: dict[str, Any]) -> dict[str, Any]:
-        return {
+        client_oid_value = str(row.get("clientOid", ""))
+        record = {
             "order_id": str(row.get("orderId")),
-            "client_oid": str(row.get("clientOid", "")),
+            "client_oid": client_oid_value,
             "price": str(row.get("triggerPrice", "")),
             "plan_type": str(row.get("planType")),
             "qty": str(row.get("size", "")),
@@ -1566,6 +1600,9 @@ class TradingEngine:
             ),
             "created_at": now_iso(),
         }
+        if "-trailguard-" in client_oid_value:
+            record["source"] = "close_all_trailing_guard"
+        return record
 
     def _reconcile_position(self, actual: Optional[dict[str, Any]]) -> None:
         old = self.state.data["position"]
@@ -1753,6 +1790,19 @@ class TradingEngine:
                     return row
             await asyncio.sleep(0.25)
         raise BotError(f"Trailing plan {order_id} was not confirmed on Bitget")
+
+    async def wait_for_stop_plan(self, order_id: str) -> dict[str, Any]:
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            rows = await self.api.pending_plans()
+            for row in rows:
+                if (
+                    str(row.get("orderId")) == order_id
+                    and str(row.get("planType")) in {"loss_plan", "pos_loss"}
+                ):
+                    return row
+            await asyncio.sleep(0.25)
+        raise BotError(f"Stop plan {order_id} was not confirmed on Bitget")
 
     async def cancel_adds(self) -> list[str]:
         cancelled = []
@@ -2003,15 +2053,49 @@ class TradingEngine:
         if side not in {"long", "short"}:
             raise BotError(f"Cannot arm a trailing plan for position side {side!r}")
         fresh_mark = await self.reference_price()
-        # Put the activation price one tick beyond the current mark in the
-        # already-crossed direction. This avoids relying on a stale position
-        # snapshot while the request is in flight.
+        callback_fraction = CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT / Decimal("100")
         if side == "long":
-            trigger = self.config.floor_price(fresh_mark) - self.config.price_step
-            if trigger <= 0:
-                raise BotError(f"Cannot derive a positive trailing trigger from {fresh_mark}")
+            # Bitget accepts a long trailing activation at or above market.
+            trigger = self.config.ceil_price(fresh_mark)
+            guard_trigger = self.config.floor_price(
+                fresh_mark * (Decimal("1") - callback_fraction)
+            )
         else:
-            trigger = self.config.floor_price(fresh_mark) + self.config.price_step
+            # Bitget accepts a short trailing activation at or below market.
+            trigger = self.config.floor_price(fresh_mark)
+            guard_trigger = self.config.ceil_price(
+                fresh_mark * (Decimal("1") + callback_fraction)
+            )
+
+        # The native moving plan can be accepted before its activation price is
+        # crossed. Install a market-executed SL at the CLOSE_ALL callback level
+        # first, so an immediate adverse move is protected during that gap.
+        await self.cancel_plan_slot("stop_order")
+        guard_coid = client_oid(message_id, index, "trailguard")
+        guard_result = await self.api.place_plan(
+            plan_type="pos_loss",
+            hold_side="buy" if side == "long" else "sell",
+            trigger_price=guard_trigger,
+            client_oid=guard_coid,
+        )
+        guard_order_id = str(guard_result.get("orderId") or "")
+        if not guard_order_id:
+            raise BotError(
+                "Bitget did not return an orderId for the trailing guard stop"
+            )
+        guard_record = {
+            "order_id": guard_order_id,
+            "client_oid": guard_coid,
+            "price": ds(guard_trigger),
+            "plan_type": "pos_loss",
+            "source": "close_all_trailing_guard",
+            "callback_rate_pct": ds(CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT),
+            "created_at": now_iso(),
+        }
+        self.state.data["pending"]["stop_order"] = guard_record
+        self.state.save()
+        await self.wait_for_stop_plan(guard_order_id)
+        self.log("CLOSE_ALL_TRAILING_GUARD_SET", stop_order=guard_record.copy())
 
         coid = client_oid(message_id, index, "trail")
         result = await self.api.place_trailing_plan(
@@ -2035,6 +2119,7 @@ class TradingEngine:
             "armed_roe_pct": ds(roe),
             "roe_source": roe_source,
             "side": side,
+            "guard_stop_order_id": guard_order_id,
             "created_at": now_iso(),
         }
         # Persist the ID before confirmation so the fallback path can cancel a
@@ -2048,22 +2133,22 @@ class TradingEngine:
             if side == "long"
             else confirmation_mark <= trigger
         )
-        if not activation_crossed:
-            raise BotError(
-                "Trailing plan was registered but immediate activation could not be "
-                f"verified: side={side}, trigger={trigger}, mark={confirmation_mark}"
-            )
-        # Keep the existing stop/TP protection until Bitget confirms the new
-        # trailing plan. A crash or timeout before this point therefore leaves
-        # the leveraged position protected rather than in a plan-less gap.
-        for slot in ("stop_order", "tp_order"):
-            await self.cancel_plan_slot(slot)
+        record["activated"] = activation_crossed
+        self.state.data["pending"]["trailing_order"] = record
+        self.state.save()
+        # The guard remains as an exchange-side fallback. Once the moving plan
+        # activates, its dynamic callback is always at least as protective as
+        # this fixed CLOSE_ALL-level stop. An old TP would interfere, so remove it.
+        await self.cancel_plan_slot("tp_order")
         self.log("CLOSE_ALL_TRAILING_ARMED", trailing_order=record.copy())
         return {
             "trailing": True,
             "order_id": order_id,
             "trigger_price": ds(trigger),
+            "guard_stop_order_id": guard_order_id,
+            "guard_trigger_price": ds(guard_trigger),
             "callback_rate_pct": ds(CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT),
+            "activated": activation_crossed,
             "roe_pct": ds(roe),
             "roe_source": roe_source,
         }
