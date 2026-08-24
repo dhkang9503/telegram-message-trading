@@ -2002,25 +2002,34 @@ class TradingEngine:
         side = str(actual.get("holdSide"))
         if side not in {"long", "short"}:
             raise BotError(f"Cannot arm a trailing plan for position side {side!r}")
-        fresh_mark = await self.reference_price()
-        # Put the activation price one tick beyond the current mark in the
-        # already-crossed direction. This avoids relying on a stale position
-        # snapshot while the request is in flight.
-        if side == "long":
-            trigger = self.config.floor_price(fresh_mark) - self.config.price_step
+        coid = client_oid(message_id, index, "trail")
+        trigger = Decimal("0")
+        for attempt in range(2):
+            fresh_mark = await self.reference_price()
+            rounded_mark = self.config.floor_price(fresh_mark)
+            # Bitget requires a long moving-plan trigger at or above market and
+            # a short trigger at or below market. Keep it one tick into the
+            # favorable direction; retry once if the market crosses that price
+            # while the request is in flight.
+            trigger = (
+                rounded_mark + self.config.price_step
+                if side == "long"
+                else rounded_mark - self.config.price_step
+            )
             if trigger <= 0:
                 raise BotError(f"Cannot derive a positive trailing trigger from {fresh_mark}")
-        else:
-            trigger = self.config.floor_price(fresh_mark) + self.config.price_step
-
-        coid = client_oid(message_id, index, "trail")
-        result = await self.api.place_trailing_plan(
-            hold_side="buy" if side == "long" else "sell",
-            trigger_price=trigger,
-            size=qty,
-            range_rate=CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT,
-            client_oid=coid,
-        )
+            try:
+                result = await self.api.place_trailing_plan(
+                    hold_side="buy" if side == "long" else "sell",
+                    trigger_price=trigger,
+                    size=qty,
+                    range_rate=CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT,
+                    client_oid=coid,
+                )
+                break
+            except BitgetAPIError as exc:
+                if exc.code != "43034" or attempt == 1:
+                    raise
         order_id = str(result.get("orderId") or "")
         if not order_id:
             raise BotError("Bitget did not return an orderId for the trailing plan")
@@ -2048,22 +2057,21 @@ class TradingEngine:
             if side == "long"
             else confirmation_mark <= trigger
         )
-        if not activation_crossed:
-            raise BotError(
-                "Trailing plan was registered but immediate activation could not be "
-                f"verified: side={side}, trigger={trigger}, mark={confirmation_mark}"
-            )
-        # Keep the existing stop/TP protection until Bitget confirms the new
-        # trailing plan. A crash or timeout before this point therefore leaves
-        # the leveraged position protected rather than in a plan-less gap.
-        for slot in ("stop_order", "tp_order"):
-            await self.cancel_plan_slot(slot)
+        record["activated"] = activation_crossed
+        self.state.save()
+        # A registered moving plan may still be waiting for its activation
+        # price. Preserve the existing stop/TP until activation is confirmed;
+        # reconciliation will clean those plans up after an eventual close.
+        if activation_crossed:
+            for slot in ("stop_order", "tp_order"):
+                await self.cancel_plan_slot(slot)
         self.log("CLOSE_ALL_TRAILING_ARMED", trailing_order=record.copy())
         return {
             "trailing": True,
             "order_id": order_id,
             "trigger_price": ds(trigger),
             "callback_rate_pct": ds(CLOSE_ALL_TRAILING_CALLBACK_RATE_PCT),
+            "activated": activation_crossed,
             "roe_pct": ds(roe),
             "roe_source": roe_source,
         }
