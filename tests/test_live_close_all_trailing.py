@@ -213,15 +213,16 @@ def test_close_all_at_threshold_arms_full_size_trailing(rig):
     calls = mutations(api, start)
     assert [call["method"] for call in calls] == ["place_trailing_plan"]
     assert calls[0]["size"] == expected_qty
-    assert calls[0]["trigger_price"] == api.mark_price - engine.config.price_step
+    assert calls[0]["trigger_price"] == api.mark_price + engine.config.price_step
     assert calls[0]["range_rate"] == Decimal("0.10")
     assert result["trailing"] is True
+    assert result["activated"] is False
     assert result["roe_pct"] == "20"
     assert api.position_row is not None
     assert state.data["pending"]["trailing_order"]["plan_type"] == "moving_plan"
 
 
-def test_short_trailing_activation_rounds_up_to_start_immediately(rig):
+def test_short_trailing_trigger_is_below_current_market(rig):
     engine, api, _ = rig
     api.mark_price = Decimal("63900.05")
     execute(engine, "OPEN_SHORT")
@@ -232,11 +233,20 @@ def test_short_trailing_activation_rounds_up_to_start_immediately(rig):
     placed = [
         call for call in mutations(api) if call["method"] == "place_trailing_plan"
     ][0]
-    assert placed["trigger_price"] == Decimal("63900.1")
+    assert placed["trigger_price"] == Decimal("63899.9")
 
 
 def test_close_all_cancels_stop_and_tp_after_confirming_trailing(rig):
-    engine, api, state = rig
+    _, _, state = rig
+
+    class ActivatedTrailingClient(FakeBitgetClient):
+        async def place_trailing_plan(self, **kwargs):
+            result = await super().place_trailing_plan(**kwargs)
+            self.mark_price = kwargs["trigger_price"]
+            return result
+
+    api = ActivatedTrailingClient()
+    engine = ScenarioEngine(api, state, rig[0].config)
     execute(engine, "OPEN_LONG")
     execute(engine, "SET_STOP", 63000, message_id=2)
     execute(engine, "SET_TP", None, message_id=3)
@@ -258,7 +268,61 @@ def test_close_all_cancels_stop_and_tp_after_confirming_trailing(rig):
     assert state.data["pending"]["tp_order"] is None
 
 
-def test_adverse_move_before_activation_market_closes_with_old_protection_intact():
+def test_trigger_price_rejection_refreshes_market_and_retries_once(rig):
+    _, _, state = rig
+
+    class RacingMarketClient(FakeBitgetClient):
+        async def place_trailing_plan(self, **kwargs):
+            if not any(call["method"] == "place_trailing_plan" for call in self.calls):
+                self.record("place_trailing_plan", **kwargs)
+                self.mark_price += Decimal("1")
+                raise live.BitgetAPIError(
+                    "43034", "The trigger price should be >= the current market price"
+                )
+            return await super().place_trailing_plan(**kwargs)
+
+    api = RacingMarketClient()
+    engine = ScenarioEngine(api, state, rig[0].config)
+    execute(engine, "OPEN_LONG")
+    set_roe(api, "25")
+
+    result = execute(engine, "CLOSE_ALL", message_id=2)
+
+    placed = [call for call in mutations(api) if call["method"] == "place_trailing_plan"]
+    assert len(placed) == 2
+    assert placed[0]["trigger_price"] == Decimal("63900.1")
+    assert placed[1]["trigger_price"] == Decimal("63901.1")
+    assert result["trailing"] is True
+
+
+def test_repeated_trigger_price_rejection_falls_back_to_market_close(rig):
+    _, _, state = rig
+
+    class RejectingTriggerClient(FakeBitgetClient):
+        async def place_trailing_plan(self, **kwargs):
+            self.record("place_trailing_plan", **kwargs)
+            raise live.BitgetAPIError(
+                "43034", "The trigger price should be <= the current market price"
+            )
+
+    api = RejectingTriggerClient()
+    engine = ScenarioEngine(api, state, rig[0].config)
+    execute(engine, "OPEN_SHORT")
+    set_roe(api, "25")
+    start = len(api.calls)
+
+    result = execute(engine, "CLOSE_ALL", message_id=2)
+
+    assert result == {"result": {"closed": True}}
+    assert [call["method"] for call in mutations(api, start)] == [
+        "place_trailing_plan",
+        "place_trailing_plan",
+        "flash_close",
+    ]
+    assert api.position_row is None
+
+
+def test_pending_activation_keeps_old_protection_intact():
     class AdverseMoveClient(FakeBitgetClient):
         async def place_trailing_plan(self, **kwargs):
             result = await super().place_trailing_plan(**kwargs)
@@ -284,21 +348,16 @@ def test_adverse_move_before_activation_market_closes_with_old_protection_intact
     result = execute(engine, "CLOSE_ALL", message_id=4)
 
     calls = mutations(api, start)
-    assert result == {"result": {"closed": True}}
-    assert [call["method"] for call in calls] == [
-        "place_trailing_plan",
-        "cancel_plan",
-        "cancel_plan",
-        "cancel_plan",
-        "flash_close",
-    ]
+    assert result["trailing"] is True
+    assert result["activated"] is False
+    assert [call["method"] for call in calls] == ["place_trailing_plan"]
     assert set(calls[0]["existing_plan_types"]) == {"pos_loss", "pos_profit"}
-    assert api.position_row is None
-    assert api.plan_rows == []
-    assert any(
-        event["event"] == "CLOSE_ALL_TRAILING_FAILED_MARKET_FALLBACK"
-        for event in engine.events
-    )
+    assert api.position_row is not None
+    assert {row["planType"] for row in api.plan_rows} == {
+        "pos_loss",
+        "pos_profit",
+        "moving_plan",
+    }
 
 
 def test_trailing_registration_failure_falls_back_to_market_close(rig):
