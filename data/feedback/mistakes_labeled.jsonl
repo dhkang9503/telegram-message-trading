@@ -36,3 +36,5 @@
 {"source":{"message":"저 610물타기 910손절 걸엇어요 !"},"label":{"status":"labeled","correct_actions":[{"type":"ADD","price":610},{"type":"SET_STOP","price":910}]}}
 {"source":{"message":"재진입 한번만 더 볼게요!"},"label":{"status":"labeled","correct_actions":[{"type":"OPEN_REENTRY","price":null,"side":null}]}}
 {"source":{"message":"짜르고 재진입 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null},{"type":"OPEN_REENTRY","price":null,"side":null}]}}
+{"source":{"message":"짜를게요 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"짜릅시다 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
