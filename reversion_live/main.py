@@ -182,7 +182,12 @@ class RollingVolumeTracker:
 
 
 class SpikeDetector:
-    def __init__(self, threshold_60s: float, threshold_10s: float, reset_threshold: float):
+    def __init__(
+        self,
+        threshold_60s: float,
+        threshold_10s: float,
+        reset_threshold: float,
+    ) -> None:
         self.threshold_60s = threshold_60s
         self.threshold_10s = threshold_10s
         self.reset_threshold = reset_threshold
@@ -247,13 +252,24 @@ def format_signed_usd(value: float) -> str:
     return f"{sign}${abs(value):,.0f}"
 
 
+def build_startup_message(config: Config) -> str:
+    return (
+        f"✅ {display_symbol(config.symbol)} 거래량 알림봇 시작\n"
+        f"60s: {format_volume_btc(config.volume_60s_threshold)} | "
+        f"10s: {format_volume_btc(config.volume_10s_threshold)}"
+    )
+
+
 def build_alert_message(symbol: str, emoji: str, snapshot: VolumeSnapshot) -> str:
     price_change = snapshot.price_change
     price_change_pct = snapshot.price_change_pct
     if price_change is None or price_change_pct is None:
         raise ValueError("snapshot is not warmed up for a 60-second price change")
 
-    when = datetime.fromtimestamp(snapshot.timestamp_ms / 1000, tz=KST).strftime("%H:%M:%S KST")
+    when = datetime.fromtimestamp(
+        snapshot.timestamp_ms / 1000,
+        tz=KST,
+    ).strftime("%H:%M:%S KST")
     return (
         f"{emoji} {display_symbol(symbol)} 거래량 급증\n"
         f"{when} | {format_volume_btc(snapshot.volume_60s)} | "
@@ -305,9 +321,9 @@ class VolumeSpikeBot:
     async def _send_notification(self, text: str) -> None:
         try:
             await asyncio.to_thread(send_telegram_sync, self.config, text)
-            LOG.info("telegram alert sent: %s", text.replace("\n", " | "))
+            LOG.info("telegram notification sent: %s", text.replace("\n", " | "))
         except Exception:
-            LOG.exception("failed to send Telegram alert")
+            LOG.exception("failed to send Telegram notification")
 
     async def process_message(self, raw: str | bytes) -> None:
         payload = json.loads(raw)
@@ -355,6 +371,8 @@ class VolumeSpikeBot:
 
     async def run(self, stop_event: asyncio.Event) -> None:
         reconnect_delay = 1.0
+        startup_notification_scheduled = False
+
         while not stop_event.is_set():
             self.reset_stream_state()
             try:
@@ -368,6 +386,10 @@ class VolumeSpikeBot:
                 ) as websocket:
                     LOG.info("Binance Futures WebSocket connected; warming up rolling window")
                     reconnect_delay = 1.0
+                    if not startup_notification_scheduled:
+                        self._schedule_notification(build_startup_message(self.config))
+                        startup_notification_scheduled = True
+
                     async for raw in websocket:
                         if stop_event.is_set():
                             break
