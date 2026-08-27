@@ -1,2299 +1,426 @@
-"""Binance USD-M full-period regime ensemble bot.
+"""BTCUSDT futures rolling-volume spike alert bot.
 
-The original asymmetric snapback strategy always runs as a virtual shadow
-strategy.  A causal EWM of completed shadow-trade returns selects between:
-
-* gate ON: copy the snapback signal at the validated 1.6 risk scale;
-* gate OFF: hold the strongest BTC/ETH/SOL 15m EMA(32/384) trend with
-  volatility targeting and a 5x exposure ceiling.
-
-Signals use completed candles and the account holds at most one real position.
-LIVE_TRADING defaults to 0.  No order is submitted unless it is explicitly 1.
+The service consumes Binance USD-M Futures aggregate trades and the live 1m
+kline over a combined WebSocket connection. It detects short, intense volume
+spikes using rolling 10s/60s windows and sends one compact Telegram alert per
+spike. No trading API key is required and this module never submits orders.
 """
 from __future__ import annotations
 
-import csv
-import hashlib
-import hmac
+import asyncio
 import json
 import logging
 import os
-import secrets
 import signal
-import statistics
-import time
+from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
-from pathlib import Path
+from datetime import datetime
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
-D = lambda x, default="0": Decimal(default) if x is None or x == "" else Decimal(str(x))
+from websockets.asyncio.client import connect
 
-
-@dataclass(frozen=True)
-class Profile:
-    notional_mult: Decimal
-    tp_atr: Decimal
-    sl_atr: Decimal
-    max_hold_minutes: int
-    hard_stop: Decimal
-
-
-# Original snapback profiles.  Research modules import this name, so it remains
-# the unchanged virtual-shadow definition.
-PROFILES = {
-    "BTCUSDT": Profile(D("5"), D("8"), D("6"), 48 * 60, D("0.20")),
-    "ETHUSDT": Profile(D("9"), D("2"), D("3"), 24 * 60, D("0.20")),
-    "SOLUSDT": Profile(D("3"), D("5"), D("4"), 6 * 60, D("0.15")),
-}
-SYMBOLS = tuple(PROFILES)  # fixed priority: BTC > ETH > SOL
-
-# The validated live-copy layer applies the selected 1.6 risk scale to both
-# notional and account-level hard loss.  This preserves each profile's price
-# stop distance while scaling PnL exactly as in the final direct audit.
-SNAPBACK_LIVE_PROFILES = {
-    symbol: Profile(
-        profile.notional_mult * D("1.6"),
-        profile.tp_atr,
-        profile.sl_atr,
-        profile.max_hold_minutes,
-        profile.hard_stop * D("1.6"),
-    )
-    for symbol, profile in PROFILES.items()
-}
-
-STRATEGY_ID = "full_period_regime_ensemble_v1"
-STATE_VERSION = 5
-
-# Exchange leverage controls reserved margin, not strategy exposure.  Twenty
-# times is above the largest validated notional multiplier (14.4x) while
-# avoiding needless dependence on symbol-specific 98x availability.
-LEVERAGE = int(os.getenv("BINANCE_EXCHANGE_LEVERAGE", "20"))
-if not 15 <= LEVERAGE <= 125:
-    raise ValueError("BINANCE_EXCHANGE_LEVERAGE must be between 15 and 125")
-BB_PERIOD = 20
-EMA_PERIOD = 20
-RSI_PERIOD = 14
-ATR_PERIOD = 14
-ADX_PERIOD = 14
-ATR_MEDIAN_LOOKBACK = 100
-INDICATOR_FETCH_LIMIT = 500
-FALLBACK_FETCH_LIMIT = 1500
-
-GATE_SPAN = 40
-GATE_THRESHOLD = D("0.0025")
-GATE_ALPHA = D(2) / D(GATE_SPAN + 1)
-SHADOW_COST = D("0.0005")
-
-FALLBACK_FAST = 32
-FALLBACK_SLOW = 384
-FALLBACK_VOL_WINDOW = 32
-FALLBACK_MIN_HOLD = 48
-FALLBACK_SWITCH_MULTIPLE = D("1.25")
-FALLBACK_TARGET_ANNUAL_VOL = D("1.2")
-FALLBACK_MAX_LEVERAGE = D("5")
-FALLBACK_BARS_PER_YEAR = D(365 * 24 * 4)
-FALLBACK_TARGET_BAR_VOL = FALLBACK_TARGET_ANNUAL_VOL / FALLBACK_BARS_PER_YEAR.sqrt()
-
-# Signal thresholds from the 2024-08-09 .. 2026-08-14 search.
-BTC_BB_Z = D("2.75")
-BTC_RSI_MIN = D("65")
-BTC_RSI_REVERSAL = D("12")
-BTC_ADX_MAX = D("35")
-BTC_ATR_RATIO_MAX = D("3.0")
-
-ETH_BB_Z = D("2.50")
-ETH_RSI_MAX = D("30")
-ETH_RSI_REVERSAL = D("11")
-ETH_ADX_MAX = D("70")
-ETH_ATR_RATIO_MAX = D("1.5")
-
-SOL_KELTNER_ATR = D("2.25")
-SOL_RSI_LONG_MAX = D("25")
-SOL_RSI_SHORT_MIN = D("75")
-SOL_RSI_REVERSAL = D("8")
-SOL_ADX_MAX = D("35")
-SOL_ATR_RATIO_MAX = D("3.0")
-
-TAKER_FEE = D("0.0004")
-SIGNAL_INTERVAL_MS = 15 * 60 * 1000
-SIGNAL_MAX_AGE_MS = int(float(os.getenv("SIGNAL_MAX_AGE_SECONDS", "10")) * 1000)
-BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
-LIVE = os.getenv("LIVE_TRADING", "0") == "1"
-SIZING_CAP = D(os.getenv("SIZING_EQUITY_CAP_USDT", "0"))
-INITIAL_EQUITY_MIN = D(os.getenv("INITIAL_EQUITY_MIN_USDT", "45"))
-INITIAL_EQUITY_MAX = D(os.getenv("INITIAL_EQUITY_MAX_USDT", "55"))
-if INITIAL_EQUITY_MIN <= 0 or INITIAL_EQUITY_MAX < INITIAL_EQUITY_MIN:
-    raise ValueError("invalid initial equity guard range")
-POLL = float(os.getenv("POLL_SECONDS", "1"))
-RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"
-STATE_PATH = Path(os.getenv("REVERSION_STATE_PATH", str(Path(__file__).with_name("state.json"))))
-INSTANCE_LOCK_PATH = Path(
-    os.getenv("BOT_INSTANCE_LOCK_PATH", str(STATE_PATH.with_suffix(STATE_PATH.suffix + ".lock")))
-)
-RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW_MS", "5000"))
-TIMEOUT = float(os.getenv("BINANCE_HTTP_TIMEOUT_SECONDS", "10"))
-ALLOW_COLD_GATE = os.getenv("ALLOW_COLD_GATE", "0") == "1"
-SHADOW_SEED_FILES = tuple(
-    Path(x)
-    for x in os.getenv(
-        "SHADOW_GATE_SEED_FILES",
-        os.pathsep.join(
-            str(Path(__file__).with_name("results") / name)
-            for name in (
-                "presample_snapback_corrected_trades.csv",
-                "recent_snapback_corrected_trades.csv",
-            )
-        ),
-    ).split(os.pathsep)
-    if x
-)
-EMBEDDED_GATE_SEED = {
-    "completed_count": 292,
-    "ewm": "0.03108061800816574691247015836",
-    "gate_on": True,
-    "seeded_through_ms": 1786369200000,
-    "last_signal": {
-        "BTCUSDT": 1786314599999,
-        "ETHUSDT": 1784296799999,
-        "SOLUSDT": 1785984299999,
-    },
-}
-
-logging.basicConfig(
-    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+KST = ZoneInfo("Asia/Seoul")
 LOG = logging.getLogger("reversion_live")
-STOP = False
-
-
-class BotError(RuntimeError):
-    pass
-
-
-class OrderBelowMinimum(BotError):
-    pass
-
-
-class BinanceError(BotError):
-    def __init__(self, status: int, code: int | None, msg: str):
-        super().__init__(f"Binance error status={status} code={code}: {msg}")
-        self.status, self.code = status, code
-
-
-class InstanceLock:
-    """OS-released advisory lock preventing two processes from trading one state."""
-
-    def __init__(self, path: Path):
-        self.path = path
-        self.handle: Any = None
-
-    def __enter__(self) -> "InstanceLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = self.path.open("a+b", buffering=0)
-        try:
-            self.handle.seek(0)
-            if self.handle.read(1) == b"":
-                self.handle.write(b"0")
-                self.handle.flush()
-            self.handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            self.handle.close()
-            self.handle = None
-            raise BotError(f"another bot process holds {self.path}") from exc
-        return self
-
-    def __exit__(self, *_: Any) -> None:
-        if self.handle is None:
-            return
-        self.handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-        self.handle.close()
-        self.handle = None
-
-
-def ds(x: Decimal) -> str:
-    s = format(x.normalize(), "f")
-    return "0" if s == "-0" else s
-
-
-def save_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def blank_state() -> dict[str, Any]:
-    return {
-        "version": STATE_VERSION,
-        "strategy": STRATEGY_ID,
-        "active_symbol": None,
-        "active_strategy": None,
-        "side": None,
-        "cycle_equity": None,
-        "account_equity_at_start": None,
-        "entry_atr": None,
-        "signal_reference": None,
-        "notional_mult": None,
-        "opened_at_ms": None,
-        "signal_close_time": None,
-        "live_account_initialized": False,
-        "initial_live_equity": None,
-        "last_signal": {},
-        "last_strategy_bar_close": 0,
-        "shadow": {
-            "completed_count": 0,
-            "ewm": None,
-            "gate_on": False,
-            "position": None,
-            "seeded": False,
-            "catchup_complete": False,
-            "catchup_through_ms": None,
-        },
-        "fallback": {
-            "desired": 0,
-            "held_bars": 0,
-            "score": None,
-            "vol": None,
-            "leverage": None,
-        },
-        "pending_order": None,
-        "updated_at": int(time.time()),
-    }
-
-
-class State:
-    def __init__(self, path: Path):
-        self.path = path
-        self.data = blank_state()
-        self.legacy = False
-        self.loaded_version = STATE_VERSION
-        if path.exists():
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            version = int(loaded.get("version", 1))
-            self.loaded_version = version
-            if version == STATE_VERSION:
-                self.data.update(loaded)
-            elif version in (1, 2, 3, 4):
-                # Never silently take over a position opened by an older strategy.
-                # v3 is rebuilt from the audited gate seed because its embedded seed
-                # could skip history between the seed timestamp and process startup.
-                self.data = loaded
-                self.legacy = True
-            else:
-                raise BotError(f"unsupported state version={version}")
-        if not self.legacy:
-            self.save()
-
-    def save(self) -> None:
-        self.data["updated_at"] = int(time.time())
-        save_json(self.path, self.data)
-
-    def rebuild_for_strategy(self) -> None:
-        # Preserve only the one-time live-account guard when rebuilding a flat v3
-        # state. Gate/fallback/signal state must be reconstructed from audited
-        # history rather than carried across the schema boundary.
-        initialized = bool(self.data.get("live_account_initialized", False))
-        initial_equity = self.data.get("initial_live_equity")
-        self.data = blank_state()
-        if self.loaded_version in (3, 4):
-            self.data["live_account_initialized"] = initialized
-            self.data["initial_live_equity"] = initial_equity
-        self.loaded_version = STATE_VERSION
-        self.legacy = False
-        self.save()
-
-    def reset_cycle(self) -> None:
-        preserved = {
-            "last_signal": dict(self.data.get("last_signal", {})),
-            "last_strategy_bar_close": int(self.data.get("last_strategy_bar_close", 0)),
-            "shadow": self.data.get("shadow", blank_state()["shadow"]),
-            "fallback": self.data.get("fallback", blank_state()["fallback"]),
-            "live_account_initialized": bool(
-                self.data.get("live_account_initialized", False)
-            ),
-            "initial_live_equity": self.data.get("initial_live_equity"),
-        }
-        self.data = blank_state()
-        self.data.update(preserved)
-        self.legacy = False
-        self.save()
 
 
 @dataclass(frozen=True)
-class Rules:
-    step: Decimal
-    min_qty: Decimal
-    min_notional: Decimal
-
-    def floor(self, qty: Decimal) -> Decimal:
-        return (qty / self.step).to_integral_value(rounding=ROUND_DOWN) * self.step
-
-
-@dataclass(frozen=True)
-class Position:
+class Config:
     symbol: str
-    amount: Decimal
-    entry: Decimal
-    breakeven: Decimal
-    mark: Decimal
-    upnl: Decimal
-    liq: Decimal
+    volume_60s_threshold: float
+    volume_10s_threshold: float
+    volume_reset_threshold: float
+    telegram_bot_token: str
+    telegram_chat_id: str
+    telegram_timeout_seconds: float
+    websocket_url: str
 
-    @property
-    def open(self) -> bool:
-        return self.amount != 0
+    @classmethod
+    def from_env(cls) -> "Config":
+        symbol = os.getenv("SYMBOL", "BTCUSDT").strip().upper()
+        volume_60s_threshold = float(os.getenv("VOLUME_60S_THRESHOLD", "1000"))
+        volume_10s_threshold = float(os.getenv("VOLUME_10S_THRESHOLD", "300"))
+        volume_reset_threshold = float(os.getenv("VOLUME_RESET_THRESHOLD", "600"))
+        telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        telegram_timeout_seconds = float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10"))
 
-    @property
-    def side(self) -> str:
-        return "long" if self.amount > 0 else "short" if self.amount < 0 else "flat"
+        if not symbol:
+            raise ValueError("SYMBOL must not be empty")
+        if volume_60s_threshold <= 0 or volume_10s_threshold <= 0:
+            raise ValueError("volume thresholds must be positive")
+        if not 0 <= volume_reset_threshold < volume_60s_threshold:
+            raise ValueError(
+                "VOLUME_RESET_THRESHOLD must be >= 0 and lower than VOLUME_60S_THRESHOLD"
+            )
+        if telegram_timeout_seconds <= 0:
+            raise ValueError("TELEGRAM_TIMEOUT_SECONDS must be positive")
+        if not telegram_bot_token:
+            raise ValueError("TELEGRAM_BOT_TOKEN is required")
+        if not telegram_chat_id:
+            raise ValueError("TELEGRAM_CHAT_ID is required")
 
-    @property
-    def qty(self) -> Decimal:
-        return abs(self.amount)
+        stream_symbol = symbol.lower()
+        default_url = (
+            "wss://fstream.binance.com/stream?streams="
+            f"{stream_symbol}@aggTrade/{stream_symbol}@kline_1m"
+        )
+        websocket_url = os.getenv("BINANCE_FUTURES_WS_URL", default_url).strip()
+        if not websocket_url:
+            raise ValueError("BINANCE_FUTURES_WS_URL must not be empty")
+
+        return cls(
+            symbol=symbol,
+            volume_60s_threshold=volume_60s_threshold,
+            volume_10s_threshold=volume_10s_threshold,
+            volume_reset_threshold=volume_reset_threshold,
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
+            telegram_timeout_seconds=telegram_timeout_seconds,
+            websocket_url=websocket_url,
+        )
 
 
 @dataclass(frozen=True)
-class Signal:
-    side: str
-    close_time: int
-    atr: Decimal
-    reference_close: Decimal
-    detail: str
+class Trade:
+    timestamp_ms: int
+    price: float
+    quantity: float
+    agg_trade_id: int
 
 
-class Binance:
-    def __init__(self):
-        self.key = os.getenv("BINANCE_API_KEY", "")
-        self.secret = os.getenv("BINANCE_API_SECRET", "")
-        self.offset = 0
-        self.last_sync = 0.0
-        if LIVE and (not self.key or not self.secret):
-            raise BotError("LIVE_TRADING=1 requires BINANCE_API_KEY and BINANCE_API_SECRET")
+@dataclass(frozen=True)
+class VolumeSnapshot:
+    timestamp_ms: int
+    current_price: float
+    volume_10s: float
+    volume_60s: float
+    price_60s_ago: float | None
 
-    def req(
-        self,
-        method: str,
-        path: str,
-        params: dict[str, Any] | None = None,
-        signed: bool = False,
-    ) -> Any:
-        p = dict(params or {})
-        if signed:
-            if not self.key or not self.secret:
-                raise BotError("signed call requires Binance credentials")
-            self.sync_time()
-            p.update(
-                {
-                    "timestamp": int(time.time() * 1000) + self.offset,
-                    "recvWindow": RECV_WINDOW,
-                }
-            )
-        clean = {
-            k: (
-                ds(v)
-                if isinstance(v, Decimal)
-                else str(v).lower()
-                if isinstance(v, bool)
-                else v
-            )
-            for k, v in p.items()
-        }
-        q = urlencode(clean)
-        if signed:
-            q += ("&" if q else "") + "signature=" + hmac.new(
-                self.secret.encode(), q.encode(), hashlib.sha256
-            ).hexdigest()
-        url = BASE_URL + path + (("?" + q) if q else "")
-        headers = {"Accept": "application/json", "User-Agent": "reversion-live/2.0"}
-        if self.key:
-            headers["X-MBX-APIKEY"] = self.key
-        try:
-            with urlopen(Request(url, method=method, headers=headers), timeout=TIMEOUT) as r:
-                body = r.read().decode()
-                return json.loads(body) if body else {}
-        except HTTPError as e:
-            raw = e.read().decode(errors="replace")
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError:
-                payload = {"msg": raw}
-            raise BinanceError(
-                e.code,
-                int(payload["code"]) if "code" in payload else None,
-                str(payload.get("msg", raw)),
-            ) from e
-        except URLError as e:
-            raise BotError(f"Binance network error: {e}") from e
+    @property
+    def ready(self) -> bool:
+        return self.price_60s_ago is not None
 
-    def sync_time(self) -> None:
-        if time.monotonic() - self.last_sync < 300:
-            return
-        server = self.req("GET", "/fapi/v1/time")["serverTime"]
-        self.offset = int(server) - int(time.time() * 1000)
-        self.last_sync = time.monotonic()
-
-    def klines(
-        self,
-        symbol: str,
-        interval: str,
-        limit: int = 120,
-        start_time: int | None = None,
-        end_time: int | None = None,
-    ) -> list[list[Any]]:
-        params: dict[str, Any] = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        }
-        if start_time is not None:
-            params["startTime"] = start_time
-        if end_time is not None:
-            params["endTime"] = end_time
-        return self.req(
-            "GET", "/fapi/v1/klines", params
-        )
-
-    def funding_rates(
-        self, symbol: str, start_time: int, end_time: int
-    ) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        cursor = start_time
-        while cursor <= end_time:
-            page = self.req(
-                "GET",
-                "/fapi/v1/fundingRate",
-                {
-                    "symbol": symbol,
-                    "startTime": cursor,
-                    "endTime": end_time,
-                    "limit": 1000,
-                },
-            )
-            if not page:
-                break
-            out.extend(page)
-            newest = max(int(row["fundingTime"]) for row in page)
-            if newest < cursor or len(page) < 1000:
-                break
-            cursor = newest + 1
-        return out
-
-    def account(self) -> dict[str, Any]:
-        return self.req("GET", "/fapi/v3/account", signed=True)
-
-    def positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        x = self.req(
-            "GET",
-            "/fapi/v3/positionRisk",
-            {"symbol": symbol} if symbol else {},
-            signed=True,
-        )
-        return x if isinstance(x, list) else [x]
-
-    def open_orders(self) -> list[dict[str, Any]]:
-        return self.req("GET", "/fapi/v1/openOrders", signed=True)
-
-    def position_mode(self) -> bool:
-        x = self.req("GET", "/fapi/v1/positionSide/dual", signed=True)["dualSidePosition"]
-        return x if isinstance(x, bool) else str(x).lower() == "true"
-
-    def set_one_way(self) -> None:
-        self.req(
-            "POST",
-            "/fapi/v1/positionSide/dual",
-            {"dualSidePosition": "false"},
-            True,
-        )
-
-    def configure(self, symbol: str) -> Decimal:
-        try:
-            self.req(
-                "POST",
-                "/fapi/v1/marginType",
-                {"symbol": symbol, "marginType": "CROSSED"},
-                True,
-            )
-        except BinanceError as e:
-            if e.code != -4046:
-                raise
-        x = self.req(
-            "POST",
-            "/fapi/v1/leverage",
-            {"symbol": symbol, "leverage": LEVERAGE},
-            True,
-        )
-        if int(x.get("leverage", 0)) != LEVERAGE:
-            raise BotError(f"{symbol} did not accept {LEVERAGE}x")
-        return D(x.get("maxNotionalValue"))
-
-    def order(
-        self, symbol: str, side: str, qty: Decimal, reduce: bool, cid: str
-    ) -> dict[str, Any]:
-        p: dict[str, Any] = {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": qty,
-            "newClientOrderId": cid,
-            "newOrderRespType": "RESULT",
-        }
-        if reduce:
-            p["reduceOnly"] = "true"
-        return self.req("POST", "/fapi/v1/order", p, True)
-
-    def get_order(self, symbol: str, cid: str) -> dict[str, Any]:
-        return self.req(
-            "GET",
-            "/fapi/v1/order",
-            {"symbol": symbol, "origClientOrderId": cid},
-            True,
-        )
-
-
-def closed(rows: list[list[Any]]) -> list[list[Any]]:
-    now = int(time.time() * 1000)
-    return [r for r in rows if int(r[6]) < now]
-
-
-def ewm(values: list[Decimal], alpha: Decimal, min_periods: int) -> list[Decimal | None]:
-    if not values:
-        return []
-    out: list[Decimal | None] = [None] * len(values)
-    cur = values[0]
-    for i, x in enumerate(values):
-        if i:
-            cur = (D(1) - alpha) * cur + alpha * x
-        if i >= min_periods - 1:
-            out[i] = cur
-    return out
-
-
-def atr_series(rows: list[list[Any]]) -> list[Decimal | None]:
-    if not rows:
-        return []
-    tr: list[Decimal] = []
-    for i, r in enumerate(rows):
-        h, l = D(r[2]), D(r[3])
-        if i == 0:
-            tr.append(h - l)
-        else:
-            prev_close = D(rows[i - 1][4])
-            tr.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
-    return ewm(tr, D(1) / D(ATR_PERIOD), ATR_PERIOD)
-
-
-def ema_series(values: list[Decimal], period: int) -> list[Decimal]:
-    if not values:
-        return []
-    alpha = D(2) / D(period + 1)
-    cur = values[0]
-    out = [cur]
-    for x in values[1:]:
-        cur = (D(1) - alpha) * cur + alpha * x
-        out.append(cur)
-    return out
-
-
-def rsi_series(closes: list[Decimal]) -> list[Decimal | None]:
-    if len(closes) < 2:
-        return [None] * len(closes)
-    gains = [D(0)]
-    losses = [D(0)]
-    for i in range(1, len(closes)):
-        delta = closes[i] - closes[i - 1]
-        gains.append(max(delta, D(0)))
-        losses.append(max(-delta, D(0)))
-    avg_gain = ewm(gains, D(1) / D(RSI_PERIOD), RSI_PERIOD)
-    avg_loss = ewm(losses, D(1) / D(RSI_PERIOD), RSI_PERIOD)
-    out: list[Decimal | None] = [None] * len(closes)
-    for i, (g, l) in enumerate(zip(avg_gain, avg_loss)):
-        if g is None or l is None:
-            continue
-        if l == 0:
-            out[i] = D(100) if g > 0 else D(50)
-        else:
-            rs = g / l
-            out[i] = D(100) - D(100) / (D(1) + rs)
-    return out
-
-
-def adx_series(rows: list[list[Any]]) -> list[Decimal | None]:
-    if not rows:
-        return []
-    tr = [D(0)]
-    plus_dm = [D(0)]
-    minus_dm = [D(0)]
-    for i in range(1, len(rows)):
-        h, l = D(rows[i][2]), D(rows[i][3])
-        ph, pl, pc = D(rows[i - 1][2]), D(rows[i - 1][3]), D(rows[i - 1][4])
-        up = h - ph
-        down = pl - l
-        plus_dm.append(up if up > down and up > 0 else D(0))
-        minus_dm.append(down if down > up and down > 0 else D(0))
-        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
-
-    alpha = D(1) / D(ADX_PERIOD)
-    sm_tr = ewm(tr, alpha, ADX_PERIOD)
-    sm_plus = ewm(plus_dm, alpha, ADX_PERIOD)
-    sm_minus = ewm(minus_dm, alpha, ADX_PERIOD)
-    dx_values: list[Decimal] = []
-    dx_indexes: list[int] = []
-    for i in range(len(rows)):
-        if sm_tr[i] is None or sm_tr[i] == 0:
-            continue
-        pdi = D(100) * sm_plus[i] / sm_tr[i]
-        mdi = D(100) * sm_minus[i] / sm_tr[i]
-        denom = pdi + mdi
-        dx = D(0) if denom == 0 else D(100) * abs(pdi - mdi) / denom
-        dx_values.append(dx)
-        dx_indexes.append(i)
-
-    out: list[Decimal | None] = [None] * len(rows)
-    if not dx_values:
-        return out
-    adx_vals = ewm(dx_values, alpha, ADX_PERIOD)
-    for idx, value in zip(dx_indexes, adx_vals):
-        if value is not None:
-            out[idx] = value
-    return out
-
-
-def rolling_z(closes: list[Decimal], i: int, period: int = BB_PERIOD) -> Decimal | None:
-    if i < period - 1:
-        return None
-    w = closes[i - period + 1 : i + 1]
-    mean = sum(w, D(0)) / D(period)
-    var = sum((x - mean) ** 2 for x in w) / D(period)
-    sd = var.sqrt()
-    return D(0) if sd == 0 else (closes[i] - mean) / sd
-
-
-def atr_ratio(atrs: list[Decimal | None], i: int) -> Decimal | None:
-    cur = atrs[i]
-    if cur is None or cur <= 0:
-        return None
-    start = max(0, i - ATR_MEDIAN_LOOKBACK + 1)
-    hist = [x for x in atrs[start : i + 1] if x is not None and x > 0]
-    if len(hist) < ATR_MEDIAN_LOOKBACK:
-        return None
-    med = D(statistics.median(hist))
-    return None if med <= 0 else cur / med
-
-
-def signal_for(
-    api: Binance, symbol: str, supplied_rows: list[list[Any]] | None = None
-) -> Signal | None:
-    rows = supplied_rows if supplied_rows is not None else closed(
-        api.klines(symbol, "15m", INDICATOR_FETCH_LIMIT)
-    )
-    needed = max(
-        BB_PERIOD,
-        RSI_PERIOD,
-        ATR_PERIOD,
-        ADX_PERIOD * 2,
-        ATR_MEDIAN_LOOKBACK + ATR_PERIOD,
-    ) + 2
-    if len(rows) < needed:
-        return None
-
-    closes = [D(r[4]) for r in rows]
-    atrs = atr_series(rows)
-    rsis = rsi_series(closes)
-    adxs = adx_series(rows)
-    emas = ema_series(closes, EMA_PERIOD)
-    p, c = len(rows) - 2, len(rows) - 1
-
-    pa, ca = atrs[p], atrs[c]
-    prsi, crsi = rsis[p], rsis[c]
-    cadx = adxs[c]
-    ratio = atr_ratio(atrs, c)
-    if None in (pa, ca, prsi, crsi, cadx, ratio):
-        return None
-    assert pa is not None and ca is not None
-    assert prsi is not None and crsi is not None
-    assert cadx is not None and ratio is not None
-
-    close_time = int(rows[c][6])
-
-    if symbol == "BTCUSDT":
-        pz = rolling_z(closes, p)
-        cz = rolling_z(closes, c)
-        if pz is None or cz is None:
+    @property
+    def price_change(self) -> float | None:
+        if self.price_60s_ago is None:
             return None
-        if (
-            pz > BTC_BB_Z
-            and prsi > BTC_RSI_MIN
-            and cz < BTC_BB_Z
-            and prsi - crsi >= BTC_RSI_REVERSAL
-            and cadx <= BTC_ADX_MAX
-            and ratio <= BTC_ATR_RATIO_MAX
-        ):
-            detail = (
-                f"z={ds(pz)}->{ds(cz)} rsi={ds(prsi)}->{ds(crsi)} "
-                f"adx={ds(cadx)} atr_ratio={ds(ratio)}"
-            )
-            return Signal("short", close_time, ca, closes[c], detail)
-        return None
+        return self.current_price - self.price_60s_ago
 
-    if symbol == "ETHUSDT":
-        pz = rolling_z(closes, p)
-        cz = rolling_z(closes, c)
-        if pz is None or cz is None:
+    @property
+    def price_change_pct(self) -> float | None:
+        if self.price_60s_ago is None or self.price_60s_ago == 0:
             return None
-        if (
-            pz < -ETH_BB_Z
-            and prsi < ETH_RSI_MAX
-            and cz > -ETH_BB_Z
-            and crsi - prsi >= ETH_RSI_REVERSAL
-            and cadx <= ETH_ADX_MAX
-            and ratio <= ETH_ATR_RATIO_MAX
-        ):
-            detail = (
-                f"z={ds(pz)}->{ds(cz)} rsi={ds(prsi)}->{ds(crsi)} "
-                f"adx={ds(cadx)} atr_ratio={ds(ratio)}"
-            )
-            return Signal("long", close_time, ca, closes[c], detail)
-        return None
-
-    if symbol == "SOLUSDT":
-        upper_p = emas[p] + SOL_KELTNER_ATR * pa
-        lower_p = emas[p] - SOL_KELTNER_ATR * pa
-        upper_c = emas[c] + SOL_KELTNER_ATR * ca
-        lower_c = emas[c] - SOL_KELTNER_ATR * ca
-        common = cadx <= SOL_ADX_MAX and ratio <= SOL_ATR_RATIO_MAX
-        if (
-            common
-            and closes[p] < lower_p
-            and prsi < SOL_RSI_LONG_MAX
-            and closes[c] > lower_c
-            and crsi - prsi >= SOL_RSI_REVERSAL
-        ):
-            detail = (
-                f"lower={ds(lower_p)}->{ds(lower_c)} close={ds(closes[p])}->{ds(closes[c])} "
-                f"rsi={ds(prsi)}->{ds(crsi)} adx={ds(cadx)} atr_ratio={ds(ratio)}"
-            )
-            return Signal("long", close_time, ca, closes[c], detail)
-        if (
-            common
-            and closes[p] > upper_p
-            and prsi > SOL_RSI_SHORT_MIN
-            and closes[c] < upper_c
-            and prsi - crsi >= SOL_RSI_REVERSAL
-        ):
-            detail = (
-                f"upper={ds(upper_p)}->{ds(upper_c)} close={ds(closes[p])}->{ds(closes[c])} "
-                f"rsi={ds(prsi)}->{ds(crsi)} adx={ds(cadx)} atr_ratio={ds(ratio)}"
-            )
-            return Signal("short", close_time, ca, closes[c], detail)
-        return None
-
-    raise BotError(f"unsupported symbol {symbol}")
+        return (self.current_price / self.price_60s_ago - 1.0) * 100.0
 
 
-def exact_entry_kline(
-    api: Binance,
-    symbol: str,
-    interval: str,
-    expected_open_ms: int,
-    signal_close_time: int,
-) -> list[Any]:
-    """Fetch the exact entry candle, tolerating exchange boundary propagation lag.
+class RollingVolumeTracker:
+    """Maintain O(1)-amortized 10s/60s volume windows from aggregate trades."""
 
-    Binance can briefly expose the previous kline immediately after a timeframe
-    boundary. Poll the exact requested candle until the signal freshness deadline.
-    A stale/recovered shadow signal is allowed to fetch its historical entry candle
-    once so shadow accounting remains continuous without opening a stale live trade.
-    """
-    step_by_interval = {"1m": 60_000, "5m": 5 * 60_000}
-    if interval not in step_by_interval:
-        raise BotError(f"unsupported entry interval={interval}")
-    expected_open_ms = int(expected_open_ms)
-    deadline_ms = int(signal_close_time) + SIGNAL_MAX_AGE_MS
-    last_open: int | None = None
-    while True:
-        rows = api.klines(
-            symbol,
-            interval,
-            2,
-            start_time=expected_open_ms,
-            end_time=expected_open_ms + step_by_interval[interval] - 1,
-        )
-        for row in rows:
-            open_ms = int(row[0])
-            last_open = open_ms
-            if open_ms == expected_open_ms:
-                return row
+    def __init__(self) -> None:
+        self.trades_10s: deque[Trade] = deque()
+        self.trades_60s: deque[Trade] = deque()
+        self.volume_10s = 0.0
+        self.volume_60s = 0.0
+        self.price_60s_ago: float | None = None
+        self.last_timestamp_ms: int | None = None
+        self.last_agg_trade_id: int | None = None
 
-        now_ms = int(time.time() * 1000)
-        if now_ms >= deadline_ms:
-            raise BotError(
-                f"entry candle unavailable: {symbol} {interval} "
-                f"expected={expected_open_ms} last={last_open} now={now_ms}"
-            )
-        time.sleep(max(0.01, min(0.25, (deadline_ms - now_ms) / 1000)))
+    def reset(self) -> None:
+        self.trades_10s.clear()
+        self.trades_60s.clear()
+        self.volume_10s = 0.0
+        self.volume_60s = 0.0
+        self.price_60s_ago = None
+        self.last_timestamp_ms = None
+        self.last_agg_trade_id = None
 
-
-def latest_trade(api: Binance, symbol: str) -> tuple[Decimal, int]:
-    rows = api.klines(symbol, "5m", 2)
-    if not rows:
-        raise BotError(f"trade price unavailable for {symbol}")
-    # Binance's current kline close updates with the latest trade while the candle is open.
-    return D(rows[-1][4]), int(rows[-1][0])
-
-
-def latest_completed_15m_close_time(now_ms: int | None = None) -> int:
-    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-    return (now_ms // SIGNAL_INTERVAL_MS) * SIGNAL_INTERVAL_MS - 1
-
-
-def parse_pos(x: dict[str, Any]) -> Position:
-    return Position(
-        str(x["symbol"]),
-        D(x.get("positionAmt")),
-        D(x.get("entryPrice")),
-        D(x.get("breakEvenPrice") or x.get("entryPrice")),
-        D(x.get("markPrice")),
-        D(x.get("unRealizedProfit")),
-        D(x.get("liquidationPrice")),
-    )
-
-
-def open_positions(api: Binance) -> list[Position]:
-    return [p for p in map(parse_pos, api.positions()) if p.open]
-
-
-def one_position(api: Binance, symbol: str) -> Position:
-    rows = [
-        parse_pos(x)
-        for x in api.positions(symbol)
-        if str(x.get("symbol")) == symbol
-    ]
-    opens = [p for p in rows if p.open]
-    if len(opens) > 1:
-        raise BotError(f"multiple live rows for {symbol}")
-    return (
-        opens[0]
-        if opens
-        else rows[0]
-        if rows
-        else Position(symbol, D(0), D(0), D(0), D(0), D(0), D(0))
-    )
-
-
-def load_rules(api: Binance) -> dict[str, Rules]:
-    info = api.req("GET", "/fapi/v1/exchangeInfo")
-    out: dict[str, Rules] = {}
-    for s in info.get("symbols", []):
-        if s.get("symbol") not in SYMBOLS:
-            continue
-        fs = {f["filterType"]: f for f in s.get("filters", [])}
-        lot = fs.get("MARKET_LOT_SIZE") or fs["LOT_SIZE"]
-        if D(lot.get("stepSize")) <= 0:
-            lot = fs["LOT_SIZE"]
-        nf = fs.get("MIN_NOTIONAL") or fs.get("NOTIONAL") or {}
-        out[s["symbol"]] = Rules(
-            D(lot["stepSize"]),
-            D(lot["minQty"]),
-            D(nf.get("notional") or nf.get("minNotional")),
-        )
-    if set(out) != set(SYMBOLS):
-        raise BotError("missing symbol filters")
-    return out
-
-
-def timestamp_ms(value: str) -> int:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return int(parsed.timestamp() * 1000)
-
-
-def seed_shadow_gate(state: State) -> None:
-    """Initialize the causal gate from completed audited shadow trades.
-
-    A fresh live state cannot reproduce a 40-trade gate from a short REST
-    window.  The checked audit ledgers are therefore the explicit seed.  Once
-    seeded, every later shadow trade is simulated and persisted locally.
-    """
-    shadow = state.data["shadow"]
-    if shadow.get("seeded") or int(shadow.get("completed_count", 0)) > 0:
-        return
-    now_ms = int(time.time() * 1000)
-    events: list[tuple[int, int, str, Decimal]] = []
-    missing: list[str] = []
-    for path in SHADOW_SEED_FILES:
-        if not path.exists():
-            missing.append(str(path))
-            continue
-        with path.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                entry_ms = timestamp_ms(row["entry_time"])
-                exit_ms = timestamp_ms(row["exit_time"])
-                if exit_ms <= now_ms:
-                    events.append((entry_ms, exit_ms, row["symbol"], D(row["net_return"])))
-    if missing or len(events) < GATE_SPAN:
-        if now_ms >= int(EMBEDDED_GATE_SEED["seeded_through_ms"]):
-            shadow.update(
-                {
-                    "completed_count": EMBEDDED_GATE_SEED["completed_count"],
-                    "ewm": EMBEDDED_GATE_SEED["ewm"],
-                    "gate_on": EMBEDDED_GATE_SEED["gate_on"],
-                    "position": None,
-                    "seeded": True,
-                    "seeded_through_ms": EMBEDDED_GATE_SEED["seeded_through_ms"],
-                }
-            )
-            state.data["last_signal"].update(EMBEDDED_GATE_SEED["last_signal"])
-            state.save()
+    def add(self, trade: Trade) -> VolumeSnapshot | None:
+        if self.last_agg_trade_id is not None and trade.agg_trade_id <= self.last_agg_trade_id:
+            return None
+        if self.last_timestamp_ms is not None and trade.timestamp_ms < self.last_timestamp_ms:
             LOG.warning(
-                "GATE_SEEDED_EMBEDDED completed=%s ewm=%s sampled_gate=%s through=%s",
-                shadow["completed_count"],
-                shadow["ewm"],
-                shadow["gate_on"],
-                shadow["seeded_through_ms"],
+                "ignoring out-of-order aggTrade id=%s timestamp=%s last_timestamp=%s",
+                trade.agg_trade_id,
+                trade.timestamp_ms,
+                self.last_timestamp_ms,
             )
-            return
-        message = (
-            "shadow gate seed unavailable; missing=" + ",".join(missing)
-            if missing
-            else f"shadow gate seed has {len(events)} trades; {GATE_SPAN} required"
+            return None
+
+        self.last_agg_trade_id = trade.agg_trade_id
+        self.last_timestamp_ms = trade.timestamp_ms
+        self.trades_10s.append(trade)
+        self.trades_60s.append(trade)
+        self.volume_10s += trade.quantity
+        self.volume_60s += trade.quantity
+
+        cutoff_10s = trade.timestamp_ms - 10_000
+        while self.trades_10s and self.trades_10s[0].timestamp_ms < cutoff_10s:
+            expired = self.trades_10s.popleft()
+            self.volume_10s -= expired.quantity
+
+        cutoff_60s = trade.timestamp_ms - 60_000
+        while self.trades_60s and self.trades_60s[0].timestamp_ms < cutoff_60s:
+            expired = self.trades_60s.popleft()
+            self.volume_60s -= expired.quantity
+            self.price_60s_ago = expired.price
+
+        if abs(self.volume_10s) < 1e-12:
+            self.volume_10s = 0.0
+        if abs(self.volume_60s) < 1e-12:
+            self.volume_60s = 0.0
+
+        return VolumeSnapshot(
+            timestamp_ms=trade.timestamp_ms,
+            current_price=trade.price,
+            volume_10s=self.volume_10s,
+            volume_60s=self.volume_60s,
+            price_60s_ago=self.price_60s_ago,
         )
-        if LIVE and not ALLOW_COLD_GATE:
-            raise BotError(message + "; set ALLOW_COLD_GATE=1 only to start a new 40-trade warmup")
-        LOG.warning("%s; gate starts cold", message)
-        shadow["seeded"] = True
-        state.save()
-        return
-
-    count = 0
-    current: Decimal | None = None
-    sampled_gate = False
-    latest_exit = 0
-    last_signal = dict(state.data.get("last_signal", {}))
-    for entry_ms, exit_ms, symbol, trade_return in sorted(events):
-        if trade_return <= -D(1):
-            raise BotError(f"invalid seeded shadow return={trade_return} at {entry_ms}")
-        sampled_gate = count >= GATE_SPAN and current is not None and current > GATE_THRESHOLD
-        current = (
-            trade_return
-            if current is None
-            else (D(1) - GATE_ALPHA) * current + GATE_ALPHA * trade_return
-        )
-        count += 1
-        latest_exit = max(latest_exit, exit_ms)
-        last_signal[symbol] = max(int(last_signal.get(symbol, 0)), entry_ms - 1)
-
-    shadow.update(
-        {
-            "completed_count": count,
-            "ewm": ds(current) if current is not None else None,
-            "gate_on": sampled_gate,
-            "position": None,
-            "seeded": True,
-            "seeded_through_ms": latest_exit,
-        }
-    )
-    state.data["last_signal"] = last_signal
-    state.save()
-    LOG.warning(
-        "GATE_SEEDED completed=%s ewm=%s sampled_gate=%s through=%s",
-        count,
-        ds(current) if current is not None else "n/a",
-        sampled_gate,
-        latest_exit,
-    )
 
 
+class SpikeDetector:
+    def __init__(self, threshold_60s: float, threshold_10s: float, reset_threshold: float):
+        self.threshold_60s = threshold_60s
+        self.threshold_10s = threshold_10s
+        self.reset_threshold = reset_threshold
+        self.alerted = False
 
-def historical_klines(
-    api: Binance,
-    symbol: str,
-    interval: str,
-    start_time: int,
-    end_time: int,
-    limit: int = 1500,
-) -> list[list[Any]]:
-    """Fetch an exact historical kline interval, failing on gaps/duplicates.
+    def reset(self) -> None:
+        self.alerted = False
 
-    Startup gate reconstruction is risk state, so incomplete exchange history is
-    treated as fatal instead of silently approximated.
-    """
-    step_by_interval = {"1m": 60_000, "15m": SIGNAL_INTERVAL_MS}
-    if interval not in step_by_interval:
-        raise BotError(f"unsupported historical interval={interval}")
-    step = step_by_interval[interval]
-    if end_time < start_time:
-        return []
-    cursor = start_time
-    rows: list[list[Any]] = []
-    while cursor <= end_time:
-        page = api.klines(
-            symbol,
-            interval,
-            limit,
-            start_time=cursor,
-            end_time=end_time,
-        )
-        page = sorted(
-            (row for row in page if cursor <= int(row[0]) <= end_time),
-            key=lambda row: int(row[0]),
-        )
-        if not page:
-            break
-        rows.extend(page)
-        newest = int(page[-1][0])
-        if newest < cursor:
-            raise BotError(f"{symbol} {interval} history cursor did not advance")
-        cursor = newest + step
-        if len(page) < limit:
-            break
-
-    dedup: dict[int, list[Any]] = {}
-    for row in rows:
-        open_ms = int(row[0])
-        if open_ms in dedup:
-            raise BotError(f"duplicate {symbol} {interval} candle at {open_ms}")
-        dedup[open_ms] = row
-    ordered = [dedup[key] for key in sorted(dedup)]
-    expected = list(range(start_time, end_time + 1, step))
-    actual = [int(row[0]) for row in ordered]
-    if actual != expected:
-        missing = sorted(set(expected) - set(actual))
-        extra = sorted(set(actual) - set(expected))
-        raise BotError(
-            f"incomplete {symbol} {interval} history start={start_time} end={end_time} "
-            f"expected={len(expected)} actual={len(actual)} "
-            f"missing_head={missing[:3]} extra_head={extra[:3]}"
-        )
-    return ordered
-
-
-def _shadow_trade_levels(symbol: str, s: Signal, entry: Decimal) -> dict[str, Any]:
-    profile = PROFILES[symbol]
-    side_sign = D(1) if s.side == "long" else D(-1)
-    qty_abs = profile.notional_mult / entry
-    qty = side_sign * qty_abs
-    wallet = D(1) - profile.notional_mult * SHADOW_COST
-    if s.side == "long":
-        take_profit = entry + profile.tp_atr * s.atr
-        atr_stop = entry - profile.sl_atr * s.atr
-        hard_stop = (
-            entry * (D(1) + SHADOW_COST) - profile.hard_stop / qty_abs
-        ) / (D(1) - SHADOW_COST)
-        stop = max(atr_stop, hard_stop)
-    else:
-        take_profit = entry - profile.tp_atr * s.atr
-        atr_stop = entry + profile.sl_atr * s.atr
-        hard_stop = (
-            entry * (D(1) - SHADOW_COST) + profile.hard_stop / qty_abs
-        ) / (D(1) + SHADOW_COST)
-        stop = min(atr_stop, hard_stop)
-    return {
-        "profile": profile,
-        "qty": qty,
-        "qty_abs": qty_abs,
-        "wallet": wallet,
-        "take_profit": take_profit,
-        "stop": stop,
-    }
-
-
-def simulate_historical_shadow(
-    api: Binance,
-    symbol: str,
-    s: Signal,
-    cutoff_open_ms: int,
-) -> dict[str, Any]:
-    """Replay one shadow trade with the same minute/funding semantics as live."""
-    entry_open_ms = s.close_time + 1
-    if entry_open_ms > cutoff_open_ms:
-        raise BotError(
-            f"shadow entry {entry_open_ms} is newer than closed-minute cutoff {cutoff_open_ms}"
-        )
-    profile = PROFILES[symbol]
-    max_exit_ms = entry_open_ms + profile.max_hold_minutes * 60_000
-    end_open_ms = min(max_exit_ms, cutoff_open_ms)
-    rows = historical_klines(api, symbol, "1m", entry_open_ms, end_open_ms)
-    if not rows:
-        raise BotError(f"historical shadow entry candle unavailable for {symbol}")
-
-    entry = D(rows[0][1])
-    levels = _shadow_trade_levels(symbol, s, entry)
-    qty = D(levels["qty"])
-    qty_abs = D(levels["qty_abs"])
-    wallet = D(levels["wallet"])
-    take_profit = D(levels["take_profit"])
-    stop = D(levels["stop"])
-
-    funding_rows = api.funding_rates(symbol, entry_open_ms, int(rows[-1][6]))
-    funding_by_minute: dict[int, list[dict[str, Any]]] = {}
-    for funding in funding_rows:
-        funding_time = int(funding["fundingTime"])
-        minute = (funding_time // 60_000) * 60_000
-        funding_by_minute.setdefault(minute, []).append(funding)
-    last_funding_time = entry_open_ms - 1
-
-    for row in rows:
-        open_ms = int(row[0])
-        open_price, high, low = D(row[1]), D(row[2]), D(row[3])
-        if open_ms > entry_open_ms:
-            for funding in funding_by_minute.get(open_ms, []):
-                funding_time = int(funding["fundingTime"])
-                if funding_time <= last_funding_time:
-                    continue
-                mark = D(funding.get("markPrice"), row[1])
-                wallet -= qty * mark * D(funding["fundingRate"])
-                last_funding_time = funding_time
-
-        open_equity = wallet + qty * (open_price - entry)
-        reason: str | None = None
-        exit_price = D(0)
-        if open_equity <= D("0.005") * qty_abs * open_price:
-            reason = "liquidation_gap"
-            exit_price = open_price
-        else:
-            stop_hit = (qty > 0 and low <= stop) or (qty < 0 and high >= stop)
-            target_hit = (qty > 0 and high >= take_profit) or (
-                qty < 0 and low <= take_profit
-            )
-            if stop_hit:
-                exit_price = min(stop, open_price) if qty > 0 else max(stop, open_price)
-                reason = "stop"
-            elif target_hit:
-                exit_price = max(take_profit, open_price) if qty > 0 else min(
-                    take_profit, open_price
-                )
-                reason = "take_profit"
-            elif open_ms >= max_exit_ms:
-                exit_price = open_price
-                reason = "max_hold"
-
-        if reason is not None:
-            if reason == "liquidation_gap":
-                trade_return = D("-1")
-            else:
-                wallet += qty * (exit_price - entry) - qty_abs * exit_price * SHADOW_COST
-                trade_return = wallet - D(1)
-            return {
-                "completed": True,
-                "exit_close_ms": int(row[6]),
-                "trade_return": trade_return,
-                "reason": reason,
-                "exit_price": exit_price,
-            }
-
-    raw = {
-        "symbol": symbol,
-        "side": s.side,
-        "entry": ds(entry),
-        "qty": ds(qty),
-        "wallet": ds(wallet),
-        "take_profit": ds(take_profit),
-        "stop": ds(stop),
-        "entry_open_ms": entry_open_ms,
-        "last_processed_open_ms": int(rows[-1][0]),
-        "last_funding_time_ms": last_funding_time,
-        "funding_checked_through_ms": int(rows[-1][6]),
-        "max_exit_ms": max_exit_ms,
-    }
-    return {"completed": False, "position": raw}
-
-
-def _apply_catchup_completion(shadow: dict[str, Any], result: dict[str, Any]) -> None:
-    trade_return = D(result["trade_return"])
-    count = int(shadow.get("completed_count", 0))
-    prior = D(shadow.get("ewm")) if shadow.get("ewm") is not None else None
-    updated = (
-        trade_return
-        if prior is None
-        else (D(1) - GATE_ALPHA) * prior + GATE_ALPHA * trade_return
-    )
-    shadow["completed_count"] = count + 1
-    shadow["ewm"] = ds(updated)
-    shadow["position"] = None
-
-
-def catch_up_shadow_gate(api: Binance, state: State, now_ms: int | None = None) -> None:
-    """Causally reconstruct seed-to-startup shadow history before live orders.
-
-    This intentionally preserves the research gate sampling timing: a gate value
-    is sampled when a new shadow trade starts; a completed trade updates EWM,
-    while gate_on is resampled only at the next eligible shadow entry.
-    """
-    if state.legacy:
-        raise BotError("cannot catch up a legacy state")
-    shadow = state.data["shadow"]
-    if shadow.get("catchup_complete"):
-        return
-    if not shadow.get("seeded"):
-        raise BotError("shadow gate must be seeded before catch-up")
-    if shadow.get("position"):
-        raise BotError("startup catch-up requires a flat seeded shadow state")
-
-    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
-    seed_through = int(shadow.get("seeded_through_ms") or 0)
-    target_close = latest_completed_15m_close_time(now_ms)
-    latest_closed_1m_open = (now_ms // 60_000) * 60_000 - 60_000
-    if seed_through <= 0:
-        raise BotError("invalid shadow seeded_through_ms")
-    if latest_closed_1m_open < 0:
-        raise BotError("invalid closed-minute cutoff")
-
-    first_close = ((seed_through // SIGNAL_INTERVAL_MS) + 1) * SIGNAL_INTERVAL_MS - 1
-    before_count = int(shadow.get("completed_count", 0))
-    LOG.warning(
-        "GATE_CATCHUP_START from=%s to=%s completed=%s ewm=%s sampled_gate=%s",
-        seed_through,
-        target_close,
-        before_count,
-        shadow.get("ewm"),
-        shadow.get("gate_on"),
-    )
-
-    if first_close > target_close:
-        shadow["catchup_complete"] = True
-        shadow["catchup_through_ms"] = target_close
-        state.data["last_strategy_bar_close"] = target_close
-        state.save()
-        LOG.warning(
-            "GATE_CATCHUP_COMPLETE from=%s to=%s added_trades=0 completed=%s "
-            "ewm=%s gate_on=%s",
-            seed_through,
-            target_close,
-            before_count,
-            shadow.get("ewm"),
-            shadow.get("gate_on"),
-        )
-        return
-
-    first_open = first_close - SIGNAL_INTERVAL_MS + 1
-    warmup_open = max(
-        0, first_open - (INDICATOR_FETCH_LIMIT - 1) * SIGNAL_INTERVAL_MS
-    )
-    target_open = target_close - SIGNAL_INTERVAL_MS + 1
-    rows_by_symbol = {
-        symbol: historical_klines(
-            api, symbol, "15m", warmup_open, target_open, INDICATOR_FETCH_LIMIT
-        )
-        for symbol in SYMBOLS
-    }
-    index_by_close = {
-        symbol: {int(row[6]): i for i, row in enumerate(rows)}
-        for symbol, rows in rows_by_symbol.items()
-    }
-    replay_closes = list(range(first_close, target_close + 1, SIGNAL_INTERVAL_MS))
-    for close_time in replay_closes:
-        missing = [symbol for symbol in SYMBOLS if close_time not in index_by_close[symbol]]
-        if missing:
-            raise BotError(
-                f"historical 15m alignment missing close_time={close_time} symbols={missing}"
-            )
-
-    # Work on a detached JSON copy so an exception cannot persist a partially
-    # reconstructed gate. seed_shadow_gate itself is the only pre-catchup write.
-    working = json.loads(json.dumps(state.data))
-    shadow = working["shadow"]
-    scheduled: dict[str, Any] | None = None
-
-    for close_time in replay_closes:
-        if (
-            scheduled is not None
-            and scheduled.get("completed")
-            and int(scheduled["exit_close_ms"]) <= close_time
-        ):
-            _apply_catchup_completion(shadow, scheduled)
-            scheduled = None
-
-        candidates: list[tuple[str, Signal]] = []
-        for symbol in SYMBOLS:
-            rows = rows_by_symbol[symbol]
-            idx = index_by_close[symbol][close_time]
-            start = max(0, idx - INDICATOR_FETCH_LIMIT + 1)
-            current = signal_for(api, symbol, rows[start : idx + 1])
-            if current and current.close_time > int(
-                working["last_signal"].get(symbol, 0)
-            ):
-                candidates.append((symbol, current))
-                working["last_signal"][symbol] = current.close_time
-
-        if candidates and scheduled is None:
-            count = int(shadow.get("completed_count", 0))
-            current_ewm = D(shadow.get("ewm")) if shadow.get("ewm") is not None else None
-            gate_on = (
-                count >= GATE_SPAN
-                and current_ewm is not None
-                and current_ewm > GATE_THRESHOLD
-            )
-            shadow["gate_on"] = gate_on
-            symbol, selected = candidates[0]
-            scheduled = simulate_historical_shadow(
-                api, symbol, selected, latest_closed_1m_open
-            )
-            if not scheduled.get("completed"):
-                shadow["position"] = scheduled["position"]
-
-    if scheduled is not None and scheduled.get("completed"):
-        if int(scheduled["exit_close_ms"]) > latest_closed_1m_open + 59_999:
-            raise BotError("historical shadow completion exceeds closed-minute cutoff")
-        _apply_catchup_completion(shadow, scheduled)
-        scheduled = None
-
-    shadow["catchup_complete"] = True
-    shadow["catchup_through_ms"] = target_close
-    working["last_strategy_bar_close"] = target_close
-    state.data = working
-    state.save()
-    added = int(shadow.get("completed_count", 0)) - before_count
-    LOG.warning(
-        "GATE_CATCHUP_COMPLETE from=%s to=%s added_trades=%s completed=%s ewm=%s "
-        "gate_on=%s shadow_open=%s",
-        seed_through,
-        target_close,
-        added,
-        shadow.get("completed_count"),
-        shadow.get("ewm"),
-        shadow.get("gate_on"),
-        bool(shadow.get("position")),
-    )
-
-def rolling_return_vol(closes: list[Decimal], window: int) -> list[Decimal | None]:
-    returns: list[Decimal | None] = [None]
-    returns.extend(closes[i] / closes[i - 1] - D(1) for i in range(1, len(closes)))
-    out: list[Decimal | None] = [None] * len(closes)
-    for i in range(window, len(closes)):
-        sample = [x for x in returns[i - window + 1 : i + 1] if x is not None]
-        if len(sample) != window:
-            continue
-        mean = sum(sample, D(0)) / D(window)
-        variance = sum((x - mean) ** 2 for x in sample) / D(window)
-        out[i] = variance.sqrt()
-    return out
-
-
-def fallback_snapshot(rows_by_symbol: dict[str, list[list[Any]]]) -> dict[str, Any]:
-    """Reconstruct the locked EMA selector from aligned completed 15m rows."""
-    maps = {
-        symbol: {int(row[6]): row for row in rows}
-        for symbol, rows in rows_by_symbol.items()
-    }
-    common = sorted(set.intersection(*(set(rows) for rows in maps.values())))
-    if len(common) < FALLBACK_SLOW + FALLBACK_VOL_WINDOW:
-        raise BotError(f"fallback warmup unavailable: only {len(common)} common candles")
-    closes = {
-        symbol: [D(maps[symbol][close_time][4]) for close_time in common]
-        for symbol in SYMBOLS
-    }
-    fast = {symbol: ema_series(values, FALLBACK_FAST) for symbol, values in closes.items()}
-    slow = {symbol: ema_series(values, FALLBACK_SLOW) for symbol, values in closes.items()}
-    vols = {
-        symbol: rolling_return_vol(values, FALLBACK_VOL_WINDOW)
-        for symbol, values in closes.items()
-    }
-    scale = D(FALLBACK_SLOW - FALLBACK_FAST).sqrt()
-    score_rows: list[dict[str, Decimal | None]] = []
-    for i in range(len(common)):
-        scores: dict[str, Decimal | None] = {}
-        for symbol in SYMBOLS:
-            vol = vols[symbol][i]
-            scores[symbol] = (
-                None
-                if vol is None or vol <= 0
-                else (fast[symbol][i] / slow[symbol][i] - D(1)) / (vol * scale)
-            )
-        score_rows.append(scores)
-
-    current_symbol: str | None = None
-    current_dir = 0
-    held = 0
-    for scores in score_rows:
-        best_symbol: str | None = None
-        best_strength = D("-1")
-        best_dir = 0
-        for symbol in SYMBOLS:
-            value = scores[symbol]
-            if value is not None and abs(value) >= 0 and abs(value) > best_strength:
-                best_symbol = symbol
-                best_strength = abs(value)
-                best_dir = 1 if value > 0 else -1
-        keep = False
-        if current_symbol is not None:
-            value = scores[current_symbol]
-            if value is not None and (1 if value > 0 else -1) == current_dir:
-                keep = True
-                if (
-                    held >= FALLBACK_MIN_HOLD
-                    and best_symbol is not None
-                    and best_symbol != current_symbol
-                    and best_strength > abs(value) * FALLBACK_SWITCH_MULTIPLE
-                ):
-                    keep = False
-        if keep:
-            held += 1
-        elif best_symbol is not None:
-            current_symbol = best_symbol
-            current_dir = best_dir
-            held = 1
-        else:
-            current_symbol = None
-            current_dir = 0
-            held = 0
-
-    if current_symbol is None:
-        return {
-            "close_time": common[-1], "desired": 0, "held_bars": 0,
-            "score": None, "vol": None, "leverage": None,
-        }
-    latest_score = score_rows[-1][current_symbol]
-    latest_vol = vols[current_symbol][-1]
-    assert latest_score is not None and latest_vol is not None
-    leverage = min(FALLBACK_MAX_LEVERAGE, FALLBACK_TARGET_BAR_VOL / latest_vol)
-    desired = (SYMBOLS.index(current_symbol) + 1) * current_dir
-    return {
-        "close_time": common[-1],
-        "desired": desired,
-        "held_bars": held,
-        "score": latest_score,
-        "vol": latest_vol,
-        "leverage": leverage,
-    }
-
-
-class Bot:
-    def __init__(self, api: Binance, state: State, rules: dict[str, Rules]):
-        self.api, self.state, self.rules = api, state, rules
-        self.last_signal_scan = 0.0
-        self.last_shadow_sync = 0.0
-
-    def qty(self, symbol: str, notional: Decimal, price: Decimal) -> Decimal:
-        r = self.rules[symbol]
-        q = r.floor(notional / price)
-        if (
-            q < r.min_qty
-            or q <= 0
-            or (r.min_notional > 0 and q * price < r.min_notional)
-        ):
-            raise OrderBelowMinimum(
-                f"{symbol} order below exchange minimum; bot will not auto-upsize"
-            )
-        return q
-
-    def reconcile_pending(self) -> bool:
-        x = self.state.data.get("pending_order")
-        if not x:
+    def evaluate(self, snapshot: VolumeSnapshot, allow_trigger: bool = True) -> bool:
+        if self.alerted:
+            if snapshot.volume_60s < self.reset_threshold:
+                self.alerted = False
             return False
+
+        if not snapshot.ready or not allow_trigger:
+            return False
+
+        if (
+            snapshot.volume_60s >= self.threshold_60s
+            and snapshot.volume_10s >= self.threshold_10s
+        ):
+            self.alerted = True
+            return True
+        return False
+
+
+@dataclass
+class CandleState:
+    open_time_ms: int | None = None
+    open_price: float | None = None
+
+    def reset(self) -> None:
+        self.open_time_ms = None
+        self.open_price = None
+
+    def update(self, kline: dict[str, Any]) -> None:
+        self.open_time_ms = int(kline["t"])
+        self.open_price = float(kline["o"])
+
+    def direction_emoji(self, trade: Trade) -> str | None:
+        expected_open_ms = trade.timestamp_ms // 60_000 * 60_000
+        if self.open_time_ms != expected_open_ms or self.open_price is None:
+            return None
+        return "🔵" if trade.price >= self.open_price else "🔴"
+
+
+def display_symbol(symbol: str) -> str:
+    return symbol[:-4] if symbol.endswith("USDT") and len(symbol) > 4 else symbol
+
+
+def format_volume_btc(volume: float) -> str:
+    if volume >= 1000:
+        text = f"{volume / 1000:.2f}".rstrip("0").rstrip(".")
+        return f"{text}K BTC"
+    if volume >= 100:
+        return f"{volume:.0f} BTC"
+    return f"{volume:.2f}".rstrip("0").rstrip(".") + " BTC"
+
+
+def format_signed_usd(value: float) -> str:
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):,.0f}"
+
+
+def build_alert_message(symbol: str, emoji: str, snapshot: VolumeSnapshot) -> str:
+    price_change = snapshot.price_change
+    price_change_pct = snapshot.price_change_pct
+    if price_change is None or price_change_pct is None:
+        raise ValueError("snapshot is not warmed up for a 60-second price change")
+
+    when = datetime.fromtimestamp(snapshot.timestamp_ms / 1000, tz=KST).strftime("%H:%M:%S KST")
+    return (
+        f"{emoji} {display_symbol(symbol)} 거래량 급증\n"
+        f"{when} | {format_volume_btc(snapshot.volume_60s)} | "
+        f"${snapshot.current_price:,.0f} | {format_signed_usd(price_change)} "
+        f"({price_change_pct:+.2f}%)"
+    )
+
+
+def send_telegram_sync(config: Config, text: str) -> None:
+    endpoint = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+    body = urlencode({"chat_id": config.telegram_chat_id, "text": text}).encode("utf-8")
+    request = Request(
+        endpoint,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urlopen(request, timeout=config.telegram_timeout_seconds) as response:
+        raw = response.read().decode("utf-8")
+    payload = json.loads(raw) if raw else {}
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram sendMessage failed: {payload}")
+
+
+class VolumeSpikeBot:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.tracker = RollingVolumeTracker()
+        self.detector = SpikeDetector(
+            config.volume_60s_threshold,
+            config.volume_10s_threshold,
+            config.volume_reset_threshold,
+        )
+        self.candle = CandleState()
+        self.notification_tasks: set[asyncio.Task[None]] = set()
+        self.warmup_logged = False
+
+    def reset_stream_state(self) -> None:
+        self.tracker.reset()
+        self.detector.reset()
+        self.candle.reset()
+        self.warmup_logged = False
+
+    def _schedule_notification(self, text: str) -> None:
+        task = asyncio.create_task(self._send_notification(text))
+        self.notification_tasks.add(task)
+        task.add_done_callback(self.notification_tasks.discard)
+
+    async def _send_notification(self, text: str) -> None:
         try:
-            order = self.api.get_order(x["symbol"], x["cid"])
-        except BinanceError as e:
-            if e.code == -2013:
-                self.state.data["pending_order"] = None
-                self.state.save()
-                return False
-            raise BotError(f"cannot reconcile pending order: {e}") from e
-        if order.get("status") != "FILLED":
-            raise BotError(f"pending order status={order.get('status')}; manual review")
-        return True
+            await asyncio.to_thread(send_telegram_sync, self.config, text)
+            LOG.info("telegram alert sent: %s", text.replace("\n", " | "))
+        except Exception:
+            LOG.exception("failed to send Telegram alert")
 
-    def market(
-        self, symbol: str, side: str, qty: Decimal, reduce: bool, action: str
-    ) -> None:
-        if self.state.data.get("pending_order") and self.reconcile_pending():
-            raise BotError("previous market order filled but local transition is incomplete")
-        cid = (
-            f"rv{action}{int(time.time() * 1000) % 10**10}{secrets.token_hex(3)}"
-        )[:36]
-        self.state.data["pending_order"] = {
-            "symbol": symbol,
-            "cid": cid,
-            "action": action,
-            "qty": ds(qty),
-        }
-        self.state.save()
-        try:
-            order = self.api.order(symbol, side, qty, reduce, cid)
-        except (BinanceError, BotError) as e:
-            if self.reconcile_pending():
-                return
-            raise BotError(f"market order not confirmed: {e}") from e
-        if order.get("status") not in (None, "FILLED"):
-            raise BotError(f"unexpected market status={order.get('status')}")
+    async def process_message(self, raw: str | bytes) -> None:
+        payload = json.loads(raw)
+        data = payload.get("data", payload)
+        event_type = data.get("e")
 
-    def clear_pending(self) -> None:
-        self.state.data["pending_order"] = None
-        self.state.save()
-
-    def bootstrap(self) -> None:
-        if not LIVE:
-            LOG.warning("LIVE_TRADING=0: signal-only mode")
-            if self.state.legacy:
-                LOG.warning("legacy state is not migrated in signal-only mode")
-                return
-            seed_shadow_gate(self.state)
-            catch_up_shadow_gate(self.api, self.state)
+        if event_type == "kline":
+            kline = data.get("k")
+            if isinstance(kline, dict):
+                self.candle.update(kline)
             return
 
-        pos = open_positions(self.api)
-
-        if self.state.legacy:
-            if pos:
-                raise BotError(
-                    "legacy strategy position/state detected. Do not let the new "
-                    "gate-catchup strategy take over an older live position; "
-                    "finish/close it with the matching old bot first."
-                )
-            LOG.warning(
-                "migrating flat state v%s to %s with full gate reconstruction",
-                self.state.loaded_version,
-                STRATEGY_ID,
-            )
-            self.state.rebuild_for_strategy()
-
-        seed_shadow_gate(self.state)
-        catch_up_shadow_gate(self.api, self.state)
-
-        if self.reconcile_pending():
-            raise BotError("recovered FILLED pending order; manual state reconciliation required")
-
-        if len(pos) > 1:
-            raise BotError("more than one futures position is open")
-        if self.api.open_orders():
-            raise BotError("existing USD-M open orders block this bot")
-
-        if pos:
-            p = pos[0]
-            active_strategy = self.state.data.get("active_strategy")
-            required = ["active_symbol", "side", "cycle_equity", "opened_at_ms"]
-            if active_strategy == "snapback":
-                required.extend(("entry_atr", "signal_reference"))
-            if (
-                self.state.data.get("strategy") != STRATEGY_ID
-                or active_strategy not in ("snapback", "fallback")
-                or p.symbol not in SYMBOLS
-                or self.state.data.get("active_symbol") != p.symbol
-                or self.state.data.get("side") != p.side
-                or not self.state.data.get("live_account_initialized")
-                or any(self.state.data.get(k) is None for k in required)
-            ):
-                raise BotError(f"unknown/incompatible live position: {p}")
+        if event_type != "aggTrade":
             return
 
-        if self.state.data.get("active_symbol"):
-            self.state.reset_cycle()
-
-        if not self.state.data.get("live_account_initialized"):
-            account = self.api.account()
-            actual = D(
-                account.get("totalMarginBalance") or account.get("totalWalletBalance")
-            )
-            if not INITIAL_EQUITY_MIN <= actual <= INITIAL_EQUITY_MAX:
-                raise BotError(
-                    f"initial futures equity {ds(actual)} is outside the configured "
-                    f"{ds(INITIAL_EQUITY_MIN)}..{ds(INITIAL_EQUITY_MAX)} USDT guard"
-                )
-            self.state.data["live_account_initialized"] = True
-            self.state.data["initial_live_equity"] = ds(actual)
-            self.state.save()
-            LOG.warning(
-                "LIVE_ACCOUNT_INITIALIZED equity=%s guard=%s..%s sizing_cap=%s",
-                ds(actual),
-                ds(INITIAL_EQUITY_MIN),
-                ds(INITIAL_EQUITY_MAX),
-                ds(SIZING_CAP),
-            )
-
-        if self.api.position_mode():
-            self.api.set_one_way()
-
-    def open_signal(self, symbol: str, s: Signal) -> None:
-        if open_positions(self.api) or self.api.open_orders():
-            return
-        if self.api.position_mode():
-            raise BotError("one-way mode required")
-
-        profile = SNAPBACK_LIVE_PROFILES[symbol]
-        max_notional = self.api.configure(symbol)
-        account = self.api.account()
-        actual = D(account.get("totalMarginBalance") or account.get("totalWalletBalance"))
-        if actual <= 0:
-            raise BotError("invalid futures equity")
-        equity = min(actual, SIZING_CAP) if SIZING_CAP > 0 else actual
-
-        entry_row = exact_entry_kline(
-            self.api, symbol, "5m", s.close_time + 1, s.close_time
+        trade = Trade(
+            timestamp_ms=int(data["T"]),
+            price=float(data["p"]),
+            quantity=float(data["q"]),
+            agg_trade_id=int(data["a"]),
         )
-        trade, candle = D(entry_row[4]), int(entry_row[0])
-        notional = equity * profile.notional_mult
-        if max_notional > 0 and notional > max_notional:
-            raise BotError(
-                f"{symbol} desired notional {ds(notional)} exceeds leverage-bracket "
-                f"maximum {ds(max_notional)}; set SIZING_EQUITY_CAP_USDT explicitly"
-            )
-        try:
-            q = self.qty(symbol, notional, trade)
-        except OrderBelowMinimum as e:
-            self.state.data["last_signal"][symbol] = s.close_time
-            self.state.save()
-            LOG.warning(
-                "SKIP_ENTRY %s %s close_time=%s trade=%s sizing_equity=%s "
-                "notional_mult=%s reason=%s",
-                symbol,
-                s.side,
-                s.close_time,
-                ds(trade),
-                ds(equity),
-                ds(profile.notional_mult),
-                e,
-            )
+        snapshot = self.tracker.add(trade)
+        if snapshot is None:
             return
 
+        if snapshot.ready and not self.warmup_logged:
+            LOG.info("rolling 60s window warmed up; spike detection active")
+            self.warmup_logged = True
+
+        emoji = self.candle.direction_emoji(trade)
+        if not self.detector.evaluate(snapshot, allow_trigger=emoji is not None):
+            return
+
+        assert emoji is not None
+        message = build_alert_message(self.config.symbol, emoji, snapshot)
         LOG.warning(
-            "OPEN_SNAPBACK %s %s qty=%s trade=%s sizing_equity=%s notional_mult=%s "
-            "signal_atr=%s detail=[%s]",
-            symbol,
-            s.side,
-            ds(q),
-            ds(trade),
-            ds(equity),
-            ds(profile.notional_mult),
-            ds(s.atr),
-            s.detail,
+            "VOLUME_SPIKE volume_60s=%.3f volume_10s=%.3f price=%.2f change=%.2f pct=%.4f",
+            snapshot.volume_60s,
+            snapshot.volume_10s,
+            snapshot.current_price,
+            snapshot.price_change,
+            snapshot.price_change_pct,
         )
-        self.market(symbol, "BUY" if s.side == "long" else "SELL", q, False, "open")
-        time.sleep(0.4)
-        p = one_position(self.api, symbol)
-        if not p.open or p.side != s.side:
-            raise BotError("entry reconciliation failed")
+        self._schedule_notification(message)
 
-        self.state.data.update(
-            {
-                "version": STATE_VERSION,
-                "strategy": STRATEGY_ID,
-                "active_symbol": symbol,
-                "active_strategy": "snapback",
-                "side": s.side,
-                "cycle_equity": ds(equity),
-                "account_equity_at_start": ds(actual),
-                "entry_atr": ds(s.atr),
-                "signal_reference": ds(s.reference_close),
-                "notional_mult": ds(profile.notional_mult),
-                "opened_at_ms": int(time.time() * 1000),
-                "signal_close_time": s.close_time,
-            }
-        )
-        self.state.data["last_signal"][symbol] = s.close_time
-        self.state.save()
-        self.clear_pending()
-
-        tp, sl, cap = self.exit_prices(p)
-        LOG.info(
-            "ENTRY_STATE strategy=snapback %s candle=%s entry=%s reference=%s atr=%s "
-            "tp=%s atr_sl=%s hard_cap=%s",
-            symbol,
-            candle,
-            ds(p.entry),
-            ds(s.reference_close),
-            ds(s.atr),
-            ds(tp),
-            ds(sl),
-            ds(cap),
-        )
-
-    def open_fallback(self, desired: int, leverage: Decimal, close_time: int) -> None:
-        if desired == 0 or open_positions(self.api) or self.api.open_orders():
-            return
-        asset = abs(desired) - 1
-        if asset < 0 or asset >= len(SYMBOLS):
-            raise BotError(f"invalid fallback desired={desired}")
-        symbol = SYMBOLS[asset]
-        side = "long" if desired > 0 else "short"
-        if leverage <= 0 or leverage > FALLBACK_MAX_LEVERAGE:
-            raise BotError(f"invalid fallback leverage={leverage}")
-        if self.api.position_mode():
-            raise BotError("one-way mode required")
-        max_notional = self.api.configure(symbol)
-        account = self.api.account()
-        actual = D(account.get("totalMarginBalance") or account.get("totalWalletBalance"))
-        if actual <= 0:
-            raise BotError("invalid futures equity")
-        equity = min(actual, SIZING_CAP) if SIZING_CAP > 0 else actual
-        entry_row = exact_entry_kline(
-            self.api, symbol, "5m", close_time + 1, close_time
-        )
-        trade, candle = D(entry_row[4]), int(entry_row[0])
-        notional = equity * leverage
-        if max_notional > 0 and notional > max_notional:
-            raise BotError(
-                f"{symbol} desired notional {ds(notional)} exceeds leverage-bracket "
-                f"maximum {ds(max_notional)}; set SIZING_EQUITY_CAP_USDT explicitly"
-            )
-        try:
-            quantity = self.qty(symbol, notional, trade)
-        except OrderBelowMinimum as exc:
-            LOG.warning(
-                "SKIP_FALLBACK_ENTRY %s %s close_time=%s leverage=%s reason=%s",
-                symbol, side, close_time, ds(leverage), exc,
-            )
-            return
-        LOG.warning(
-            "OPEN_FALLBACK %s %s qty=%s trade=%s sizing_equity=%s leverage=%s",
-            symbol, side, ds(quantity), ds(trade), ds(equity), ds(leverage),
-        )
-        self.market(symbol, "BUY" if side == "long" else "SELL", quantity, False, "fbopen")
-        time.sleep(0.4)
-        position = one_position(self.api, symbol)
-        if not position.open or position.side != side:
-            raise BotError("fallback entry reconciliation failed")
-        self.state.data.update(
-            {
-                "version": STATE_VERSION,
-                "strategy": STRATEGY_ID,
-                "active_symbol": symbol,
-                "active_strategy": "fallback",
-                "side": side,
-                "cycle_equity": ds(equity),
-                "account_equity_at_start": ds(actual),
-                "entry_atr": None,
-                "signal_reference": None,
-                "notional_mult": ds(leverage),
-                "opened_at_ms": int(time.time() * 1000),
-                "signal_close_time": close_time,
-            }
-        )
-        self.state.save()
-        self.clear_pending()
-        LOG.info(
-            "ENTRY_STATE strategy=fallback %s candle=%s entry=%s leverage=%s",
-            symbol, candle, ds(position.entry), ds(leverage),
-        )
-
-    def close_all(self, p: Position, reason: str, trade: Decimal | None = None) -> None:
-        q = self.rules[p.symbol].floor(p.qty)
-        LOG.warning(
-            "CLOSE_ALL reason=%s %s qty=%s entry=%s trade=%s mark=%s upnl=%s",
-            reason,
-            p.symbol,
-            ds(q),
-            ds(p.entry),
-            ds(trade) if trade is not None else "n/a",
-            ds(p.mark),
-            ds(p.upnl),
-        )
-        self.market(
-            p.symbol,
-            "SELL" if p.side == "long" else "BUY",
-            q,
-            True,
-            "close",
-        )
-        time.sleep(0.4)
-        after = one_position(self.api, p.symbol)
-        self.clear_pending()
-        if after.open:
-            raise BotError(f"residual position after close: {after.qty}")
-        self.state.reset_cycle()
-
-    def hard_stop_price(self, p: Position) -> Decimal:
-        profile = SNAPBACK_LIVE_PROFILES[p.symbol]
-        equity = D(self.state.data["cycle_equity"])
-        # Solve net PnL including one entry taker fee and one expected exit taker fee.
-        if p.side == "long":
-            return (
-                p.entry * (D(1) + TAKER_FEE)
-                - equity * profile.hard_stop / p.qty
-            ) / (D(1) - TAKER_FEE)
-        return (
-            p.entry * (D(1) - TAKER_FEE)
-            + equity * profile.hard_stop / p.qty
-        ) / (D(1) + TAKER_FEE)
-
-    def exit_prices(self, p: Position) -> tuple[Decimal, Decimal, Decimal]:
-        profile = SNAPBACK_LIVE_PROFILES[p.symbol]
-        a = D(self.state.data["entry_atr"])
-        reference = D(self.state.data["signal_reference"])
-        if a <= 0:
-            raise BotError("invalid entry ATR in state")
-        if reference <= 0:
-            raise BotError("invalid signal reference in state")
-        if p.side == "long":
-            tp = reference + profile.tp_atr * a
-            atr_sl = reference - profile.sl_atr * a
-        else:
-            tp = reference - profile.tp_atr * a
-            atr_sl = reference + profile.sl_atr * a
-        return tp, atr_sl, self.hard_stop_price(p)
-
-    def manage(self) -> None:
-        symbol = self.state.data["active_symbol"]
-        active_strategy = self.state.data.get("active_strategy")
-        live_positions = open_positions(self.api)
-        if len(live_positions) != 1 or live_positions[0].symbol != symbol:
-            if not live_positions:
-                self.state.reset_cycle()
-                return
-            raise BotError(f"max-one-position invariant broken: {live_positions}")
-
-        p = live_positions[0]
-        if active_strategy == "fallback":
-            return
-        if active_strategy != "snapback":
-            raise BotError(f"unknown active_strategy={active_strategy}")
-        profile = SNAPBACK_LIVE_PROFILES[symbol]
-        trade, _ = latest_trade(self.api, symbol)
-        tp, atr_sl, hard_cap = self.exit_prices(p)
-
-        # Use the tighter adverse stop; the hard cap is an account-loss safety ceiling.
-        if p.side == "long":
-            effective_sl = max(atr_sl, hard_cap)
-            if trade <= effective_sl:
-                reason = "cycle_loss_cap" if hard_cap >= atr_sl else "atr_stop"
-                LOG.warning(
-                    "STOP %s side=%s reason=%s trade=%s atr_sl=%s hard_cap=%s",
-                    symbol,
-                    p.side,
-                    reason,
-                    ds(trade),
-                    ds(atr_sl),
-                    ds(hard_cap),
+    async def run(self, stop_event: asyncio.Event) -> None:
+        reconnect_delay = 1.0
+        while not stop_event.is_set():
+            self.reset_stream_state()
+            try:
+                LOG.info("connecting Binance Futures WebSocket: %s", self.config.websocket_url)
+                async with connect(
+                    self.config.websocket_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=10,
+                    max_queue=2048,
+                ) as websocket:
+                    LOG.info("Binance Futures WebSocket connected; warming up rolling window")
+                    reconnect_delay = 1.0
+                    async for raw in websocket:
+                        if stop_event.is_set():
+                            break
+                        await self.process_message(raw)
+            except Exception:
+                if stop_event.is_set():
+                    break
+                LOG.exception(
+                    "Binance WebSocket disconnected; reconnecting in %.0fs",
+                    reconnect_delay,
                 )
-                self.close_all(p, reason, trade)
-                return
-            if trade >= tp:
-                LOG.warning(
-                    "TAKE_PROFIT %s side=%s trade=%s target=%s tp_atr=%s",
-                    symbol,
-                    p.side,
-                    ds(trade),
-                    ds(tp),
-                    ds(profile.tp_atr),
-                )
-                self.close_all(p, "atr_take_profit", trade)
-                return
-        else:
-            effective_sl = min(atr_sl, hard_cap)
-            if trade >= effective_sl:
-                reason = "cycle_loss_cap" if hard_cap <= atr_sl else "atr_stop"
-                LOG.warning(
-                    "STOP %s side=%s reason=%s trade=%s atr_sl=%s hard_cap=%s",
-                    symbol,
-                    p.side,
-                    reason,
-                    ds(trade),
-                    ds(atr_sl),
-                    ds(hard_cap),
-                )
-                self.close_all(p, reason, trade)
-                return
-            if trade <= tp:
-                LOG.warning(
-                    "TAKE_PROFIT %s side=%s trade=%s target=%s tp_atr=%s",
-                    symbol,
-                    p.side,
-                    ds(trade),
-                    ds(tp),
-                    ds(profile.tp_atr),
-                )
-                self.close_all(p, "atr_take_profit", trade)
-                return
 
-        opened = int(self.state.data["opened_at_ms"])
-        held_ms = int(time.time() * 1000) - opened
-        if held_ms >= profile.max_hold_minutes * 60 * 1000:
-            LOG.warning(
-                "TIME_EXIT %s side=%s held_minutes=%.1f max_minutes=%s trade=%s",
-                symbol,
-                p.side,
-                held_ms / 60000,
-                profile.max_hold_minutes,
-                ds(trade),
-            )
-            self.close_all(p, "max_hold_time", trade)
-
-    def complete_shadow(self, trade_return: Decimal, reason: str, exit_price: Decimal) -> None:
-        shadow = self.state.data["shadow"]
-        count = int(shadow.get("completed_count", 0))
-        prior = D(shadow.get("ewm")) if shadow.get("ewm") is not None else None
-        updated = (
-            trade_return
-            if prior is None
-            else (D(1) - GATE_ALPHA) * prior + GATE_ALPHA * trade_return
-        )
-        shadow.update(
-            {
-                "completed_count": count + 1,
-                "ewm": ds(updated),
-                "position": None,
-            }
-        )
-        self.state.save()
-        LOG.warning(
-            "SHADOW_CLOSE reason=%s exit=%s return=%s completed=%s ewm=%s "
-            "sampled_gate_remains=%s",
-            reason,
-            ds(exit_price),
-            ds(trade_return),
-            count + 1,
-            ds(updated),
-            shadow.get("gate_on"),
-        )
-
-    def start_shadow(self, symbol: str, s: Signal) -> bool:
-        shadow = self.state.data["shadow"]
-        if shadow.get("position"):
-            return bool(shadow.get("gate_on"))
-        count = int(shadow.get("completed_count", 0))
-        current = D(shadow.get("ewm")) if shadow.get("ewm") is not None else None
-        gate_on = count >= GATE_SPAN and current is not None and current > GATE_THRESHOLD
-        shadow["gate_on"] = gate_on
-
-        row = exact_entry_kline(
-            self.api, symbol, "1m", s.close_time + 1, s.close_time
-        )
-        entry_open_ms = int(row[0])
-        entry = D(row[1])
-        profile = PROFILES[symbol]
-        side_sign = D(1) if s.side == "long" else D(-1)
-        qty_abs = profile.notional_mult / entry
-        qty = side_sign * qty_abs
-        wallet = D(1) - profile.notional_mult * SHADOW_COST
-        if s.side == "long":
-            take_profit = entry + profile.tp_atr * s.atr
-            atr_stop = entry - profile.sl_atr * s.atr
-            hard_stop = (
-                entry * (D(1) + SHADOW_COST) - profile.hard_stop / qty_abs
-            ) / (D(1) - SHADOW_COST)
-            stop = max(atr_stop, hard_stop)
-        else:
-            take_profit = entry - profile.tp_atr * s.atr
-            atr_stop = entry + profile.sl_atr * s.atr
-            hard_stop = (
-                entry * (D(1) - SHADOW_COST) + profile.hard_stop / qty_abs
-            ) / (D(1) + SHADOW_COST)
-            stop = min(atr_stop, hard_stop)
-        shadow["position"] = {
-            "symbol": symbol,
-            "side": s.side,
-            "entry": ds(entry),
-            "qty": ds(qty),
-            "wallet": ds(wallet),
-            "take_profit": ds(take_profit),
-            "stop": ds(stop),
-            "entry_open_ms": entry_open_ms,
-            "last_processed_open_ms": entry_open_ms - 60_000,
-            "last_funding_time_ms": entry_open_ms - 1,
-            "funding_checked_through_ms": entry_open_ms - 1,
-            "max_exit_ms": entry_open_ms + profile.max_hold_minutes * 60_000,
-        }
-        self.state.save()
-        LOG.warning(
-            "SHADOW_OPEN %s %s entry=%s atr=%s tp=%s stop=%s sampled_gate=%s "
-            "completed=%s ewm=%s",
-            symbol,
-            s.side,
-            ds(entry),
-            ds(s.atr),
-            ds(take_profit),
-            ds(stop),
-            gate_on,
-            count,
-            ds(current) if current is not None else "n/a",
-        )
-        return gate_on
-
-    def sync_shadow(self) -> None:
-        if time.monotonic() - self.last_shadow_sync < 2:
-            return
-        self.last_shadow_sync = time.monotonic()
-        shadow = self.state.data.get("shadow", {})
-        raw = shadow.get("position")
-        if not raw:
-            return
-        now_ms = int(time.time() * 1000)
-        closed_end = (now_ms // 60_000) * 60_000
-        cursor = int(raw["last_processed_open_ms"]) + 60_000
-        if cursor >= closed_end:
-            return
-        symbol = str(raw["symbol"])
-        pages: list[list[Any]] = []
-        while cursor < closed_end:
-            page = self.api.klines(
-                symbol, "1m", 1500, start_time=cursor, end_time=closed_end - 1
-            )
-            page = [row for row in page if int(row[0]) >= cursor and int(row[6]) < now_ms]
-            if not page:
+            if stop_event.is_set():
                 break
-            pages.extend(page)
-            newest = max(int(row[0]) for row in page)
-            if newest < cursor:
-                break
-            cursor = newest + 60_000
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=reconnect_delay)
+            except TimeoutError:
+                pass
+            reconnect_delay = min(reconnect_delay * 2.0, 30.0)
 
-        if not pages:
-            return
-        funding_rows = self.api.funding_rates(
-            symbol,
-            int(raw.get("funding_checked_through_ms", raw["entry_open_ms"] - 1)) + 1,
-            int(pages[-1][6]),
-        )
-        funding_by_minute: dict[int, list[dict[str, Any]]] = {}
-        for funding in funding_rows:
-            minute = int(funding["fundingTime"]) // 60_000 * 60_000
-            funding_by_minute.setdefault(minute, []).append(funding)
-
-        entry = D(raw["entry"])
-        qty = D(raw["qty"])
-        qty_abs = abs(qty)
-        wallet = D(raw["wallet"])
-        take_profit = D(raw["take_profit"])
-        stop = D(raw["stop"])
-        side_sign = D(1) if qty > 0 else D(-1)
-        entry_open_ms = int(raw["entry_open_ms"])
-        last_funding_time = int(raw.get("last_funding_time_ms", entry_open_ms - 1))
-
-        for row in pages:
-            open_ms = int(row[0])
-            open_price, high, low = D(row[1]), D(row[2]), D(row[3])
-            if open_ms > entry_open_ms:
-                for funding in funding_by_minute.get(open_ms, []):
-                    funding_time = int(funding["fundingTime"])
-                    if funding_time <= last_funding_time:
-                        continue
-                    mark = D(funding.get("markPrice"), row[1])
-                    wallet -= qty * mark * D(funding["fundingRate"])
-                    last_funding_time = funding_time
-
-            open_equity = wallet + qty * (open_price - entry)
-            if open_equity <= D("0.005") * qty_abs * open_price:
-                self.complete_shadow(D("-1"), "liquidation_gap", open_price)
-                return
-            stop_hit = (qty > 0 and low <= stop) or (qty < 0 and high >= stop)
-            target_hit = (qty > 0 and high >= take_profit) or (
-                qty < 0 and low <= take_profit
-            )
-            reason: str | None = None
-            exit_price = D(0)
-            if stop_hit:
-                exit_price = min(stop, open_price) if qty > 0 else max(stop, open_price)
-                reason = "stop"
-            elif target_hit:
-                exit_price = max(take_profit, open_price) if qty > 0 else min(
-                    take_profit, open_price
-                )
-                reason = "take_profit"
-            elif open_ms >= int(raw["max_exit_ms"]):
-                exit_price = open_price
-                reason = "max_hold"
-
-            raw["last_processed_open_ms"] = open_ms
-            raw["last_funding_time_ms"] = last_funding_time
-            raw["funding_checked_through_ms"] = int(row[6])
-            raw["wallet"] = ds(wallet)
-            if reason is not None:
-                wallet += qty * (exit_price - entry) - qty_abs * exit_price * SHADOW_COST
-                self.complete_shadow(wallet - D(1), reason, exit_price)
-                return
-        self.state.save()
-
-    def apply_fallback(self, snapshot: dict[str, Any], fresh: bool) -> None:
-        desired = int(snapshot["desired"])
-        fallback = self.state.data["fallback"]
-        fallback.update(
-            {
-                "desired": desired,
-                "held_bars": int(snapshot["held_bars"]),
-                "score": ds(snapshot["score"]) if snapshot["score"] is not None else None,
-                "vol": ds(snapshot["vol"]) if snapshot["vol"] is not None else None,
-                "leverage": ds(snapshot["leverage"])
-                if snapshot["leverage"] is not None
-                else None,
-            }
-        )
-        self.state.save()
-        if not LIVE or not fresh:
-            return
-        if bool(self.state.data["shadow"].get("gate_on")):
-            live_positions = open_positions(self.api)
-            if live_positions and self.state.data.get("active_strategy") == "fallback":
-                self.close_all(live_positions[0], "gate_on_disables_fallback")
-            return
-        live_positions = open_positions(self.api)
-        if live_positions:
-            if self.state.data.get("active_strategy") != "fallback":
-                return
-            position = live_positions[0]
-            desired_symbol = SYMBOLS[abs(desired) - 1] if desired else None
-            desired_side = "long" if desired > 0 else "short"
-            if desired and position.symbol == desired_symbol and position.side == desired_side:
-                return
-            self.close_all(position, "fallback_switch")
-        if desired:
-            leverage = snapshot["leverage"]
-            if leverage is None:
-                return
-            self.open_fallback(desired, leverage, int(snapshot["close_time"]))
-
-    def scan(self) -> None:
-        if time.monotonic() - self.last_signal_scan < 5:
-            return
-        self.last_signal_scan = time.monotonic()
-        expected_close = latest_completed_15m_close_time()
-        if expected_close <= int(self.state.data.get("last_strategy_bar_close", 0)):
-            return
-
-        rows_by_symbol = {
-            symbol: closed(self.api.klines(symbol, "15m", FALLBACK_FETCH_LIMIT))
-            for symbol in SYMBOLS
-        }
-        snapshot = fallback_snapshot(rows_by_symbol)
-        close_time = int(snapshot["close_time"])
-        if close_time <= int(self.state.data.get("last_strategy_bar_close", 0)):
-            return
-        now_ms = int(time.time() * 1000)
-        age_ms = max(0, now_ms - close_time)
-        fresh_bar = age_ms <= SIGNAL_MAX_AGE_MS
-        candidates: list[tuple[str, Signal]] = []
-        for symbol in SYMBOLS:
-            current = signal_for(self.api, symbol, rows_by_symbol[symbol])
-            if current and current.close_time > int(
-                self.state.data["last_signal"].get(symbol, 0)
-            ):
-                candidates.append((symbol, current))
-
-        LOG.info(
-            "FALLBACK_SIGNAL close_time=%s desired=%s held=%s score=%s vol=%s "
-            "leverage=%s gate_on=%s age_ms=%s fresh=%s",
-            close_time,
-            snapshot["desired"],
-            snapshot["held_bars"],
-            ds(snapshot["score"]) if snapshot["score"] is not None else "n/a",
-            ds(snapshot["vol"]) if snapshot["vol"] is not None else "n/a",
-            ds(snapshot["leverage"]) if snapshot["leverage"] is not None else "n/a",
-            self.state.data["shadow"].get("gate_on"),
-            age_ms,
-            fresh_bar,
-        )
-        for symbol, current in candidates:
-            LOG.info(
-                "SNAPBACK_SIGNAL %s %s close_time=%s reference=%s atr=%s fresh=%s "
-                "detail=[%s]",
-                symbol,
-                current.side,
-                current.close_time,
-                ds(current.reference_close),
-                ds(current.atr),
-                fresh_bar,
-                current.detail,
-            )
-
-        if candidates:
-            if self.state.data["shadow"].get("position"):
-                LOG.info("SKIP_SHADOW_SIGNAL occupied=true candidates=%s", len(candidates))
-            else:
-                symbol, selected = candidates[0]
-                gate_on = self.start_shadow(symbol, selected)
-                if LIVE and fresh_bar and gate_on:
-                    live_positions = open_positions(self.api)
-                    if live_positions and self.state.data.get("active_strategy") == "fallback":
-                        self.close_all(live_positions[0], "gate_on_snapback")
-                        live_positions = []
-                    if not live_positions:
-                        self.open_signal(symbol, selected)
-                elif LIVE and not fresh_bar:
-                    LOG.info(
-                        "SKIP_STALE_LIVE_SNAPBACK %s close_time=%s age_ms=%s",
-                        symbol,
-                        selected.close_time,
-                        age_ms,
-                    )
-                if len(candidates) > 1:
-                    LOG.info(
-                        "SNAPBACK_PRIORITY selected=%s consumed=%s",
-                        symbol,
-                        ",".join(item[0] for item in candidates[1:]),
-                    )
-
-        self.apply_fallback(snapshot, fresh_bar)
-        for symbol, current in candidates:
-            self.state.data["last_signal"][symbol] = current.close_time
-        self.state.data["last_strategy_bar_close"] = close_time
-        self.state.save()
-
-    def run(self) -> None:
-        self.bootstrap()
-        profile_summary = "; ".join(
-            f"{s}:notional={ds(p.notional_mult)}x,tp={ds(p.tp_atr)}ATR,"
-            f"sl={ds(p.sl_atr)}ATR,max_hold={p.max_hold_minutes}m,"
-            f"hard_cap={ds(p.hard_stop * D(100))}%"
-            for s, p in SNAPBACK_LIVE_PROFILES.items()
-        )
-        LOG.info(
-            "started strategy=%s live=%s symbols=%s priority=%s leverage=%sx cross "
-            "max_one_position gate=ewm(%s)>%s fallback=ema(%s,%s) target_vol=%s "
-            "max_fallback_leverage=%s fresh_signal=%sms snapback_profiles=[%s]",
-            STRATEGY_ID,
-            LIVE,
-            SYMBOLS,
-            ">".join(SYMBOLS),
-            LEVERAGE,
-            GATE_SPAN,
-            ds(GATE_THRESHOLD),
-            FALLBACK_FAST,
-            FALLBACK_SLOW,
-            ds(FALLBACK_TARGET_ANNUAL_VOL),
-            ds(FALLBACK_MAX_LEVERAGE),
-            SIGNAL_MAX_AGE_MS,
-            profile_summary,
-        )
-        while not STOP:
-            if LIVE and self.state.data.get("pending_order") and self.reconcile_pending():
-                raise BotError("FILLED pending order with incomplete local transition")
-            self.sync_shadow()
-            if LIVE and self.state.data.get("active_symbol"):
-                self.manage()
-            self.scan()
-            if RUN_ONCE:
-                break
-            time.sleep(POLL)
+        if self.notification_tasks:
+            await asyncio.gather(*self.notification_tasks, return_exceptions=True)
 
 
-def stop_handler(*_: Any) -> None:
-    global STOP
-    STOP = True
+async def async_main() -> None:
+    config = Config.from_env()
+    logging.basicConfig(
+        level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    LOG.info(
+        "started symbol=%s volume_60s_threshold=%s volume_10s_threshold=%s reset=%s",
+        config.symbol,
+        config.volume_60s_threshold,
+        config.volume_10s_threshold,
+        config.volume_reset_threshold,
+    )
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
+    await VolumeSpikeBot(config).run(stop_event)
+    LOG.info("stopped")
 
 
 def main() -> None:
-    signal.signal(signal.SIGINT, stop_handler)
-    signal.signal(signal.SIGTERM, stop_handler)
-    with InstanceLock(INSTANCE_LOCK_PATH):
-        api = Binance()
-        state = State(STATE_PATH)
-        rules = load_rules(api)
-        Bot(api, state, rules).run()
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        LOG.exception("bot stopped: %s", e)
-        raise SystemExit(1)
+    main()
