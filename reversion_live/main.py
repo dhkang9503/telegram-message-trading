@@ -1,9 +1,9 @@
 """BTCUSDT futures rolling-volume spike alert and event recorder.
 
 The service consumes Binance USD-M Futures aggregate trades and the live 1m
-kline over a combined WebSocket connection. It detects short, intense volume
-spikes using rolling 10s/60s windows, sends one compact Telegram alert per
-spike, and records each event for later return / MFE / MAE analysis.
+kline over a combined WebSocket connection. It alerts when rolling 60-second
+volume reaches the configured threshold, with a fixed cooldown to avoid spam.
+Rolling 10-second volume is retained as an analysis feature only.
 
 No trading API key is required and this module never submits orders.
 """
@@ -41,13 +41,16 @@ HORIZONS_MS: tuple[tuple[str, int], ...] = (
 )
 FINAL_HORIZON = HORIZONS_MS[-1][0]
 STATE_PERSIST_INTERVAL_MS = 15_000
+ALERT_COOLDOWN_MS = 60_000
 
 
 @dataclass(frozen=True)
 class Config:
     symbol: str
     volume_60s_threshold: float
+    # Retained for env/backward compatibility and data context; no longer gates alerts.
     volume_10s_threshold: float
+    # Retained for env/backward compatibility; cooldown now controls re-alerting.
     volume_reset_threshold: float
     telegram_bot_token: str
     telegram_chat_id: str
@@ -65,20 +68,13 @@ class Config:
         telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         telegram_timeout_seconds = float(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10"))
         data_dir = Path(
-            os.getenv(
-                "VOLUME_DATA_DIR",
-                "/home/ubuntu/reversion_live/data",
-            )
+            os.getenv("VOLUME_DATA_DIR", "/home/ubuntu/reversion_live/data")
         ).expanduser()
 
         if not symbol:
             raise ValueError("SYMBOL must not be empty")
-        if volume_60s_threshold <= 0 or volume_10s_threshold <= 0:
-            raise ValueError("volume thresholds must be positive")
-        if not 0 <= volume_reset_threshold < volume_60s_threshold:
-            raise ValueError(
-                "VOLUME_RESET_THRESHOLD must be >= 0 and lower than VOLUME_60S_THRESHOLD"
-            )
+        if volume_60s_threshold <= 0:
+            raise ValueError("VOLUME_60S_THRESHOLD must be positive")
         if telegram_timeout_seconds <= 0:
             raise ValueError("TELEGRAM_TIMEOUT_SECONDS must be positive")
         if not telegram_bot_token:
@@ -207,36 +203,33 @@ class RollingVolumeTracker:
 
 
 class SpikeDetector:
+    """Trigger on rolling 60s volume, at most once per cooldown interval."""
+
     def __init__(
         self,
         threshold_60s: float,
-        threshold_10s: float,
-        reset_threshold: float,
+        cooldown_ms: int = ALERT_COOLDOWN_MS,
     ) -> None:
         self.threshold_60s = threshold_60s
-        self.threshold_10s = threshold_10s
-        self.reset_threshold = reset_threshold
-        self.alerted = False
+        self.cooldown_ms = cooldown_ms
+        self.last_alert_timestamp_ms: int | None = None
 
     def reset(self) -> None:
-        self.alerted = False
+        self.last_alert_timestamp_ms = None
 
     def evaluate(self, snapshot: VolumeSnapshot, allow_trigger: bool = True) -> bool:
-        if self.alerted:
-            if snapshot.volume_60s < self.reset_threshold:
-                self.alerted = False
-            return False
-
         if not snapshot.ready or not allow_trigger:
             return False
-
+        if snapshot.volume_60s < self.threshold_60s:
+            return False
         if (
-            snapshot.volume_60s >= self.threshold_60s
-            and snapshot.volume_10s >= self.threshold_10s
+            self.last_alert_timestamp_ms is not None
+            and snapshot.timestamp_ms - self.last_alert_timestamp_ms < self.cooldown_ms
         ):
-            self.alerted = True
-            return True
-        return False
+            return False
+
+        self.last_alert_timestamp_ms = snapshot.timestamp_ms
+        return True
 
 
 @dataclass
@@ -439,7 +432,11 @@ class EventRecorder:
             self.active = {}
 
     @staticmethod
-    def _append_csv(path: Path, fieldnames: list[str] | tuple[str, ...], row: dict[str, Any]) -> None:
+    def _append_csv(
+        path: Path,
+        fieldnames: list[str] | tuple[str, ...],
+        row: dict[str, Any],
+    ) -> None:
         needs_header = not path.exists() or path.stat().st_size == 0
         with path.open("a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -458,11 +455,16 @@ class EventRecorder:
         )
         os.replace(tmp, self.state_path)
 
-    def persist_state(self, force: bool = False, trade_timestamp_ms: int | None = None) -> None:
+    def persist_state(
+        self,
+        force: bool = False,
+        trade_timestamp_ms: int | None = None,
+    ) -> None:
         if not force and trade_timestamp_ms is not None:
             if (
                 self.last_persist_trade_ms is not None
-                and trade_timestamp_ms - self.last_persist_trade_ms < STATE_PERSIST_INTERVAL_MS
+                and trade_timestamp_ms - self.last_persist_trade_ms
+                < STATE_PERSIST_INTERVAL_MS
             ):
                 return
             self.last_persist_trade_ms = trade_timestamp_ms
@@ -506,7 +508,11 @@ class EventRecorder:
         self.active[event.event_id] = event
         self._append_csv(self.raw_path, RAW_FIELDS, self._base_row(event))
         self.persist_state(force=True)
-        LOG.info("recorded volume event id=%s active_events=%s", event.event_id, len(self.active))
+        LOG.info(
+            "recorded volume event id=%s active_events=%s",
+            event.event_id,
+            len(self.active),
+        )
         return event
 
     def _completed_row(self, event: ActiveEvent) -> dict[str, Any]:
@@ -576,7 +582,7 @@ def build_startup_message(config: Config) -> str:
     return (
         f"✅ {display_symbol(config.symbol)} 거래량 알림봇 시작\n"
         f"60s: {format_volume_btc(config.volume_60s_threshold)} | "
-        f"10s: {format_volume_btc(config.volume_10s_threshold)}"
+        f"cooldown: {ALERT_COOLDOWN_MS // 1000}s"
     )
 
 
@@ -618,11 +624,7 @@ class VolumeSpikeBot:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.tracker = RollingVolumeTracker()
-        self.detector = SpikeDetector(
-            config.volume_60s_threshold,
-            config.volume_10s_threshold,
-            config.volume_reset_threshold,
-        )
+        self.detector = SpikeDetector(config.volume_60s_threshold)
         self.candle = CandleState()
         self.recorder = EventRecorder(config.data_dir)
         self.notification_tasks: set[asyncio.Task[None]] = set()
@@ -715,7 +717,10 @@ class VolumeSpikeBot:
             while not stop_event.is_set():
                 self.reset_stream_state()
                 try:
-                    LOG.info("connecting Binance Futures WebSocket: %s", self.config.websocket_url)
+                    LOG.info(
+                        "connecting Binance Futures WebSocket: %s",
+                        self.config.websocket_url,
+                    )
                     async with connect(
                         self.config.websocket_url,
                         ping_interval=20,
@@ -723,10 +728,14 @@ class VolumeSpikeBot:
                         close_timeout=10,
                         max_queue=2048,
                     ) as websocket:
-                        LOG.info("Binance Futures WebSocket connected; warming up rolling window")
+                        LOG.info(
+                            "Binance Futures WebSocket connected; warming up rolling window"
+                        )
                         reconnect_delay = 1.0
                         if not startup_notification_scheduled:
-                            self._schedule_notification(build_startup_message(self.config))
+                            self._schedule_notification(
+                                build_startup_message(self.config)
+                            )
                             startup_notification_scheduled = True
 
                         async for raw in websocket:
@@ -764,12 +773,10 @@ async def async_main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     LOG.info(
-        "started symbol=%s volume_60s_threshold=%s volume_10s_threshold=%s "
-        "reset=%s data_dir=%s",
+        "started symbol=%s volume_60s_threshold=%s alert_cooldown=%ss data_dir=%s",
         config.symbol,
         config.volume_60s_threshold,
-        config.volume_10s_threshold,
-        config.volume_reset_threshold,
+        ALERT_COOLDOWN_MS // 1000,
         config.data_dir,
     )
 
