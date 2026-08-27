@@ -39,18 +39,21 @@ def test_rolling_windows_cross_minute_boundaries_and_keep_60s_price_anchor():
     assert round(snapshot.price_change_pct, 6) == 10.0
 
 
-def test_spike_alerts_once_until_60s_volume_falls_below_reset_threshold():
-    detector = rv.SpikeDetector(1000.0, 300.0, 600.0)
-    spike = rv.VolumeSnapshot(60_001, 110.0, 350.0, 1050.0, 100.0)
+def test_spike_uses_60s_volume_only_and_realerts_after_cooldown():
+    detector = rv.SpikeDetector(1000.0)
+    first = rv.VolumeSnapshot(60_001, 110.0, 50.0, 1050.0, 100.0)
+    before_cooldown = rv.VolumeSnapshot(119_999, 111.0, 40.0, 1400.0, 100.0)
+    after_cooldown = rv.VolumeSnapshot(120_001, 112.0, 20.0, 1300.0, 100.0)
 
-    assert detector.evaluate(spike) is True
-    assert detector.evaluate(spike) is False
-    assert detector.alerted is True
+    assert detector.evaluate(first) is True
+    assert detector.evaluate(before_cooldown) is False
+    assert detector.evaluate(after_cooldown) is True
 
-    cooling = rv.VolumeSnapshot(70_000, 109.0, 20.0, 599.0, 100.0)
-    assert detector.evaluate(cooling) is False
-    assert detector.alerted is False
-    assert detector.evaluate(spike) is True
+
+def test_spike_does_not_trigger_below_60s_threshold():
+    detector = rv.SpikeDetector(1000.0)
+    snapshot = rv.VolumeSnapshot(60_001, 110.0, 500.0, 999.9, 100.0)
+    assert detector.evaluate(snapshot) is False
 
 
 def test_current_1m_candle_controls_blue_or_red_marker():
@@ -62,7 +65,7 @@ def test_current_1m_candle_controls_blue_or_red_marker():
     assert candle.direction_emoji(trade(120_100, 106.0, 1.0, 3)) is None
 
 
-def test_startup_message_shows_active_thresholds(tmp_path):
+def test_startup_message_shows_60s_threshold_and_cooldown(tmp_path):
     config = rv.Config(
         symbol="BTCUSDT",
         volume_60s_threshold=1000.0,
@@ -77,7 +80,7 @@ def test_startup_message_shows_active_thresholds(tmp_path):
 
     assert rv.build_startup_message(config) == (
         "✅ BTC 거래량 알림봇 시작\n"
-        "60s: 1K BTC | 10s: 300 BTC"
+        "60s: 1K BTC | cooldown: 60s"
     )
 
 
