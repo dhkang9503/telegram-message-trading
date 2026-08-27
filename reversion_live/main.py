@@ -1,9 +1,11 @@
-"""BTCUSDT futures rolling-volume spike alert and event recorder.
+"""BTCUSDT futures volume-spike alert and event recorder.
 
 The service consumes Binance USD-M Futures aggregate trades and the live 1m
-kline over a combined WebSocket connection. It alerts when rolling 60-second
-volume reaches the configured threshold, with a fixed cooldown to avoid spam.
-Rolling 10-second volume is retained as an analysis feature only.
+kline over a combined WebSocket connection. An alert is triggered when either
+Binance's current 1m kline base-asset volume or a locally calculated rolling
+60-second volume reaches the configured threshold. The rolling window catches
+spikes that straddle a fixed candle boundary, while the kline volume keeps the
+bot aligned with the Binance futures chart.
 
 No trading API key is required and this module never submits orders.
 """
@@ -42,15 +44,16 @@ HORIZONS_MS: tuple[tuple[str, int], ...] = (
 FINAL_HORIZON = HORIZONS_MS[-1][0]
 STATE_PERSIST_INTERVAL_MS = 15_000
 ALERT_COOLDOWN_MS = 60_000
+VOLUME_STATUS_INTERVAL_MS = 10_000
 
 
 @dataclass(frozen=True)
 class Config:
     symbol: str
     volume_60s_threshold: float
-    # Retained for env/backward compatibility and data context; no longer gates alerts.
+    # Retained for env/backward compatibility and analysis context; no alert gate.
     volume_10s_threshold: float
-    # Retained for env/backward compatibility; cooldown now controls re-alerting.
+    # Retained for env/backward compatibility; cooldown controls re-alerting.
     volume_reset_threshold: float
     telegram_bot_token: str
     telegram_chat_id: str
@@ -203,53 +206,73 @@ class RollingVolumeTracker:
 
 
 class SpikeDetector:
-    """Trigger on rolling 60s volume, at most once per cooldown interval."""
+    """Trigger when fixed-1m or rolling-60s volume reaches the threshold."""
 
     def __init__(
         self,
-        threshold_60s: float,
+        threshold: float,
         cooldown_ms: int = ALERT_COOLDOWN_MS,
     ) -> None:
-        self.threshold_60s = threshold_60s
+        self.threshold = threshold
         self.cooldown_ms = cooldown_ms
         self.last_alert_timestamp_ms: int | None = None
 
     def reset(self) -> None:
         self.last_alert_timestamp_ms = None
 
-    def evaluate(self, snapshot: VolumeSnapshot, allow_trigger: bool = True) -> bool:
-        if not snapshot.ready or not allow_trigger:
-            return False
-        if snapshot.volume_60s < self.threshold_60s:
-            return False
+    def evaluate(
+        self,
+        timestamp_ms: int,
+        rolling_60s_volume: float,
+        kline_1m_volume: float,
+        allow_trigger: bool = True,
+    ) -> str | None:
+        if not allow_trigger:
+            return None
+        if max(rolling_60s_volume, kline_1m_volume) < self.threshold:
+            return None
         if (
             self.last_alert_timestamp_ms is not None
-            and snapshot.timestamp_ms - self.last_alert_timestamp_ms < self.cooldown_ms
+            and timestamp_ms - self.last_alert_timestamp_ms < self.cooldown_ms
         ):
-            return False
+            return None
 
-        self.last_alert_timestamp_ms = snapshot.timestamp_ms
-        return True
+        self.last_alert_timestamp_ms = timestamp_ms
+        rolling_hit = rolling_60s_volume >= self.threshold
+        kline_hit = kline_1m_volume >= self.threshold
+        if rolling_hit and kline_hit:
+            return "both"
+        return "rolling60" if rolling_hit else "kline1m"
 
 
 @dataclass
 class CandleState:
     open_time_ms: int | None = None
     open_price: float | None = None
+    volume_1m: float = 0.0
 
     def reset(self) -> None:
         self.open_time_ms = None
         self.open_price = None
+        self.volume_1m = 0.0
 
     def update(self, kline: dict[str, Any]) -> None:
         self.open_time_ms = int(kline["t"])
         self.open_price = float(kline["o"])
+        self.volume_1m = float(kline.get("v", 0.0))
+
+    def is_current_for(self, trade: Trade) -> bool:
+        expected_open_ms = trade.timestamp_ms // 60_000 * 60_000
+        return self.open_time_ms == expected_open_ms and self.open_price is not None
 
     def direction_emoji(self, trade: Trade) -> str | None:
-        expected_open_ms = trade.timestamp_ms // 60_000 * 60_000
-        if self.open_time_ms != expected_open_ms or self.open_price is None:
+        if not self.is_current_for(trade):
             return None
+        assert self.open_price is not None
         return "🔵" if trade.price >= self.open_price else "🔴"
+
+    def volume_for_trade(self, trade: Trade) -> float:
+        return self.volume_1m if self.is_current_for(trade) else 0.0
 
 
 def iso_utc(timestamp_ms: int) -> str:
@@ -581,26 +604,35 @@ def format_signed_usd(value: float) -> str:
 def build_startup_message(config: Config) -> str:
     return (
         f"✅ {display_symbol(config.symbol)} 거래량 알림봇 시작\n"
-        f"60s: {format_volume_btc(config.volume_60s_threshold)} | "
+        f"1m/60s: {format_volume_btc(config.volume_60s_threshold)} | "
         f"cooldown: {ALERT_COOLDOWN_MS // 1000}s"
     )
 
 
-def build_alert_message(symbol: str, emoji: str, snapshot: VolumeSnapshot) -> str:
-    price_change = snapshot.price_change
-    price_change_pct = snapshot.price_change_pct
-    if price_change is None or price_change_pct is None:
-        raise ValueError("snapshot is not warmed up for a 60-second price change")
-
+def build_alert_message(
+    symbol: str,
+    emoji: str,
+    snapshot: VolumeSnapshot,
+    kline_1m_volume: float,
+) -> str:
     when = datetime.fromtimestamp(
         snapshot.timestamp_ms / 1000,
         tz=KST,
     ).strftime("%H:%M:%S KST")
+    volumes = (
+        f"1m {format_volume_btc(kline_1m_volume)} | "
+        f"60s {format_volume_btc(snapshot.volume_60s)}"
+    )
+    if snapshot.price_change is None or snapshot.price_change_pct is None:
+        change_text = "60s Δ warming up"
+    else:
+        change_text = (
+            f"{format_signed_usd(snapshot.price_change)} "
+            f"({snapshot.price_change_pct:+.2f}%)"
+        )
     return (
         f"{emoji} {display_symbol(symbol)} 거래량 급증\n"
-        f"{when} | {format_volume_btc(snapshot.volume_60s)} | "
-        f"${snapshot.current_price:,.0f} | {format_signed_usd(price_change)} "
-        f"({price_change_pct:+.2f}%)"
+        f"{when} | {volumes} | ${snapshot.current_price:,.0f} | {change_text}"
     )
 
 
@@ -629,12 +661,14 @@ class VolumeSpikeBot:
         self.recorder = EventRecorder(config.data_dir)
         self.notification_tasks: set[asyncio.Task[None]] = set()
         self.warmup_logged = False
+        self.last_status_log_ms: int | None = None
 
     def reset_stream_state(self) -> None:
         self.tracker.reset()
         self.detector.reset()
         self.candle.reset()
         self.warmup_logged = False
+        self.last_status_log_ms = None
 
     def _schedule_notification(self, text: str) -> None:
         task = asyncio.create_task(self._send_notification(text))
@@ -647,6 +681,26 @@ class VolumeSpikeBot:
             LOG.info("telegram notification sent: %s", text.replace("\n", " | "))
         except Exception:
             LOG.exception("failed to send Telegram notification")
+
+    def _log_volume_status(
+        self,
+        trade: Trade,
+        snapshot: VolumeSnapshot,
+        kline_1m_volume: float,
+    ) -> None:
+        if (
+            self.last_status_log_ms is not None
+            and trade.timestamp_ms - self.last_status_log_ms < VOLUME_STATUS_INTERVAL_MS
+        ):
+            return
+        self.last_status_log_ms = trade.timestamp_ms
+        LOG.info(
+            "VOLUME_STATUS kline_1m=%.3f rolling60=%.3f rolling10=%.3f ready=%s",
+            kline_1m_volume,
+            snapshot.volume_60s,
+            snapshot.volume_10s,
+            int(snapshot.ready),
+        )
 
     async def process_message(self, raw: str | bytes) -> None:
         payload = json.loads(raw)
@@ -668,7 +722,6 @@ class VolumeSpikeBot:
             quantity=float(data["q"]),
             agg_trade_id=int(data["a"]),
         )
-
         snapshot = self.tracker.add(trade)
         if snapshot is None:
             return
@@ -679,34 +732,57 @@ class VolumeSpikeBot:
             LOG.exception("failed to update active volume-event tracking")
 
         if snapshot.ready and not self.warmup_logged:
-            LOG.info("rolling 60s window warmed up; spike detection active")
+            LOG.info("rolling 60s window warmed up; full event recording active")
             self.warmup_logged = True
 
         emoji = self.candle.direction_emoji(trade)
-        if not self.detector.evaluate(snapshot, allow_trigger=emoji is not None):
+        kline_1m_volume = self.candle.volume_for_trade(trade)
+        self._log_volume_status(trade, snapshot, kline_1m_volume)
+
+        trigger_source = self.detector.evaluate(
+            trade.timestamp_ms,
+            snapshot.volume_60s,
+            kline_1m_volume,
+            allow_trigger=emoji is not None,
+        )
+        if trigger_source is None:
             return
 
         assert emoji is not None
         assert self.candle.open_price is not None
-        message = build_alert_message(self.config.symbol, emoji, snapshot)
+        message = build_alert_message(
+            self.config.symbol,
+            emoji,
+            snapshot,
+            kline_1m_volume,
+        )
         LOG.warning(
-            "VOLUME_SPIKE volume_60s=%.3f volume_10s=%.3f price=%.2f change=%.2f pct=%.4f",
+            "VOLUME_SPIKE source=%s kline_1m=%.3f rolling60=%.3f rolling10=%.3f "
+            "price=%.2f change=%s pct=%s",
+            trigger_source,
+            kline_1m_volume,
             snapshot.volume_60s,
             snapshot.volume_10s,
             snapshot.current_price,
-            snapshot.price_change,
-            snapshot.price_change_pct,
+            "n/a" if snapshot.price_change is None else f"{snapshot.price_change:.2f}",
+            "n/a" if snapshot.price_change_pct is None else f"{snapshot.price_change_pct:.4f}",
         )
-        try:
-            self.recorder.record_event(
-                self.config.symbol,
-                trade,
-                snapshot,
-                emoji,
-                self.candle.open_price,
+
+        if snapshot.ready:
+            try:
+                self.recorder.record_event(
+                    self.config.symbol,
+                    trade,
+                    snapshot,
+                    emoji,
+                    self.candle.open_price,
+                )
+            except Exception:
+                LOG.exception("failed to record volume event")
+        else:
+            LOG.warning(
+                "volume alert fired during rolling-window warmup; CSV event recording skipped"
             )
-        except Exception:
-            LOG.exception("failed to record volume event")
         self._schedule_notification(message)
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -733,9 +809,7 @@ class VolumeSpikeBot:
                         )
                         reconnect_delay = 1.0
                         if not startup_notification_scheduled:
-                            self._schedule_notification(
-                                build_startup_message(self.config)
-                            )
+                            self._schedule_notification(build_startup_message(self.config))
                             startup_notification_scheduled = True
 
                         async for raw in websocket:
@@ -773,7 +847,8 @@ async def async_main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     LOG.info(
-        "started symbol=%s volume_60s_threshold=%s alert_cooldown=%ss data_dir=%s",
+        "started symbol=%s volume_threshold=%s sources=kline1m,rolling60 "
+        "alert_cooldown=%ss data_dir=%s",
         config.symbol,
         config.volume_60s_threshold,
         ALERT_COOLDOWN_MS // 1000,
