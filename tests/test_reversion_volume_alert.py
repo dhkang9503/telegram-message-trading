@@ -60,6 +60,24 @@ def test_current_1m_candle_controls_blue_or_red_marker():
     assert candle.direction_emoji(trade(120_100, 106.0, 1.0, 3)) is None
 
 
+def test_startup_message_shows_active_thresholds():
+    config = rv.Config(
+        symbol="BTCUSDT",
+        volume_60s_threshold=1000.0,
+        volume_10s_threshold=300.0,
+        volume_reset_threshold=600.0,
+        telegram_bot_token="token",
+        telegram_chat_id="chat",
+        telegram_timeout_seconds=10.0,
+        websocket_url="wss://example.test",
+    )
+
+    assert rv.build_startup_message(config) == (
+        "✅ BTC 거래량 알림봇 시작\n"
+        "60s: 1K BTC | 10s: 300 BTC"
+    )
+
+
 def test_alert_message_contains_current_price_and_60s_dollar_and_percent_change():
     snapshot = rv.VolumeSnapshot(
         timestamp_ms=60_001,
