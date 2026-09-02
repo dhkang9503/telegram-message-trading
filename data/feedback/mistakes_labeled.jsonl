@@ -38,3 +38,4 @@
 {"source":{"message":"짜르고 재진입 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null},{"type":"OPEN_REENTRY","price":null,"side":null}]}}
 {"source":{"message":"짜를게요 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
 {"source":{"message":"짜릅시다 ㅂㅈ"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
+{"source":{"message":"평단 별로 안좋아서 이쯤 정리할게요!"},"label":{"status":"labeled","correct_actions":[{"type":"CLOSE_ALL","price":null}]}}
