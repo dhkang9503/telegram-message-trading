@@ -4,11 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Optional run ID; blank uses Actions run number, model, and commit
-        required: false
-        default: ""
-      base_model_id:
-        description: Optional Hugging Face base model ID; blank uses configs/train.yaml
+        description: Optional run ID; blank uses Actions run number and commit
         required: false
         default: ""
   push:
@@ -21,10 +17,8 @@ on:
 permissions:
   contents: read
 
-# Manual model-comparison runs use their own group so they can run in parallel.
-# Push-triggered training remains serialized.
 concurrency:
-  group: telegram-parser-training-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'push' }}
+  group: telegram-parser-training
   cancel-in-progress: false
 
 jobs:
@@ -61,8 +55,6 @@ jobs:
       MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT || 'main' }}
       ARTIFACT_VOLUME: telegram-parser-artifacts
       LLAMA_CPP_COMMIT: 91d2fc387529940230555abd297a8b5e99737d3f
-      QWEN35_TRANSFORMERS_VERSION: "5.16.1"
-      QWEN35_PEFT_VERSION: "0.20.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -74,104 +66,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install "modal>=1.2.3,<2" PyYAML==6.0.2 httpx==0.28.1
-      - name: Resolve base model
-        id: model
-        shell: bash
-        env:
-          REQUESTED_BASE_MODEL_ID: ${{ inputs.base_model_id }}
-        run: |
-          python - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-          import yaml
-
-          config_path = Path("configs/train.yaml")
-          text = config_path.read_text(encoding="utf-8")
-          requested = os.environ.get("REQUESTED_BASE_MODEL_ID", "").strip()
-          if requested:
-              if "\n" in requested or "\r" in requested:
-                  raise SystemExit("base_model_id must be a single line")
-              text, count = re.subn(
-                  r"(?m)^(\s*base_model_id:\s*).*$",
-                  lambda match: f"{match.group(1)}{requested}",
-                  text,
-                  count=1,
-              )
-              if count != 1:
-                  raise SystemExit("Could not update model.base_model_id in configs/train.yaml")
-              config_path.write_text(text, encoding="utf-8")
-
-          config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-          model_id = str(config["model"]["base_model_id"])
-          is_qwen35 = "qwen3.5" in model_id.lower()
-
-          if is_qwen35:
-              # Qwen3.5 has 18 linear-attention layers in addition to six full-attention
-              # layers. Keep the existing Q/K/V/O + MLP targets and adapt the linear
-              # attention projections as well so the comparison is not MLP-only there.
-              target_anchor = "      - down_proj\n"
-              extra_targets = (
-                  "      - in_proj_qkv\n"
-                  "      - in_proj_z\n"
-                  "      - in_proj_a\n"
-                  "      - in_proj_b\n"
-                  "      - out_proj\n"
-              )
-              current = config_path.read_text(encoding="utf-8")
-              if "      - in_proj_qkv\n" not in current:
-                  if target_anchor not in current:
-                      raise SystemExit("Could not locate LoRA target module anchor")
-                  current = current.replace(target_anchor, target_anchor + extra_targets, 1)
-                  config_path.write_text(current, encoding="utf-8")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"base_model_id={model_id}\n")
-              output.write(f"qwen35={'true' if is_qwen35 else 'false'}\n")
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
-              env_file.write(f"BASE_MODEL_ID={model_id}\n")
-          print(f"Base model: {model_id}")
-          print(f"Qwen3.5 compatibility: {is_qwen35}")
-          PY
-      - name: Prepare Qwen3.5 training compatibility
-        if: steps.model.outputs.qwen35 == 'true'
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-
-          path = Path("modal/train_app.py")
-          text = path.read_text(encoding="utf-8")
-          marker = '        "pyyaml",\n    )\n    .env('
-          if marker not in text:
-              raise SystemExit("Could not locate Modal image dependency block")
-          extra = (
-              '        "pyyaml",\n'
-              '    )\n'
-              '    .pip_install(\n'
-              f'        "transformers=={os.environ["QWEN35_TRANSFORMERS_VERSION"]}",\n'
-              f'        "peft=={os.environ["QWEN35_PEFT_VERSION"]}",\n'
-              '    )\n'
-              '    .env('
-          )
-          text = text.replace(marker, extra, 1)
-          # Transformers v5 uses dtype; keep the old Qwen3 path untouched.
-          text = text.replace("torch_dtype=model_dtype", "dtype=model_dtype", 1)
-          # Qwen3.5 publishes a model.safetensors index/shard rather than an
-          # unsharded model.safetensors file.
-          text = text.replace(
-              'if not (base_model_dir / "model.safetensors").exists():',
-              'if not any(base_model_dir.glob("model*.safetensors")):',
-              1,
-          )
-          path.write_text(text, encoding="utf-8")
-          print(
-              "Prepared Qwen3.5 Modal image with "
-              f"transformers={os.environ['QWEN35_TRANSFORMERS_VERSION']} "
-              f"peft={os.environ['QWEN35_PEFT_VERSION']}"
-          )
-          PY
       - name: Resolve run ID
         id: run
         shell: bash
@@ -179,8 +73,7 @@ jobs:
           if [[ -n "${{ inputs.run_id }}" ]]; then
             RUN_ID="${{ inputs.run_id }}"
           else
-            MODEL_TAG="$(printf '%s' "${BASE_MODEL_ID}" | tr '/:' '--' | tr -cd '[:alnum:]._-' | cut -c1-48)"
-            RUN_ID="gh-${GITHUB_RUN_NUMBER}-${MODEL_TAG}-${GITHUB_SHA::8}"
+            RUN_ID="gh-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::8}"
           fi
           echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
           echo "RUN_ID=${RUN_ID}" >> "${GITHUB_ENV}"
@@ -316,7 +209,6 @@ jobs:
           errors = combined.get('errors', {})
           lines = [
               f"# Model run `{m['run_id']}`", "",
-              f"- Base model: **{m['base_model_id']}**",
               f"- Deploy eligible: **{m['deploy_eligible']}**",
               f"- Train rows: {m['dataset']['combined_rows']}",
               f"- Feedback rows trained: {m['dataset']['feedback_rows_appended']}",
