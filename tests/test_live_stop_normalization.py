@@ -137,7 +137,7 @@ def test_non_stop_actions_are_not_changed():
 def test_initial_margin_uses_account_equity_ratio():
     source = Path("live/live_bot.py").read_text(encoding="utf-8")
 
-    assert 'INITIAL_MARGIN_EQUITY_RATIO = Decimal("0.012")' in source
+    assert 'INITIAL_MARGIN_EQUITY_RATIO = Decimal("0.01")' in source
     assert 'sizing_source = "account_usdt_equity_ratio"' in source
     assert "INITIAL_MARGIN_USDT" not in source
     assert "fixed_6_usdt" not in source

@@ -147,18 +147,18 @@ def make_engine(reference: Decimal = Decimal("63900")):
     return engine, api, config, captured
 
 
-def test_uses_one_point_two_percent_of_account_equity():
+def test_uses_one_percent_of_account_equity():
     equity, margin = initial_margin_from_account({"usdtEquity": "400"})
 
     assert equity == Decimal("400")
-    assert margin == Decimal("4.8")
+    assert margin == Decimal("4")
 
 
 def test_preserves_fractional_equity_without_early_rounding():
     equity, margin = initial_margin_from_account({"usdtEquity": "400.3"})
 
     assert equity == Decimal("400.3")
-    assert margin == Decimal("4.8036")
+    assert margin == Decimal("4.003")
 
 
 @pytest.mark.parametrize(
@@ -194,7 +194,7 @@ def test_limit_entry_quantity_uses_resolved_limit_price():
     assert captured["qty"] == expected
     assert captured["raw_price"] == 63000
     assert captured["resolved_price"] == Decimal("63000")
-    assert captured["entry_sizing"]["margin_usdt"] == "4.8"
+    assert captured["entry_sizing"]["margin_usdt"] == "4"
     assert captured["entry_sizing"]["sizing_price"] == "63000"
 
 
