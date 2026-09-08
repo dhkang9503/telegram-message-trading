@@ -1,0 +1,195 @@
+name: Deploy scenario monitor bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref containing scenario_monitor/main.py to deploy
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-scenario-monitor-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy scenario_monitor/main.py to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      EC2_PORT: ${{ vars.EC2_SSH_PORT || '22' }}
+      BOT_SERVICE: ${{ vars.EC2_SCENARIO_MONITOR_SERVICE || 'scenario-monitor' }}
+
+    steps:
+      - name: Check out requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Resolve deployed commit
+        run: echo "DEPLOY_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate scenario monitor bot
+        run: |
+          set -euo pipefail
+          python -m py_compile scenario_monitor/main.py
+          python scenario_monitor/main.py --validate
+          python -m unittest discover -s tests -p 'test_scenario_monitor.py' -v
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+
+          for variable in EC2_HOST EC2_USER EC2_SSH_KEY; do
+            if [ -z "${!variable}" ]; then
+              echo "Required secret is empty: ${variable}" >&2
+              exit 1
+            fi
+          done
+
+          [[ "$EC2_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$EC2_PORT" =~ ^[0-9]{1,5}$ ]]
+          (( 10#$EC2_PORT >= 1 && 10#$EC2_PORT <= 65535 ))
+          [[ "$BOT_SERVICE" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.@-]*$ ]]
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          ssh-keyscan -p "$EC2_PORT" -H "$EC2_HOST" >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Upload and restart scenario monitor bot
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          remote_tmp="/tmp/scenario_monitor_main.py.${DEPLOY_SHA}.${RUN_ID}"
+          ssh_target="${EC2_USER}@${EC2_HOST}"
+          ssh_options=(
+            -i "$HOME/.ssh/deploy_key"
+            -p "$EC2_PORT"
+            -o BatchMode=yes
+            -o ConnectTimeout=15
+            -o StrictHostKeyChecking=yes
+          )
+
+          scp \
+            -i "$HOME/.ssh/deploy_key" \
+            -P "$EC2_PORT" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            scenario_monitor/main.py \
+            "${ssh_target}:${remote_tmp}"
+
+          ssh "${ssh_options[@]}" "$ssh_target" \
+            "bash -s -- '$remote_tmp' '$BOT_SERVICE' '$DEPLOY_SHA'" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          remote_tmp=$1
+          service=$2
+          deploy_sha=$3
+          bot_dir="$HOME/scenario_monitor"
+          bot_path="$bot_dir/main.py"
+          staged_path="${bot_path}.new"
+          backup_path="${bot_path}.rollback-${deploy_sha}"
+          had_previous=0
+          was_active=0
+
+          cleanup() {
+            rm -f "$remote_tmp" "$staged_path"
+          }
+          trap cleanup EXIT
+
+          wait_until_active() {
+            local attempt
+            for attempt in $(seq 1 10); do
+              if sudo systemctl is-active --quiet "$service"; then
+                sleep 2
+                sudo systemctl is-active --quiet "$service" && return 0
+              fi
+              sudo systemctl is-failed --quiet "$service" && return 1
+              sleep 1
+            done
+            return 1
+          }
+
+          test -f "$remote_tmp"
+          mkdir -p "$bot_dir"
+          python3 -m py_compile "$remote_tmp"
+          python3 "$remote_tmp" --validate
+          mkdir -p "$bot_dir/data"
+          if sudo systemctl is-active --quiet "$service"; then
+            was_active=1
+          fi
+
+          if [ -f "$bot_path" ]; then
+            cp -p "$bot_path" "$backup_path"
+            had_previous=1
+          fi
+
+          install -m 0644 "$remote_tmp" "$staged_path"
+          mv -f "$staged_path" "$bot_path"
+
+          if [ "$was_active" -eq 0 ]; then
+            rm -f "$backup_path"
+            echo "Installed ${bot_path}. Service was not active; create/enable/start it manually."
+            exit 0
+          fi
+
+          if sudo systemctl restart "$service" && wait_until_active; then
+            rm -f "$backup_path"
+            echo "Deployed ${bot_path} and restarted ${service} successfully."
+            exit 0
+          fi
+
+          echo "Deployment failed; showing recent service logs." >&2
+          sudo journalctl -u "$service" -n 80 --no-pager || true
+
+          if [ "$had_previous" -eq 1 ] && [ -f "$backup_path" ]; then
+            echo "Rolling back to the previous scenario_monitor/main.py." >&2
+            mv -f "$backup_path" "$bot_path"
+            sudo systemctl restart "$service" || true
+            if wait_until_active; then
+              echo "Rollback succeeded; deployment remains failed." >&2
+            else
+              echo "Rollback also failed; inspect the EC2 service immediately." >&2
+              sudo journalctl -u "$service" -n 80 --no-pager || true
+            fi
+          else
+            sudo systemctl stop "$service" || true
+            echo "No previous scenario_monitor/main.py existed, so there is nothing to roll back." >&2
+            rm -f "$bot_path"
+          fi
+
+          exit 1
+          REMOTE_SCRIPT
+
+      - name: Deployment summary
+        if: success()
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+        run: |
+          {
+            echo "### Scenario monitor bot deployed"
+            echo "- Ref: \`${REQUESTED_REF}\`"
+            echo "- Commit: \`${DEPLOY_SHA}\`"
+            echo "- Target: \`~/scenario_monitor/main.py\`"
+            echo "- Service: \`${BOT_SERVICE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
