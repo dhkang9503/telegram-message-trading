@@ -1,0 +1,25 @@
+[Unit]
+Description=BTCUSDT scenario condition and expiry monitor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/scenario_monitor
+Environment=PYTHONUNBUFFERED=1
+Environment=SCENARIO_DATA_DIR=/home/ubuntu/scenario_monitor/data
+Environment=SCENARIO_POLL_SECONDS=15
+EnvironmentFile=-/home/ubuntu/scenario_monitor/.env
+ExecStart=/usr/bin/python3 /home/ubuntu/scenario_monitor/main.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
