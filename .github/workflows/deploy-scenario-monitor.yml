@@ -46,9 +46,10 @@ jobs:
       - name: Validate scenario monitor bot
         run: |
           set -euo pipefail
-          python -m py_compile scenario_monitor/main.py
+          python -m py_compile scenario_monitor/*.py
+          bash -n scenario_monitor/deploy_remote.sh
           python scenario_monitor/main.py --validate
-          python -m unittest discover -s tests -p 'test_scenario_monitor.py' -v
+          python -m unittest discover -s tests -p 'test_scenario*.py' -v
 
       - name: Configure SSH
         run: |
@@ -78,108 +79,17 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-
-          remote_tmp="/tmp/scenario_monitor_main.py.${DEPLOY_SHA}.${RUN_ID}"
-          ssh_target="${EC2_USER}@${EC2_HOST}"
-          ssh_options=(
-            -i "$HOME/.ssh/deploy_key"
-            -p "$EC2_PORT"
-            -o BatchMode=yes
-            -o ConnectTimeout=15
-            -o StrictHostKeyChecking=yes
-          )
-
-          scp \
-            -i "$HOME/.ssh/deploy_key" \
-            -P "$EC2_PORT" \
-            -o BatchMode=yes \
-            -o ConnectTimeout=15 \
-            -o StrictHostKeyChecking=yes \
-            scenario_monitor/main.py \
-            "${ssh_target}:${remote_tmp}"
-
-          ssh "${ssh_options[@]}" "$ssh_target" \
-            "bash -s -- '$remote_tmp' '$BOT_SERVICE' '$DEPLOY_SHA'" <<'REMOTE_SCRIPT'
-          set -Eeuo pipefail
-
-          remote_tmp=$1
-          service=$2
-          deploy_sha=$3
-          bot_dir="$HOME/scenario_monitor"
-          bot_path="$bot_dir/main.py"
-          staged_path="${bot_path}.new"
-          backup_path="${bot_path}.rollback-${deploy_sha}"
-          had_previous=0
-          was_active=0
-
-          cleanup() {
-            rm -f "$remote_tmp" "$staged_path"
-          }
-          trap cleanup EXIT
-
-          wait_until_active() {
-            local attempt
-            for attempt in $(seq 1 10); do
-              if sudo systemctl is-active --quiet "$service"; then
-                sleep 2
-                sudo systemctl is-active --quiet "$service" && return 0
-              fi
-              sudo systemctl is-failed --quiet "$service" && return 1
-              sleep 1
-            done
-            return 1
-          }
-
-          test -f "$remote_tmp"
-          mkdir -p "$bot_dir"
-          python3 -m py_compile "$remote_tmp"
-          python3 "$remote_tmp" --validate
-          mkdir -p "$bot_dir/data"
-          if sudo systemctl is-active --quiet "$service"; then
-            was_active=1
-          fi
-
-          if [ -f "$bot_path" ]; then
-            cp -p "$bot_path" "$backup_path"
-            had_previous=1
-          fi
-
-          install -m 0644 "$remote_tmp" "$staged_path"
-          mv -f "$staged_path" "$bot_path"
-
-          if [ "$was_active" -eq 0 ]; then
-            rm -f "$backup_path"
-            echo "Installed ${bot_path}. Service was not active; create/enable/start it manually."
-            exit 0
-          fi
-
-          if sudo systemctl restart "$service" && wait_until_active; then
-            rm -f "$backup_path"
-            echo "Deployed ${bot_path} and restarted ${service} successfully."
-            exit 0
-          fi
-
-          echo "Deployment failed; showing recent service logs." >&2
-          sudo journalctl -u "$service" -n 80 --no-pager || true
-
-          if [ "$had_previous" -eq 1 ] && [ -f "$backup_path" ]; then
-            echo "Rolling back to the previous scenario_monitor/main.py." >&2
-            mv -f "$backup_path" "$bot_path"
-            sudo systemctl restart "$service" || true
-            if wait_until_active; then
-              echo "Rollback succeeded; deployment remains failed." >&2
-            else
-              echo "Rollback also failed; inspect the EC2 service immediately." >&2
-              sudo journalctl -u "$service" -n 80 --no-pager || true
-            fi
-          else
-            sudo systemctl stop "$service" || true
-            echo "No previous scenario_monitor/main.py existed, so there is nothing to roll back." >&2
-            rm -f "$bot_path"
-          fi
-
-          exit 1
-          REMOTE_SCRIPT
+          archive="scenario-monitor-${DEPLOY_SHA}-${RUN_ID}.tar.gz"
+          remote_tmp="/tmp/${archive}"
+          tar -czf "$archive" -C scenario_monitor main.py execution.py execution_store.py binance_futures.py
+          scp -i "$HOME/.ssh/deploy_key" -P "$EC2_PORT" \
+            -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes \
+            "$archive" "${EC2_USER}@${EC2_HOST}:${remote_tmp}"
+          ssh -i "$HOME/.ssh/deploy_key" -p "$EC2_PORT" \
+            -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes \
+            "${EC2_USER}@${EC2_HOST}" \
+            "bash -s -- '$remote_tmp' '$BOT_SERVICE' '$DEPLOY_SHA'" \
+            < scenario_monitor/deploy_remote.sh
 
       - name: Deployment summary
         if: success()

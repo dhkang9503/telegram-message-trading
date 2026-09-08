@@ -1,7 +1,6 @@
-"""Read-only, expiring BTCUSDT scenario monitor. Python 3.12, stdlib only.
+"""Expiring BTCUSDT monitor with opt-in execution. Python 3.12, stdlib only.
 
-No exchange credentials, orders, position inference, or automatic re-analysis.
-The built-in September 8 plan expires at its original absolute deadline.
+SCENARIO_EXECUTION_MODE defaults to off. Plan generation remains external.
 """
 from __future__ import annotations
 
@@ -21,6 +20,11 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+try:
+    from .execution import Executor
+except ImportError:
+    from execution import Executor
 
 LOG = logging.getLogger("scenario_monitor")
 MINUTE = 60_000
@@ -328,7 +332,7 @@ class Monitor:
                     self.emit(s.key, "ENTRY_READY", c.end,
                               "진입 조건 충족 알림 (주문/체결 아님)", price=c.close,
                               entry=s.entry, add=s.add, stop=s.stop, targets=s.targets,
-                              margin_pct=[15, 10], leverage=3,
+                              leverage=3,
                               deadline=iso(min(self.plan.end, st["armed_at"] + self.plan.ttl)))
 
 
@@ -365,10 +369,12 @@ def notification(event: dict) -> str:
             f'{event["reason"]}\nUTC: {event["utc"]}\nID: {event["id"]}')
     if event["kind"] == "ENTRY_READY":
         text += (f'\n확인 종가: {event["price"]:,.1f}'
-                 f'\n계획 진입/추가: {event["entry"]:,} / {event["add"]:,}'
-                 f'\n손절: {event["stop"]:,}\n익절: {event["targets"]}'
-                 '\n증거금: 시드 15% + 최대 10%, 격리 3배'
-                 '\n추가는 별도 확인 필요. 실제 보유·체결은 추적하지 않음.')
+                 f'\n계획 진입: {event["entry"]:,}'
+                 f'\n손절: {event["stop"]:,}\n자동매매 전량 TP: {event["targets"][0]:,}'
+                 f'\n실행 모드: {os.getenv("SCENARIO_EXECUTION_MODE", "off")}'
+                 '\n자동매매는 별도 설정 시에만 동작. ENTRY_FILLED로 체결 확인.'
+                 '\n자동매매: 격리 3배, 계획 위험 1% 이하, 첫 목표 전량 익절, 추가 진입 없음.'
+                 '\nlive 모드에서는 수동 중복 진입하지 마세요.')
     if "deadline" in event:
         text += f'\n진입 대기 만료(UTC): {event["deadline"]}'
     return text
@@ -400,7 +406,7 @@ def run() -> int:
     parser.add_argument("--plan", type=Path, default=os.getenv("SCENARIO_PLAN_PATH"))
     parser.add_argument("--print-default-plan", action="store_true")
     parser.add_argument("--validate", action="store_true", help="Offline config validation")
-    parser.add_argument("--once", action="store_true", help="One read-only monitoring cycle")
+    parser.add_argument("--once", action="store_true", help="One cycle; live mode can place orders")
     args = parser.parse_args()
     if args.print_default_plan:
         print(json.dumps(DEFAULT_PLAN, ensure_ascii=False, indent=2))
@@ -431,13 +437,17 @@ def run() -> int:
     # One instance per data directory, including when the plan is changed.
     with (data_dir / "monitor.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        executor = Executor.from_env(data_dir)
         saved = json.loads(state_path.read_text()) if state_path.exists() else None
         monitor = Monitor(plan, saved)
-        LOG.info("Read-only monitor %s; expires %s; state=%s", raw["plan_id"], iso(plan.end), state_path)
+        LOG.info("Monitor %s; execution=%s; expires %s; state=%s", raw["plan_id"],
+                 executor.mode if executor else "off", iso(plan.end), state_path)
         if not saved:
             monitor.emit("ALL", "STARTED", int(time.time() * 1000),
-                         "시나리오 감시 시작. 실주문/보유 포지션/뉴스 자동 판단 없음")
+                         f"시나리오 감시 시작. execution={executor.mode if executor else 'off'}. 뉴스 자동 판단 없음")
         while not stopping:
+            if executor:
+                executor.reconcile()
             now = int(time.time() * 1000)
             monitor.tick(now)  # Absolute deadlines advance even during API outages.
             if (data_dir / "PAUSE").exists():
@@ -465,6 +475,20 @@ def run() -> int:
                     LOG.error("Market read/validation failed: %s", type(exc).__name__)
                     monitor.suspend(now, "시장 데이터 오류/공백: 진입 신호 중단, 새 계획으로 재평가 필요")
             save_state(state_path, monitor.state)
+            if executor:
+                executor.cycle(monitor, market_ok, (data_dir / "PAUSE").exists())
+                try:
+                    def send_execution(message):
+                        if token:
+                            reply = request_json(f"https://api.telegram.org/bot{token}/sendMessage",
+                                                 {"chat_id": chat_id, "text": message})
+                            if not reply.get("ok"):
+                                raise RuntimeError("Telegram rejected execution notification")
+                        else:
+                            LOG.info("%s", message)
+                    executor.store.flush(send_execution)
+                except Exception as exc:
+                    LOG.error("Execution notification pending: %s", type(exc).__name__)
             try:
                 flush_outbox(monitor, state_path, token, chat_id,
                              int(time.time() * 1000), market_ok=market_ok)
