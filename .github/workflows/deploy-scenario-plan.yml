@@ -1,0 +1,145 @@
+name: Deploy scenario plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref containing the deployed scenario monitor code
+        required: true
+        default: main
+        type: string
+      plan_base64:
+        description: Base64-encoded UTF-8 scenario plan JSON (maximum 64 KiB decoded)
+        required: true
+        type: string
+      clear_pause:
+        description: Remove the manual PAUSE file after installing the new plan
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-scenario-monitor-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Validate and deploy BTC scenario plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      EC2_PORT: ${{ vars.EC2_SSH_PORT || '22' }}
+      BOT_SERVICE: ${{ vars.EC2_SCENARIO_MONITOR_SERVICE || 'scenario-monitor' }}
+
+    steps:
+      - name: Check out monitor code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Decode and validate plan
+        id: plan
+        env:
+          PLAN_BASE64: ${{ inputs.plan_base64 }}
+        run: |
+          set -euo pipefail
+          plan_path="$RUNNER_TEMP/scenario-plan.json"
+
+          if [ -z "$PLAN_BASE64" ] || ! [[ "$PLAN_BASE64" =~ ^[A-Za-z0-9+/=[:space:]]+$ ]]; then
+            echo "plan_base64 is empty or contains non-base64 characters" >&2
+            exit 1
+          fi
+          printf '%s' "$PLAN_BASE64" | tr -d '[:space:]' | base64 --decode > "$plan_path"
+          test "$(wc -c < "$plan_path")" -le 65536
+          python scenario_monitor/main.py --plan "$plan_path" --validate
+
+          PLAN_PATH="$plan_path" python - <<'PY'
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+
+          path = os.environ["PLAN_PATH"]
+          with open(path, encoding="utf-8") as handle:
+              plan = json.load(handle)
+          plan_id = plan.get("plan_id", "")
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", plan_id):
+              raise SystemExit("plan_id must be a safe 1-128 character identifier")
+          expires = datetime.fromisoformat(plan["expires_at"])
+          if expires.tzinfo is None or expires <= datetime.now(timezone.utc):
+              raise SystemExit("plan is already expired")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"plan_id={plan_id}\n")
+          PY
+
+          echo "plan_sha256=$(sha256sum "$plan_path" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "plan_path=$plan_path" >> "$GITHUB_OUTPUT"
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          for variable in EC2_HOST EC2_USER EC2_SSH_KEY; do
+            if [ -z "${!variable}" ]; then
+              echo "Required secret is empty: ${variable}" >&2
+              exit 1
+            fi
+          done
+          [[ "$EC2_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$EC2_PORT" =~ ^[0-9]{1,5}$ ]]
+          (( 10#$EC2_PORT >= 1 && 10#$EC2_PORT <= 65535 ))
+          [[ "$BOT_SERVICE" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.@-]*$ ]]
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          ssh-keyscan -p "$EC2_PORT" -H "$EC2_HOST" >> "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Upload plan and restart monitor
+        env:
+          PLAN_PATH: ${{ steps.plan.outputs.plan_path }}
+          PLAN_SHA256: ${{ steps.plan.outputs.plan_sha256 }}
+          CLEAR_PAUSE: ${{ inputs.clear_pause }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          remote_tmp="/tmp/scenario-plan-${RUN_ID}.json"
+          ssh_target="${EC2_USER}@${EC2_HOST}"
+
+          scp -i "$HOME/.ssh/deploy_key" -P "$EC2_PORT" \
+            -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes \
+            "$PLAN_PATH" "${ssh_target}:${remote_tmp}"
+          ssh -i "$HOME/.ssh/deploy_key" -p "$EC2_PORT" \
+            -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes \
+            "$ssh_target" \
+            "bash -s -- '$remote_tmp' '$BOT_SERVICE' '$PLAN_SHA256' '$CLEAR_PAUSE'" \
+            < scenario_monitor/deploy_plan_remote.sh
+
+      - name: Deployment summary
+        if: success()
+        env:
+          PLAN_ID: ${{ steps.plan.outputs.plan_id }}
+          PLAN_SHA256: ${{ steps.plan.outputs.plan_sha256 }}
+          CLEAR_PAUSE: ${{ inputs.clear_pause }}
+        run: |
+          {
+            echo "### Scenario plan deployed"
+            echo "- Plan: \`${PLAN_ID}\`"
+            echo "- SHA-256: \`${PLAN_SHA256}\`"
+            echo "- Target: \`~/scenario_monitor/plan.json\`"
+            echo "- Service: \`${BOT_SERVICE}\`"
+            echo "- Cleared PAUSE: \`${CLEAR_PAUSE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

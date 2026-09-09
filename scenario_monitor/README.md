@@ -131,6 +131,29 @@ python3 /home/ubuntu/scenario_monitor/main.py --plan /home/ubuntu/scenario_monit
 코드를 롤백한다. 첫 배포 또는 서비스가 정지된 상태라면 파일만 설치하고 시작은 운영자에게 맡긴다.
 서비스 파일 자체는 자동 설치하지 않는다. Python 3.12가 설치되어 있어야 한다.
 
+분석이 끝난 새 JSON 계획은 `.github/workflows/deploy-scenario-plan.yml`의
+**Deploy scenario plan**으로 별도 배포한다. JSON을 UTF-8 바이트 기준 base64로 인코딩해
+`plan_base64`에 붙여 넣는다. 워크플로는 64 KiB 이하인지, 계획 형식·ID·만료 시각과
+체크섬을 검증하고 `~/scenario_monitor/plan.json`을 원자적으로 교체한 뒤 서비스를
+재시작한다. 시작 로그에서 새 `plan_id`까지 확인하며, 실패하면 이전 계획을 복구한다.
+기존 코드·`.env`·상태·자동매매 저널은 변경하지 않는다.
+
+수동 중단에 사용하는 `data/PAUSE`는 기본적으로 유지된다. 검토한 새 계획을 바로
+활성화할 때만 `clear_pause=true`를 선택한다. 기존 계획과 내용이 달라졌다면 반드시
+새 `plan_id`를 사용하고, 만료된 JSON의 시각만 연장해 다시 배포하지 않는다.
+
+Linux에서 입력값을 만드는 예:
+
+```bash
+base64 -w 0 plan.json
+```
+
+PowerShell에서 입력값을 만드는 예:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("plan.json"))
+```
+
 1. PR을 병합하고 Actions에서 **Deploy scenario monitor bot**을 실행한다(`ref=main`).
 2. `scenario-monitor.service.example` 내용을 `/etc/systemd/system/scenario-monitor.service`에 작성한다.
    EC2 계정이 `ubuntu`가 아니면 `User`와 모든 `/home/ubuntu` 경로를 변경한다.
