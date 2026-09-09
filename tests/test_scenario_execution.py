@@ -202,13 +202,41 @@ class ExecutionTests(unittest.TestCase):
         self.engine.handle(self.m, event)
         self.assertEqual(len(self.markets()), 1)
 
-    def test_bad_net_rr_is_skipped_without_selecting_further_target(self):
+    def test_bad_gross_rr_is_skipped_without_selecting_further_target(self):
         raw = copy.deepcopy(self.m.plan.raw)
         raw["scenarios"][2]["targets"] = [78950, 79450, 79800]
         self.m.plan = Plan.parse(raw)
         self.enter()
         self.assertEqual(self.markets(), [])
-        self.assertIn("Net reward/risk", self.store.state["outbox"][-1])
+        self.assertIn("Gross reward/risk", self.store.state["outbox"][-1])
+
+    def test_gross_rr_uses_executable_quote_not_fee_slippage_reserve(self):
+        self.m, self.event, self.now = ready("short")
+        raw = copy.deepcopy(self.m.plan.raw)
+        raw["scenarios"][2].update(entry=78900, add=78900, stop=79060,
+                                    targets=[78520, 78250, 77620])
+        self.m.plan = Plan.parse(raw)
+        self.api.quote_value = (D("78893.8"), D("78894.0"), D("78893.8"))
+        self.api.avg = D("78893.8")
+        self.enter()
+        self.assertEqual(self.trade()["phase"], "PROTECTED")
+        self.assertEqual(self.markets()[0][2], "SELL")
+
+    def test_actual_fill_beyond_slippage_limit_is_closed(self):
+        raw = copy.deepcopy(self.m.plan.raw)
+        raw["entry_tolerance"] = 100
+        self.m.plan = Plan.parse(raw)
+        self.api.avg = D("78450")
+        self.enter()
+        self.assertEqual(self.trade()["phase"], "EMERGENCY")
+
+    def test_actual_fill_rechecks_gross_rr(self):
+        raw = copy.deepcopy(self.m.plan.raw)
+        raw["scenarios"][2]["targets"] = [79175, 79600, 80100]
+        self.m.plan = Plan.parse(raw)
+        self.api.avg = D("78440")
+        self.enter()
+        self.assertEqual(self.trade()["phase"], "EMERGENCY")
 
     def test_all_entry_gates(self):
         cases = ["stale", "future", "expired", "review", "paused", "data", "phase", "foreign", "orders", "quote", "loss", "tick"]
