@@ -60,26 +60,31 @@ data directory across plan changes, code rollbacks and deployments.
    are exact; never silently move the plan's levels.
 6. Use `targets[0]` as the **only full-position TP** and `stop` as the SL.
    `add`, later targets and informational `_execution*` JSON metadata do not
-   authorize orders. Require estimated NET reward/risk >=1.5, else skip.
+   authorize orders. Require gross reward/risk >=1.5 at the executable best
+   ask for longs or best bid for shorts, else skip. Fees and the configured
+   slippage reserve do not alter this entry gate.
 7. Round quantity down to live LOT_SIZE/MARKET_LOT_SIZE steps. Check minimum
    quantity/notional, maximum quantity and available initial margin plus fees.
 8. Persist entry intent, then send MARKET once. Confirm actual fill/average.
 9. Register STOP_MARKET first, then TAKE_PROFIT_MARKET, both on the Algo Order
    API with `closePosition=true`, `workingType=MARK_PRICE`, `priceProtect=false`.
    Do NOT combine `closePosition` with `quantity` or `reduceOnly`.
-10. Recheck actual average price, risk, reward/risk and liquidation distance.
+10. Recheck gross reward/risk from the actual average fill, the risk budget,
+    configured adverse-slippage limit and liquidation distance.
     An execution outside the tolerance/risk contract is flattened; levels aren't
     widened. No averaging down, pyramiding, split exits, trailing or SL movement.
 
-Sizing reserves adverse entry slippage and adverse exit slippage (5 bps each by
-default), plus undiscounted actual commission. Future referral rebates are not
-counted. The calculation works for longs and shorts:
+Sizing still reserves adverse entry slippage and adverse exit slippage (5 bps
+each by default), plus undiscounted actual commission. Future referral rebates
+are not counted in sizing or daily-loss accounting, but fees and reserves are
+excluded from the reward/risk gate. The calculation works for longs and shorts:
 
 ```text
 budget = min(wallet * 1%, remaining daily loss allowance)
 worst_entry = executable quote moved adversely by configured slippage
 loss_per_BTC = directional(worst_entry - SL) + entry/exit fees + SL slippage
 quantity = floor_to_exchange_step(budget / loss_per_BTC)
+gross_rr = directional(TP - executable_quote) / directional(executable_quote - SL)
 ```
 
 The KST-day loss allowance is 2% of the smaller of that day's first observed wallet
