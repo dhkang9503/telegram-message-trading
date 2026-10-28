@@ -40,6 +40,12 @@ def unit_risk(entry, stop, fee, slip, sign):
     return sign * (entry - stop) + (entry + stop) * fee + stop * slip
 
 
+def gross_reward_risk(entry, stop, tp, sign):
+    risk = sign * (entry - stop)
+    reward = sign * (tp - entry)
+    return reward, risk
+
+
 def size_order(s, tolerance, bid, ask, mark, equity, available, fee, rules, budget, slip):
     if any(not x.is_finite() for x in (bid, ask, mark, equity, available, fee, budget, slip)):
         raise ValueError("Nonfinite execution inputs")
@@ -59,9 +65,9 @@ def size_order(s, tolerance, bid, ask, mark, equity, available, fee, rules, budg
         raise ValueError("TP/SL does not match exchange tick")
     worst = entry * (1 + sign * slip)
     loss = unit_risk(worst, stop, fee, slip, sign)
-    profit = sign * (tp - worst) - (worst + tp) * fee - tp * slip
-    if sign * (worst - stop) <= 0 or loss <= 0 or profit / loss < D("1.5"):
-        raise ValueError("Net reward/risk below 1.5")
+    reward, risk = gross_reward_risk(entry, stop, tp, sign)
+    if sign * (worst - stop) <= 0 or loss <= 0 or risk <= 0 or reward / risk < D("1.5"):
+        raise ValueError("Gross reward/risk below 1.5 at executable quote")
     lot = rules["LOT_SIZE"]
     market = rules["MARKET_LOT_SIZE"]
     step = max(decimal(lot["stepSize"]), decimal(market["stepSize"]))
@@ -308,10 +314,12 @@ class Executor:
                     continue
                 avg, stop, tp = decimal(t["average"]), decimal(t["stop"]), decimal(t["tp"])
                 fee, slip, sign = decimal(t["fee"]), decimal(t["slip"]), t["sign"]
-                risk = unit_risk(avg, stop, fee, slip, sign)
-                reward = sign * (tp - avg) - (avg + tp) * fee - tp * slip
+                sized_risk = unit_risk(avg, stop, fee, slip, sign)
+                reward, risk = gross_reward_risk(avg, stop, tp, sign)
                 liquidation = decimal(position["liquidationPrice"])
-                if (risk <= 0 or filled * risk > decimal(t["budget"]) or reward / risk < D("1.5") or
+                if (sized_risk <= 0 or filled * sized_risk > decimal(t["budget"]) or
+                        risk <= 0 or reward / risk < D("1.5") or
+                        sign * (decimal(t["entry_limit"]) - avg) < 0 or
                         abs(avg - decimal(t["planned_entry"])) > decimal(t["tolerance"]) or
                         (liquidation > 0 and sign * (stop - liquidation) <= 0)):
                     self.emergency(key, t, "실제 체결 위험/손익비/가격/청산가 검사 실패")
